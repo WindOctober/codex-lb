@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 import errno
 import json
@@ -8,9 +9,11 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import aiohttp
 import pytest
 
 import app.core.tracing.otel as otel
+from app.core.config.settings import Settings
 from app.core.runtime_logging import JsonFormatter
 from app.modules.proxy.ring_membership import RING_STALE_GRACE_SECONDS, RING_STALE_THRESHOLD_SECONDS
 
@@ -237,7 +240,7 @@ async def test_lifespan_runs_normally_when_otel_is_disabled(monkeypatch: pytest.
     import app.core.startup as startup_module
     import app.main as main
 
-    settings = SimpleNamespace(
+    settings = Settings(
         otel_enabled=False,
         otel_exporter_endpoint="",
         metrics_enabled=False,
@@ -251,6 +254,12 @@ async def test_lifespan_runs_normally_when_otel_is_disabled(monkeypatch: pytest.
     usage_scheduler = _DummyScheduler()
     model_scheduler = _DummyScheduler()
     sticky_scheduler = _DummyScheduler()
+    ring_service = SimpleNamespace(
+        register=AsyncMock(),
+        mark_stale=AsyncMock(),
+        unregister=AsyncMock(),
+        heartbeat=AsyncMock(),
+    )
     call_order: list[str] = []
 
     async def _init_db() -> None:
@@ -274,13 +283,16 @@ async def test_lifespan_runs_normally_when_otel_is_disabled(monkeypatch: pytest.
     monkeypatch.setattr(main, "init_db", init_db)
     monkeypatch.setattr(main, "init_background_db", init_background_db)
     monkeypatch.setattr(main, "init_http_client", init_http_client)
+    monkeypatch.setattr(main, "_ensure_bridge_durable_schema_ready", AsyncMock())
     monkeypatch.setattr(main, "close_http_client", close_http_client)
     monkeypatch.setattr(main, "close_db", close_db)
     monkeypatch.setattr(main, "build_usage_refresh_scheduler", lambda: usage_scheduler)
     monkeypatch.setattr(main, "build_model_refresh_scheduler", lambda: model_scheduler)
     monkeypatch.setattr(main, "build_sticky_session_cleanup_scheduler", lambda: sticky_scheduler)
+    monkeypatch.setattr(main, "RingMembershipService", lambda session_factory: ring_service)
 
     async with main.lifespan(main.app):
+        await asyncio.sleep(0)
         assert startup_module._startup_complete is True
         assert usage_scheduler.started is True
         assert model_scheduler.started is True
@@ -301,9 +313,10 @@ async def test_lifespan_runs_normally_when_otel_is_disabled(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_lifespan_marks_bridge_membership_stale_on_shutdown(monkeypatch: pytest.MonkeyPatch):
+    import app.core.startup as startup_module
     import app.main as main
 
-    settings = SimpleNamespace(
+    settings = Settings(
         otel_enabled=False,
         otel_exporter_endpoint="",
         metrics_enabled=False,
@@ -320,8 +333,14 @@ async def test_lifespan_marks_bridge_membership_stale_on_shutdown(monkeypatch: p
     sticky_scheduler = _DummyScheduler()
     close_http_client = AsyncMock()
     close_db = AsyncMock()
+    register = AsyncMock()
+
+    async def _register(instance_id: str, *, endpoint_base_url: str | None = None) -> None:
+        assert startup_module._startup_complete is True
+        await register(instance_id, endpoint_base_url=endpoint_base_url)
+
     ring_service = SimpleNamespace(
-        register=AsyncMock(),
+        register=AsyncMock(side_effect=_register),
         mark_stale=AsyncMock(),
         unregister=AsyncMock(),
         heartbeat=AsyncMock(),
@@ -340,12 +359,17 @@ async def test_lifespan_marks_bridge_membership_stale_on_shutdown(monkeypatch: p
     monkeypatch.setattr(main, "init_db", AsyncMock())
     monkeypatch.setattr(main, "init_background_db", Mock())
     monkeypatch.setattr(main, "init_http_client", AsyncMock())
+    monkeypatch.setattr(main, "_ensure_bridge_durable_schema_ready", AsyncMock())
     monkeypatch.setattr(main, "close_http_client", close_http_client)
     monkeypatch.setattr(main, "close_db", close_db)
     monkeypatch.setattr(main, "build_usage_refresh_scheduler", lambda: usage_scheduler)
     monkeypatch.setattr(main, "build_model_refresh_scheduler", lambda: model_scheduler)
     monkeypatch.setattr(main, "build_sticky_session_cleanup_scheduler", lambda: sticky_scheduler)
     monkeypatch.setattr(main, "RingMembershipService", lambda session_factory: ring_service)
+    wait_for_reachable = AsyncMock()
+    monkeypatch.setattr(main, "_wait_for_bridge_advertise_endpoint", wait_for_reachable)
+    validate_advertise = AsyncMock()
+    monkeypatch.setattr(main, "_validate_bridge_advertise_endpoint_for_multi_replica", validate_advertise)
     monkeypatch.setattr(main, "mark_process_dead", Mock())
     monkeypatch.setattr(
         "app.core.cache.invalidation.CacheInvalidationPoller",
@@ -353,15 +377,97 @@ async def test_lifespan_marks_bridge_membership_stale_on_shutdown(monkeypatch: p
     )
 
     async with main.lifespan(main.app):
-        pass
+        await asyncio.sleep(0)
+        assert startup_module._startup_complete is True
 
-    ring_service.register.assert_awaited_once_with("pod-a")
+    register.assert_awaited_once_with("pod-a", endpoint_base_url=None)
+    wait_for_reachable.assert_not_awaited()
+    validate_advertise.assert_not_awaited()
+    ring_service.heartbeat.assert_not_awaited()
     ring_service.mark_stale.assert_awaited_once_with(
         "pod-a",
         stale_threshold_seconds=RING_STALE_THRESHOLD_SECONDS,
         grace_seconds=RING_STALE_GRACE_SECONDS,
     )
     ring_service.unregister.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_registers_bridge_without_waiting_for_advertise_self_probe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import app.core.startup as startup_module
+    import app.main as main
+
+    settings = Settings(
+        otel_enabled=False,
+        otel_exporter_endpoint="",
+        metrics_enabled=False,
+        shutdown_drain_timeout_seconds=0,
+        http_responses_session_bridge_instance_id="pod-a",
+        http_responses_session_bridge_advertise_base_url="http://pod-a.bridge.default.svc.cluster.local:2455",
+    )
+    settings_cache = SimpleNamespace(invalidate=AsyncMock())
+    rate_limit_cache = SimpleNamespace(invalidate=AsyncMock())
+    usage_scheduler = _DummyScheduler()
+    model_scheduler = _DummyScheduler()
+    sticky_scheduler = _DummyScheduler()
+    close_http_client = AsyncMock()
+    close_db = AsyncMock()
+    ring_service = SimpleNamespace(
+        register=AsyncMock(),
+        mark_stale=AsyncMock(),
+        unregister=AsyncMock(),
+        heartbeat=AsyncMock(),
+    )
+    cache_poller = SimpleNamespace(
+        on_invalidation=Mock(),
+        start=AsyncMock(),
+        stop=AsyncMock(),
+    )
+    wait_for_reachable = AsyncMock()
+    validate_advertise = AsyncMock()
+
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "get_settings_cache", lambda: settings_cache)
+    monkeypatch.setattr(main, "ensure_auto_bootstrap_token", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "get_rate_limit_headers_cache", lambda: rate_limit_cache)
+    monkeypatch.setattr(main, "reload_additional_quota_registry", lambda: None)
+    monkeypatch.setattr(main, "init_db", AsyncMock())
+    monkeypatch.setattr(main, "init_background_db", Mock())
+    monkeypatch.setattr(main, "init_http_client", AsyncMock())
+    monkeypatch.setattr(main, "_ensure_bridge_durable_schema_ready", AsyncMock())
+    monkeypatch.setattr(main, "close_http_client", close_http_client)
+    monkeypatch.setattr(main, "close_db", close_db)
+    monkeypatch.setattr(main, "build_usage_refresh_scheduler", lambda: usage_scheduler)
+    monkeypatch.setattr(main, "build_model_refresh_scheduler", lambda: model_scheduler)
+    monkeypatch.setattr(main, "build_sticky_session_cleanup_scheduler", lambda: sticky_scheduler)
+    monkeypatch.setattr(main, "RingMembershipService", lambda session_factory: ring_service)
+    monkeypatch.setattr(main, "_wait_for_bridge_advertise_endpoint", wait_for_reachable)
+    monkeypatch.setattr(main, "_validate_bridge_advertise_endpoint_for_multi_replica", validate_advertise)
+    monkeypatch.setattr(main, "mark_process_dead", Mock())
+    monkeypatch.setattr(
+        "app.core.cache.invalidation.CacheInvalidationPoller",
+        lambda session_factory: cache_poller,
+    )
+
+    async with main.lifespan(main.app):
+        assert startup_module._startup_complete is True
+        await asyncio.sleep(0)
+        wait_for_reachable.assert_awaited_once_with(
+            "http://pod-a.bridge.default.svc.cluster.local:2455",
+            connect_timeout_seconds=settings.upstream_connect_timeout_seconds,
+        )
+        validate_advertise.assert_awaited_once()
+        ring_service.register.assert_awaited_once_with(
+            "pod-a",
+            endpoint_base_url=None,
+        )
+        ring_service.heartbeat.assert_awaited_once_with(
+            "pod-a",
+            endpoint_base_url="http://pod-a.bridge.default.svc.cluster.local:2455",
+        )
+        assert startup_module._startup_complete is True
 
 
 def test_metrics_bind_failure_is_only_benign_in_multiprocess_mode(monkeypatch: pytest.MonkeyPatch):
@@ -374,3 +480,409 @@ def test_metrics_bind_failure_is_only_benign_in_multiprocess_mode(monkeypatch: p
     monkeypatch.setattr(main, "MULTIPROCESS_MODE", True)
     assert main._is_benign_metrics_bind_failure(SystemExit(1)) is True
     assert main._is_benign_metrics_bind_failure(OSError(errno.EADDRINUSE, "in use")) is True
+
+
+@pytest.mark.asyncio
+async def test_lifespan_fails_fast_when_bridge_durable_schema_is_missing(monkeypatch: pytest.MonkeyPatch):
+    import app.main as main
+
+    settings = Settings(
+        otel_enabled=False,
+        otel_exporter_endpoint="",
+        metrics_enabled=False,
+        shutdown_drain_timeout_seconds=0,
+    )
+    settings_cache = SimpleNamespace(invalidate=AsyncMock())
+    rate_limit_cache = SimpleNamespace(invalidate=AsyncMock())
+    usage_scheduler = _DummyScheduler()
+    model_scheduler = _DummyScheduler()
+    sticky_scheduler = _DummyScheduler()
+
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "get_settings_cache", lambda: settings_cache)
+    monkeypatch.setattr(main, "ensure_auto_bootstrap_token", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "get_rate_limit_headers_cache", lambda: rate_limit_cache)
+    monkeypatch.setattr(main, "reload_additional_quota_registry", lambda: None)
+    monkeypatch.setattr(main, "init_db", AsyncMock())
+    monkeypatch.setattr(main, "init_background_db", Mock())
+    monkeypatch.setattr(main, "init_http_client", AsyncMock())
+    monkeypatch.setattr(main, "close_http_client", AsyncMock())
+    monkeypatch.setattr(main, "close_db", AsyncMock())
+    monkeypatch.setattr(main, "build_usage_refresh_scheduler", lambda: usage_scheduler)
+    monkeypatch.setattr(main, "build_model_refresh_scheduler", lambda: model_scheduler)
+    monkeypatch.setattr(main, "build_sticky_session_cleanup_scheduler", lambda: sticky_scheduler)
+    monkeypatch.setattr(
+        main, "_ensure_bridge_durable_schema_ready", AsyncMock(side_effect=RuntimeError("missing schema"))
+    )
+
+    with pytest.raises(RuntimeError, match="missing schema"):
+        async with main.lifespan(main.app):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_lifespan_allows_missing_bridge_schema_when_fail_fast_disabled(monkeypatch: pytest.MonkeyPatch):
+    import app.core.startup as startup_module
+    import app.main as main
+
+    settings = Settings(
+        otel_enabled=False,
+        otel_exporter_endpoint="",
+        metrics_enabled=False,
+        shutdown_drain_timeout_seconds=0,
+        database_migrations_fail_fast=False,
+    )
+    settings_cache = SimpleNamespace(
+        invalidate=AsyncMock(), get=AsyncMock(return_value=SimpleNamespace(password_hash=None))
+    )
+    rate_limit_cache = SimpleNamespace(invalidate=AsyncMock())
+    usage_scheduler = _DummyScheduler()
+    model_scheduler = _DummyScheduler()
+    sticky_scheduler = _DummyScheduler()
+    ring_service = SimpleNamespace(
+        register=AsyncMock(), mark_stale=AsyncMock(), unregister=AsyncMock(), heartbeat=AsyncMock()
+    )
+    cache_poller = SimpleNamespace(on_invalidation=Mock(), start=AsyncMock(), stop=AsyncMock())
+
+    monkeypatch.setattr(main, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "get_settings_cache", lambda: settings_cache)
+    monkeypatch.setattr(main, "ensure_auto_bootstrap_token", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "get_rate_limit_headers_cache", lambda: rate_limit_cache)
+    monkeypatch.setattr(main, "reload_additional_quota_registry", lambda: None)
+    monkeypatch.setattr(main, "init_db", AsyncMock())
+    monkeypatch.setattr(main, "init_background_db", Mock())
+    monkeypatch.setattr(main, "init_http_client", AsyncMock())
+    monkeypatch.setattr(main, "close_http_client", AsyncMock())
+    monkeypatch.setattr(main, "close_db", AsyncMock())
+    monkeypatch.setattr(main, "build_usage_refresh_scheduler", lambda: usage_scheduler)
+    monkeypatch.setattr(main, "build_model_refresh_scheduler", lambda: model_scheduler)
+    monkeypatch.setattr(main, "build_sticky_session_cleanup_scheduler", lambda: sticky_scheduler)
+    monkeypatch.setattr(main, "RingMembershipService", lambda session_factory: ring_service)
+    monkeypatch.setattr(main, "_ensure_bridge_durable_schema_ready", AsyncMock(return_value=False))
+    monkeypatch.setattr(main, "mark_process_dead", Mock())
+    monkeypatch.setattr(
+        "app.core.cache.invalidation.CacheInvalidationPoller",
+        lambda session_factory: cache_poller,
+    )
+
+    async with main.lifespan(main.app):
+        await asyncio.sleep(0)
+        assert startup_module._bridge_durable_schema_ready is False
+
+
+def test_local_api_port_uses_port_env(monkeypatch: pytest.MonkeyPatch):
+    import app.main as main
+
+    monkeypatch.setenv("PORT", "3765")
+
+    assert main._local_api_port() == 3765
+
+
+def test_local_api_port_falls_back_for_invalid_env(monkeypatch: pytest.MonkeyPatch):
+    import app.main as main
+
+    monkeypatch.setenv("PORT", "not-a-port")
+    monkeypatch.setattr(main.sys, "argv", ["uvicorn", "app.main:app", "--port", "4123"])
+
+    assert main._local_api_port() == 4123
+
+
+@pytest.mark.asyncio
+async def test_wait_for_bridge_advertise_endpoint_probes_configured_url(monkeypatch: pytest.MonkeyPatch):
+    import app.main as main
+
+    seen: dict[str, object] = {}
+
+    class _FakeResponse:
+        status = 200
+
+        async def __aenter__(self) -> "_FakeResponse":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _FakeSession:
+        def __init__(self, *args, **kwargs) -> None:
+            seen["timeout"] = kwargs.get("timeout")
+            seen["trust_env"] = kwargs.get("trust_env")
+
+        async def __aenter__(self) -> "_FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str, *, ssl: bool | None = None) -> _FakeResponse:
+            seen["url"] = url
+            seen["ssl"] = ssl
+            return _FakeResponse()
+
+    monkeypatch.setattr(main.aiohttp, "ClientSession", _FakeSession)
+
+    await main._wait_for_bridge_advertise_endpoint(
+        "http://pod-a.bridge.default.svc.cluster.local:2455",
+        connect_timeout_seconds=3.0,
+    )
+
+    assert seen["url"] == "http://pod-a.bridge.default.svc.cluster.local:2455/health/live"
+    assert seen["ssl"] is None
+    assert seen["trust_env"] is False
+
+
+@pytest.mark.asyncio
+async def test_wait_for_bridge_advertise_endpoint_uses_default_tls_verification_for_https_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    seen: dict[str, object] = {}
+
+    class _FakeResponse:
+        status = 200
+
+        async def __aenter__(self) -> "_FakeResponse":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _FakeSession:
+        async def __aenter__(self) -> "_FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str, *, ssl: bool | None = None) -> _FakeResponse:
+            seen["url"] = url
+            seen["ssl"] = ssl
+            return _FakeResponse()
+
+    monkeypatch.setattr(main.aiohttp, "ClientSession", lambda *args, **kwargs: _FakeSession())
+
+    await main._wait_for_bridge_advertise_endpoint(
+        "https://pod-a.bridge.default.svc.cluster.local:2455",
+        connect_timeout_seconds=3.0,
+    )
+
+    assert seen["url"] == "https://pod-a.bridge.default.svc.cluster.local:2455/health/live"
+    assert seen["ssl"] is None
+
+
+@pytest.mark.asyncio
+async def test_wait_for_bridge_advertise_endpoint_raises_after_bounded_retry_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    current_time = 0.0
+    attempts = 0
+
+    def _monotonic() -> float:
+        return current_time
+
+    async def _sleep(delay: float) -> None:
+        nonlocal current_time
+        current_time += delay
+
+    class _FakeSession:
+        async def __aenter__(self) -> "_FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def get(self, url: str, *, ssl: bool | None = None):
+            nonlocal attempts
+            attempts += 1
+            raise aiohttp.ClientConnectionError("unreachable")
+
+    monkeypatch.setattr(main.time, "monotonic", _monotonic)
+    monkeypatch.setattr(main.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(main.aiohttp, "ClientSession", lambda *args, **kwargs: _FakeSession())
+
+    with pytest.raises(RuntimeError, match="did not become reachable"):
+        await main._wait_for_bridge_advertise_endpoint(
+            "http://pod-a.bridge.default.svc.cluster.local:2455",
+            connect_timeout_seconds=3.0,
+        )
+
+    assert attempts >= 3
+    assert current_time >= 5.0
+
+
+def test_local_api_port_supports_equals_style_argv(monkeypatch: pytest.MonkeyPatch):
+    import app.main as main
+
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.setattr(main.sys, "argv", ["uvicorn", "app.main:app", "--port=4124"])
+
+    assert main._local_api_port() == 4124
+
+
+def test_local_api_port_falls_back_to_default_when_no_valid_port_source(monkeypatch: pytest.MonkeyPatch):
+    import app.main as main
+
+    monkeypatch.setenv("PORT", "not-a-port")
+    monkeypatch.setattr(main.sys, "argv", ["uvicorn", "app.main:app", "--port", "bad"])
+
+    assert main._local_api_port() is None
+
+
+@pytest.mark.asyncio
+async def test_wait_for_bridge_advertise_endpoint_requires_known_local_port_without_advertise_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.main as main
+
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.setattr(main.sys, "argv", ["gunicorn", "app.main:app"])
+
+    with pytest.raises(RuntimeError, match="Cannot determine local bridge listener port"):
+        await main._wait_for_bridge_advertise_endpoint(None, connect_timeout_seconds=3.0)
+
+
+@pytest.mark.asyncio
+async def test_validate_bridge_advertise_endpoint_rejects_shared_hostname():
+    import app.main as main
+
+    class _RingReader:
+        async def list_active(
+            self,
+            stale_threshold_seconds: int = main.RING_STALE_THRESHOLD_SECONDS,
+            *,
+            require_endpoint: bool = False,
+        ) -> list[str]:
+            del require_endpoint
+            return ["instance-a"]
+
+    settings = Settings(
+        http_responses_session_bridge_instance_id="instance-a",
+        http_responses_session_bridge_advertise_base_url="http://instance-a.internal.local:2455",
+    )
+
+    await main._validate_bridge_advertise_endpoint_for_multi_replica(
+        svc=_RingReader(),
+        settings=settings,
+        instance_id="instance-a",
+        endpoint_base_url=settings.http_responses_session_bridge_advertise_base_url,
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_bridge_advertise_endpoint_allows_loopback_for_single_replica():
+    import app.main as main
+
+    class _RingReader:
+        async def list_active(
+            self,
+            stale_threshold_seconds: int = main.RING_STALE_THRESHOLD_SECONDS,
+            *,
+            require_endpoint: bool = False,
+        ) -> list[str]:
+            del require_endpoint
+            return ["instance-a"]
+
+    settings = Settings(
+        http_responses_session_bridge_instance_id="instance-a",
+        http_responses_session_bridge_advertise_base_url="http://127.0.0.1:2455",
+    )
+
+    await main._validate_bridge_advertise_endpoint_for_multi_replica(
+        svc=_RingReader(),
+        settings=settings,
+        instance_id="instance-a",
+        endpoint_base_url=settings.http_responses_session_bridge_advertise_base_url,
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_bridge_advertise_endpoint_rejects_loopback_when_peer_exists():
+    import app.main as main
+
+    class _RingReader:
+        async def list_active(
+            self,
+            stale_threshold_seconds: int = main.RING_STALE_THRESHOLD_SECONDS,
+            *,
+            require_endpoint: bool = False,
+        ) -> list[str]:
+            del require_endpoint
+            return ["instance-a", "instance-b"]
+
+    settings = Settings(
+        http_responses_session_bridge_instance_id="instance-a",
+        http_responses_session_bridge_advertise_base_url="http://127.0.0.1:2455",
+    )
+
+    with pytest.raises(RuntimeError):
+        await main._validate_bridge_advertise_endpoint_for_multi_replica(
+            svc=_RingReader(),
+            settings=settings,
+            instance_id="instance-a",
+            endpoint_base_url=settings.http_responses_session_bridge_advertise_base_url,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_bridge_advertise_endpoint_ignores_stale_grace_peer_for_loopback():
+    import app.main as main
+
+    seen: dict[str, int] = {}
+
+    class _RingReader:
+        async def list_active(
+            self,
+            stale_threshold_seconds: int = main.RING_STALE_THRESHOLD_SECONDS,
+            *,
+            require_endpoint: bool = False,
+        ) -> list[str]:
+            del require_endpoint
+            seen["threshold"] = stale_threshold_seconds
+            if stale_threshold_seconds <= main.RING_HEARTBEAT_INTERVAL_SECONDS:
+                return ["instance-a"]
+            return ["instance-a", "instance-old"]
+
+    settings = Settings(
+        http_responses_session_bridge_instance_id="instance-a",
+        http_responses_session_bridge_advertise_base_url="http://127.0.0.1:2455",
+    )
+
+    await main._validate_bridge_advertise_endpoint_for_multi_replica(
+        svc=_RingReader(),
+        settings=settings,
+        instance_id="instance-a",
+        endpoint_base_url=settings.http_responses_session_bridge_advertise_base_url,
+    )
+
+    assert seen["threshold"] == main.RING_HEARTBEAT_INTERVAL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_validate_bridge_advertise_endpoint_rejects_loopback_for_multi_replica_intent():
+    import app.main as main
+
+    class _RingReader:
+        async def list_active(
+            self,
+            stale_threshold_seconds: int = main.RING_STALE_THRESHOLD_SECONDS,
+            *,
+            require_endpoint: bool = False,
+        ) -> list[str]:
+            del require_endpoint
+            return ["instance-a"]
+
+    settings = Settings.model_construct(
+        http_responses_session_bridge_instance_id="instance-a",
+        http_responses_session_bridge_instance_ring=["instance-a", "instance-b"],
+        http_responses_session_bridge_advertise_base_url="http://127.0.0.1:2455",
+    )
+
+    with pytest.raises(RuntimeError):
+        await main._validate_bridge_advertise_endpoint_for_multi_replica(
+            svc=_RingReader(),
+            settings=settings,
+            instance_id="instance-a",
+            endpoint_base_url=settings.http_responses_session_bridge_advertise_base_url,
+        )
