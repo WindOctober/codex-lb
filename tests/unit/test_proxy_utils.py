@@ -3988,6 +3988,129 @@ async def test_prepare_websocket_response_create_request_logs_affinity_metadata(
     assert "prompt_cache_key_set=True" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_prepare_websocket_response_create_request_releases_reservation_on_payload_too_large(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    reservation = SimpleNamespace(reservation_id="res_large_ws", model="gpt-5.1")
+    reserve_usage = AsyncMock(return_value=reservation)
+    release_usage = AsyncMock()
+    api_key = ApiKeyData(
+        id="key_ws_large",
+        name="large",
+        key_prefix="sk-large",
+        allowed_models=["gpt-5.1"],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+
+    class Settings:
+        log_proxy_request_payload = False
+        log_proxy_request_shape = False
+        log_proxy_request_shape_raw_cache_key = False
+        log_proxy_service_tier_trace = False
+        openai_prompt_cache_key_derivation_enabled = True
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_WARN_BYTES", 64)
+    monkeypatch.setattr(proxy_service, "_UPSTREAM_RESPONSE_CREATE_MAX_BYTES", 128)
+    monkeypatch.setattr(service, "_reserve_websocket_api_key_usage", reserve_usage)
+    monkeypatch.setattr(service, "_release_websocket_reservation", release_usage)
+    monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
+
+    with pytest.raises(proxy_service.ProxyResponseError) as exc_info:
+        await service._prepare_websocket_response_create_request(
+            {
+                "type": "response.create",
+                "model": "gpt-5.1",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "x" * 256}]}],
+            },
+            headers={},
+            codex_session_affinity=False,
+            openai_cache_affinity=True,
+            sticky_threads_enabled=False,
+            openai_cache_affinity_max_age_seconds=300,
+            api_key=api_key,
+        )
+
+    assert exc_info.value.status_code == 413
+    release_usage.assert_awaited_once_with(reservation)
+
+
+def test_slim_response_create_payload_rewrites_top_level_historical_input_image():
+    payload: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "input": [
+            {"type": "input_image", "image_url": "data:image/png;base64," + ("A" * 1500)},
+            {"role": "user", "content": [{"type": "input_text", "text": "ping"}]},
+        ],
+    }
+
+    slimmed_payload, summary = proxy_service._slim_response_create_payload_for_upstream(payload, max_bytes=256)
+    slimmed_input = cast(list[JsonValue], slimmed_payload["input"])
+
+    assert summary is not None
+    assert summary["historical_images_slimmed"] == 1
+    assert slimmed_input[0] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": proxy_service._RESPONSE_CREATE_IMAGE_OMISSION_NOTICE}],
+    }
+    assert slimmed_input[-1] == {"role": "user", "content": [{"type": "input_text", "text": "ping"}]}
+
+
+def test_slim_response_create_preserves_all_items_when_no_user_message():
+    payload: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": "A" * 2000},
+            {"type": "function_call_output", "call_id": "call_2", "output": "B" * 2000},
+        ],
+    }
+
+    slimmed_payload, summary = proxy_service._slim_response_create_payload_for_upstream(payload, max_bytes=256)
+
+    slimmed_input = cast(list[JsonValue], slimmed_payload["input"])
+    assert len(slimmed_input) == 2
+    first = slimmed_input[0]
+    second = slimmed_input[1]
+    assert isinstance(first, dict) and first["call_id"] == "call_1"
+    assert isinstance(second, dict) and second["call_id"] == "call_2"
+    assert summary is None
+
+
+def test_slim_response_create_handles_object_valued_content_image():
+    payload: dict[str, JsonValue] = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "input": [
+            {
+                "role": "user",
+                "content": {"type": "input_image", "image_url": "data:image/png;base64," + ("A" * 1500)},
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "describe this"}]},
+        ],
+    }
+
+    slimmed_payload, summary = proxy_service._slim_response_create_payload_for_upstream(payload, max_bytes=4096)
+    slimmed_input = cast(list[JsonValue], slimmed_payload["input"])
+
+    assert isinstance(summary, dict)
+    assert summary["historical_images_slimmed"] == 1
+    assert len(slimmed_input) == 2
+    first_item = slimmed_input[0]
+    assert isinstance(first_item, dict)
+    first_content = first_item["content"]
+    assert isinstance(first_content, dict)
+    assert first_content["type"] == "input_text"
+
+
 def test_websocket_receive_timeout_prefers_idle_timeout_when_budget_allows(monkeypatch):
     monkeypatch.setattr(proxy_service.time, "monotonic", lambda: 100.0)
 
