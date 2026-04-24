@@ -83,6 +83,7 @@ export const DashboardOverviewSchema = z.object({
   lastSyncAt: z.string().datetime({ offset: true }).nullable(),
   timeframe: DashboardOverviewTimeframeSchema,
   accounts: z.array(AccountSummarySchema),
+  groupedAccounts: z.array(AccountSummarySchema).default([]),
   summary: z.object({
     primaryWindow: UsageSummaryWindowSchema,
     secondaryWindow: UsageSummaryWindowSchema.nullable(),

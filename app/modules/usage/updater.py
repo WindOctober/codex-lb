@@ -20,7 +20,7 @@ from app.core.plan_types import coerce_account_plan_type
 from app.core.usage.models import AdditionalRateLimitPayload, UsagePayload
 from app.core.utils.request_id import get_request_id
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, UsageHistory
+from app.db.models import ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, AccountStatus, UsageHistory
 from app.modules.accounts.auth_manager import AccountsRepositoryPort, AuthManager
 from app.modules.usage.additional_quota_keys import canonicalize_additional_quota_key
 from app.modules.usage.repository import AdditionalUsageRepository
@@ -209,6 +209,8 @@ class UsageUpdater:
         for account in accounts:
             if account.status == AccountStatus.DEACTIVATED:
                 continue
+            if account.provider_kind not in (None, ACCOUNT_PROVIDER_OPENAI_OAUTH):
+                continue
             if _is_usage_refresh_in_cooldown(account.id):
                 continue
             latest = latest_usage.get(account.id)
@@ -285,12 +287,16 @@ class UsageUpdater:
         *,
         usage_account_id: str | None,
     ) -> AccountRefreshResult:
+        if account.provider_kind not in (None, ACCOUNT_PROVIDER_OPENAI_OAUTH):
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         access_token = self._encryptor.decrypt(account.access_token_encrypted)
+        account_label = _usage_account_label(account)
         payload: UsagePayload | None = None
         try:
             payload = await fetch_usage(
                 access_token=access_token,
                 account_id=usage_account_id,
+                account_label=account_label,
             )
         except UsageFetchError as exc:
             if _should_deactivate_for_usage_error(exc):
@@ -305,10 +311,12 @@ class UsageUpdater:
                 _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
             access_token = self._encryptor.decrypt(account.access_token_encrypted)
+            account_label = _usage_account_label(account)
             try:
                 payload = await fetch_usage(
                     access_token=access_token,
                     account_id=usage_account_id,
+                    account_label=account_label,
                 )
             except UsageFetchError as retry_exc:
                 if _should_deactivate_for_usage_error(retry_exc):
@@ -483,6 +491,17 @@ def _credits_snapshot(payload: UsagePayload) -> tuple[bool | None, bool | None, 
 
 def _usage_entry_written(entry: UsageHistory | None) -> bool:
     return entry is not None
+
+
+def _usage_account_label(account: Account) -> str | None:
+    email = (account.email or "").strip()
+    if email:
+        return email
+    chatgpt_account_id = (account.chatgpt_account_id or "").strip()
+    if chatgpt_account_id:
+        return chatgpt_account_id
+    account_id = (account.id or "").strip()
+    return account_id or None
 
 
 def _prefer_merged_additional_window(

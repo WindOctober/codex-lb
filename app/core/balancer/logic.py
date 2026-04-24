@@ -61,6 +61,8 @@ class AccountState:
     deactivation_reason: str | None = None
     plan_type: str | None = None
     capacity_credits: float | None = None
+    source_rank: int = 0
+    configured_priority: int = 0
     health_tier: int = 0
 
 
@@ -70,11 +72,11 @@ class SelectionResult:
     error_message: str | None
 
 
-def _usage_sort_key(state: AccountState) -> tuple[float, float, float, str]:
+def _usage_sort_key(state: AccountState) -> tuple[float, float, float, float, str]:
     primary_used = state.used_percent if state.used_percent is not None else 0.0
     secondary_used = state.secondary_used_percent if state.secondary_used_percent is not None else primary_used
     last_selected = state.last_selected_at or 0.0
-    return secondary_used, primary_used, last_selected, state.account_id
+    return float(state.source_rank), secondary_used, primary_used, last_selected, state.account_id
 
 
 def _reset_bucket_days(state: AccountState, current: float) -> int:
@@ -219,10 +221,10 @@ def select_account(
                 return SelectionResult(None, f"Rate limit exceeded. Try again in {wait_seconds:.0f}s")
             return SelectionResult(None, "No available accounts")
 
-    def _reset_first_sort_key(state: AccountState) -> tuple[int, float, float, float, str]:
+    def _reset_first_sort_key(state: AccountState) -> tuple[float, int, float, float, float, str]:
         reset_bucket_days = _reset_bucket_days(state, current)
-        secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
-        return reset_bucket_days, secondary_used, primary_used, last_selected, account_id
+        source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
+        return source_rank, reset_bucket_days, secondary_used, primary_used, last_selected, account_id
 
     def _round_robin_sort_key(state: AccountState) -> tuple[float, str]:
         # Pick the least recently selected account, then stabilize by account_id.
@@ -264,9 +266,9 @@ def _remaining_secondary_credits(state: AccountState) -> float:
     return max(0.0, capacity * (1.0 - min(used_pct, 100.0) / 100.0))
 
 
-def _capacity_probe_sort_key(state: AccountState) -> tuple[float, float, float, float, str]:
-    secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
-    return (-_remaining_secondary_credits(state), secondary_used, primary_used, last_selected, account_id)
+def _capacity_probe_sort_key(state: AccountState) -> tuple[float, float, float, float, float, str]:
+    source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
+    return (source_rank, -_remaining_secondary_credits(state), secondary_used, primary_used, last_selected, account_id)
 
 
 def _select_capacity_weighted(available: list[AccountState]) -> AccountState:

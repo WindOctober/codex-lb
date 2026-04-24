@@ -26,8 +26,11 @@ class AccountUsage(DashboardModel):
 class AccountRequestUsage(DashboardModel):
     request_count: int = 0
     total_tokens: int = 0
+    tokens_7d: int = 0
     cached_input_tokens: int = 0
     total_cost_usd: float = 0.0
+    estimated_total_cost: float | None = None
+    estimated_total_cost_currency: str | None = None
 
 
 class AccountTokenStatus(DashboardModel):
@@ -61,6 +64,10 @@ class AccountSummary(DashboardModel):
     email: str
     display_name: str
     plan_type: str
+    provider_kind: str = "openai_oauth"
+    routing_tier: str = "openai_paid"
+    routing_priority: int = 0
+    configured_priority: int = 0
     status: str
     usage: AccountUsage | None = None
     reset_at_primary: datetime | None = None
@@ -89,6 +96,24 @@ class AccountImportResponse(DashboardModel):
     status: str
 
 
+class ApiProviderCreateRequest(DashboardModel):
+    name: str = Field(min_length=1, max_length=128)
+    base_url: str = Field(min_length=1, max_length=512)
+    api_key: str = Field(min_length=1, max_length=1024)
+    priority: int = Field(default=100, ge=0, le=100000)
+
+
+class ApiProviderCreateResponse(AccountImportResponse):
+    base_url: str
+    wire_api: str
+    priority: int
+    supported_models: list[str] = Field(default_factory=list)
+
+
+class AccountUpdateRequest(DashboardModel):
+    configured_priority: int = Field(ge=0, le=100000)
+
+
 class AccountPauseResponse(DashboardModel):
     status: str
 
@@ -99,6 +124,18 @@ class AccountReactivateResponse(DashboardModel):
 
 class AccountDeleteResponse(DashboardModel):
     status: str
+
+
+class AccountAvailabilityResponse(DashboardModel):
+    status: str
+    target_id: str
+    tested_count: int = 0
+    passed_count: int = 0
+    failed_count: int = 0
+    skipped_count: int = 0
+    active_count: int = 0
+    total_count: int = 0
+    failed_account_ids: list[str] = Field(default_factory=list)
 
 
 class AccountTrendsResponse(DashboardModel):

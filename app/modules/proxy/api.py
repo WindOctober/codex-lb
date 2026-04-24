@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
@@ -50,9 +51,10 @@ from app.core.types import JsonValue
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
-from app.db.models import Account, AccountStatus, UsageHistory
+from app.db.models import ACCOUNT_PROVIDER_API_KEY, Account, AccountStatus, UsageHistory
 from app.db.session import get_background_session
 from app.dependencies import ProxyContext, get_proxy_context, get_proxy_websocket_context
+from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import (
     ApiKeyData,
@@ -641,11 +643,11 @@ async def _build_models_response(api_key: ApiKeyData | None) -> Response:
         await _release_reservation(reservation)
         return JSONResponse(content=ModelListResponse(data=[]).model_dump(mode="json"))
 
-    items: list[ModelListItem] = []
+    items_by_id: dict[str, ModelListItem] = {}
     for slug, model in models.items():
         if not is_public_model(model, allowed_models):
             continue
-        items.append(
+        items_by_id[slug] = (
             ModelListItem(
                 id=slug,
                 created=created,
@@ -653,7 +655,28 @@ async def _build_models_response(api_key: ApiKeyData | None) -> Response:
                 metadata=_to_model_metadata(model),
             )
         )
+    async with get_background_session() as session:
+        accounts_repo = AccountsRepository(session)
+        accounts = await accounts_repo.list_accounts()
+    for account in accounts:
+        if account.provider_kind != ACCOUNT_PROVIDER_API_KEY:
+            continue
+        if account.status in {AccountStatus.PAUSED, AccountStatus.DEACTIVATED}:
+            continue
+        for model_id in _provider_supported_models(account):
+            if allowed_models is not None and model_id not in allowed_models:
+                continue
+            items_by_id.setdefault(
+                model_id,
+                ModelListItem(
+                    id=model_id,
+                    created=created,
+                    owned_by="codex-lb",
+                    metadata=_provider_model_metadata(model_id),
+                ),
+            )
     await _release_reservation(reservation)
+    items = sorted(items_by_id.values(), key=lambda item: item.id)
     return JSONResponse(content=ModelListResponse(data=items).model_dump(mode="json"))
 
 
@@ -748,6 +771,39 @@ def _to_model_metadata(model: UpstreamModel) -> ModelMetadata:
         supported_in_api=model.supported_in_api,
         minimal_client_version=model.minimal_client_version,
         priority=model.priority,
+    )
+
+
+def _provider_supported_models(account: Account) -> list[str]:
+    raw = account.supported_models_json
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid supported_models_json for account_id=%s", account.id)
+        return []
+    if not isinstance(payload, list):
+        return []
+    return sorted({item.strip() for item in payload if isinstance(item, str) and item.strip()})
+
+
+def _provider_model_metadata(model_id: str) -> ModelMetadata:
+    return ModelMetadata(
+        display_name=model_id,
+        description="Model advertised by a configured API-key upstream provider.",
+        context_window=0,
+        input_modalities=["text"],
+        supported_reasoning_levels=[],
+        default_reasoning_level=None,
+        supports_reasoning_summaries=False,
+        support_verbosity=False,
+        default_verbosity=None,
+        prefer_websockets=False,
+        supports_parallel_tool_calls=True,
+        supported_in_api=True,
+        minimal_client_version=None,
+        priority=0,
     )
 
 

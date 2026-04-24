@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Request, UploadFile
 
 from app.core.audit.service import AuditService
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
@@ -8,14 +8,19 @@ from app.core.exceptions import DashboardBadRequestError, DashboardConflictError
 from app.dependencies import AccountsContext, get_accounts_context
 from app.modules.accounts.repository import AccountIdentityConflictError
 from app.modules.accounts.schemas import (
+    AccountAvailabilityResponse,
     AccountDeleteResponse,
     AccountImportResponse,
     AccountPauseResponse,
     AccountReactivateResponse,
     AccountsResponse,
+    AccountSummary,
     AccountTrendsResponse,
+    AccountUpdateRequest,
+    ApiProviderCreateRequest,
+    ApiProviderCreateResponse,
 )
-from app.modules.accounts.service import InvalidAuthJsonError
+from app.modules.accounts.service import InvalidApiProviderError, InvalidAuthJsonError
 
 router = APIRouter(
     prefix="/api/accounts",
@@ -43,6 +48,17 @@ async def get_account_trends(
     return result
 
 
+@router.post("/{account_id}/availability", response_model=AccountAvailabilityResponse)
+async def test_account_availability(
+    account_id: str,
+    context: AccountsContext = Depends(get_accounts_context),
+) -> AccountAvailabilityResponse:
+    result = await context.service.test_availability(account_id)
+    if not result:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    return result
+
+
 @router.post("/import", response_model=AccountImportResponse)
 async def import_account(
     request: Request,
@@ -62,6 +78,24 @@ async def import_account(
         raise DashboardBadRequestError("Invalid auth.json payload", code="invalid_auth_json") from exc
     except AccountIdentityConflictError as exc:
         raise DashboardConflictError(str(exc), code="duplicate_identity_conflict") from exc
+
+
+@router.post("/providers", response_model=ApiProviderCreateResponse)
+async def create_api_provider(
+    request: Request,
+    payload: ApiProviderCreateRequest = Body(...),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> ApiProviderCreateResponse:
+    try:
+        response = await context.service.create_api_provider(payload)
+        AuditService.log_async(
+            "api_provider_created",
+            actor_ip=request.client.host if request.client else None,
+            details={"account_id": response.account_id, "base_url": response.base_url},
+        )
+        return response
+    except InvalidApiProviderError as exc:
+        raise DashboardBadRequestError(str(exc), code="invalid_api_provider") from exc
 
 
 @router.post("/{account_id}/reactivate", response_model=AccountReactivateResponse)
@@ -84,6 +118,18 @@ async def pause_account(
     if not success:
         raise DashboardNotFoundError("Account not found", code="account_not_found")
     return AccountPauseResponse(status="paused")
+
+
+@router.patch("/{account_id}", response_model=AccountSummary)
+async def update_account(
+    account_id: str,
+    payload: AccountUpdateRequest = Body(...),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> AccountSummary:
+    account = await context.service.update_account(account_id, payload)
+    if account is None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    return account
 
 
 @router.delete("/{account_id}", response_model=AccountDeleteResponse)

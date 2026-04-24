@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 from urllib.parse import urlparse, urlunparse
 
+from pydantic import ValidationError
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.datastructures import Headers
@@ -19,11 +20,14 @@ from websockets.exceptions import (
 from websockets.typing import Origin
 
 from app.core.clients.proxy import ProxyResponseError, filter_inbound_headers
+from app.core.clients.proxy import stream_responses as upstream_stream_responses
+from app.core.clients.upstream import build_responses_url
 from app.core.config.settings import get_settings
-from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope, openai_error
-from app.core.openai.models import OpenAIError
+from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.openai.parsing import parse_error_payload
+from app.core.openai.requests import ResponsesRequest
 from app.core.utils.request_id import get_request_id
+from app.core.utils.sse import extract_sse_data, parse_sse_data_json
 
 _WEBSOCKET_HOP_BY_HOP_HEADERS = {
     "accept",
@@ -102,6 +106,102 @@ class WebsocketsResponsesWebSocket:
         return str(value)
 
 
+class HTTPResponsesWebSocket:
+    def __init__(
+        self,
+        *,
+        headers: dict[str, str],
+        access_token: str,
+        account_id: str | None,
+        base_url: str | None,
+        wire_api: str,
+    ) -> None:
+        self._headers = dict(headers)
+        self._access_token = access_token
+        self._account_id = account_id
+        self._base_url = base_url
+        self._wire_api = wire_api
+        self._queue: asyncio.Queue[UpstreamWebSocketMessage] = asyncio.Queue()
+        self._stream_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
+        self._close_enqueued = False
+
+    async def send_text(self, text: str) -> None:
+        request = _responses_request_from_websocket_text(text)
+        task = asyncio.create_task(self._stream_request(request))
+        self._stream_tasks.add(task)
+        task.add_done_callback(self._stream_tasks.discard)
+
+    async def send_bytes(self, data: bytes) -> None:
+        await self._enqueue_error_event(
+            openai_error(
+                "not_implemented",
+                "Binary upstream websocket messages are not supported over HTTP responses transport",
+            )
+        )
+
+    async def receive(self) -> UpstreamWebSocketMessage:
+        if self._closed and self._queue.empty():
+            return UpstreamWebSocketMessage(kind="close")
+        return await self._queue.get()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        tasks = list(self._stream_tasks)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._enqueue_close()
+
+    def response_header(self, name: str) -> str | None:
+        return None
+
+    async def _stream_request(self, payload: ResponsesRequest) -> None:
+        try:
+            async for line in upstream_stream_responses(
+                payload,
+                self._headers,
+                self._access_token,
+                self._account_id,
+                base_url=self._base_url,
+                wire_api=self._wire_api,
+                raise_for_status=True,
+            ):
+                if self._closed:
+                    return
+                text_payload = _websocket_text_from_sse_event(line)
+                if text_payload is None:
+                    continue
+                await self._queue.put(UpstreamWebSocketMessage(kind="text", text=text_payload))
+        except ProxyResponseError as exc:
+            await self._enqueue_error_event(exc.payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._enqueue_error_event(
+                openai_error("upstream_error", str(exc) or "HTTP responses transport failed")
+            )
+
+    async def _enqueue_error_event(self, payload: OpenAIErrorEnvelope) -> None:
+        if self._closed:
+            return
+        await self._queue.put(
+            UpstreamWebSocketMessage(kind="text", text=_serialize_error_event_payload(payload))
+        )
+
+    async def _enqueue_close(self) -> None:
+        if self._close_enqueued:
+            return
+        self._close_enqueued = True
+        await self._queue.put(UpstreamWebSocketMessage(kind="close"))
+
+
 def filter_inbound_websocket_headers(headers: dict[str, str]) -> dict[str, str]:
     filtered = filter_inbound_headers(headers)
     return {key: value for key, value in filtered.items() if key.lower() not in _WEBSOCKET_HOP_BY_HOP_HEADERS}
@@ -143,8 +243,8 @@ def _pop_header_case_insensitive(headers: dict[str, str], name: str) -> str | No
     return None
 
 
-def _responses_websocket_url(base_url: str) -> str:
-    parsed = urlparse(f"{base_url.rstrip('/')}/codex/responses")
+def _responses_websocket_url(base_url: str, wire_api: str) -> str:
+    parsed = urlparse(build_responses_url(base_url, wire_api))
     if parsed.scheme == "https":
         scheme = "wss"
     elif parsed.scheme == "http":
@@ -160,13 +260,25 @@ async def connect_responses_websocket(
     account_id: str | None,
     *,
     base_url: str | None = None,
+    wire_api: str = "codex",
+    session: object | None = None,
 ) -> UpstreamResponsesWebSocket:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
-    url = _responses_websocket_url(upstream_base)
+    if wire_api != "codex":
+        return HTTPResponsesWebSocket(
+            headers=_build_upstream_websocket_headers(headers, access_token, account_id),
+            access_token=access_token,
+            account_id=account_id,
+            base_url=base_url,
+            wire_api=wire_api,
+        )
+    url = _responses_websocket_url(upstream_base, wire_api)
     upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
     origin = cast(Origin | None, _pop_header_case_insensitive(upstream_headers, "origin"))
     user_agent = _pop_header_case_insensitive(upstream_headers, "user-agent")
+    _ = session
+
     try:
         response = await websocket_connect(
             url,
@@ -218,6 +330,60 @@ def _close_code_from_exception(exc: ConnectionClosedOK | ConnectionClosedError) 
     return None
 
 
+def _responses_request_from_websocket_text(text: str) -> ResponsesRequest:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProxyResponseError(
+            400,
+            openai_error(
+                "invalid_request_error",
+                "Invalid websocket response.create payload",
+                error_type="invalid_request_error",
+            ),
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ProxyResponseError(
+            400,
+            openai_error(
+                "invalid_request_error",
+                "Invalid websocket response.create payload",
+                error_type="invalid_request_error",
+            ),
+        )
+    request_payload = dict(payload)
+    request_payload.pop("type", None)
+    request_payload.pop("client_metadata", None)
+    request_payload["stream"] = True
+    try:
+        return ResponsesRequest.model_validate(request_payload)
+    except ValidationError as exc:
+        raise ProxyResponseError(
+            400,
+            openai_error(
+                "invalid_request_error",
+                "Invalid websocket response.create payload",
+                error_type="invalid_request_error",
+            ),
+        ) from exc
+
+
+def _websocket_text_from_sse_event(event_block: str) -> str | None:
+    payload = parse_sse_data_json(event_block)
+    if payload is not None:
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    raw_data = extract_sse_data(event_block)
+    if raw_data is None:
+        return None
+    return raw_data
+
+
+def _serialize_error_event_payload(payload: OpenAIErrorEnvelope) -> str:
+    error_payload = payload.get("error") or openai_error("upstream_error", "Upstream error")["error"]
+    event = {"type": "error", "error": error_payload}
+    return json.dumps(event, ensure_ascii=True, separators=(",", ":"))
+
+
 def _handshake_error_payload(
     status_code: int,
     message: str,
@@ -260,23 +426,4 @@ def _try_parse_handshake_error_payload(
     error = parse_error_payload(payload)
     if error is None:
         return None
-    return {"error": _openai_error_detail(error)}
-
-
-def _openai_error_detail(error: OpenAIError) -> OpenAIErrorDetail:
-    detail: OpenAIErrorDetail = {}
-    if error.message is not None:
-        detail["message"] = error.message
-    if error.type is not None:
-        detail["type"] = error.type
-    if error.code is not None:
-        detail["code"] = error.code
-    if error.param is not None:
-        detail["param"] = error.param
-    if error.plan_type is not None:
-        detail["plan_type"] = error.plan_type
-    if error.resets_at is not None:
-        detail["resets_at"] = error.resets_at
-    if error.resets_in_seconds is not None:
-        detail["resets_in_seconds"] = error.resets_in_seconds
-    return detail
+    return {"error": error.model_dump(exclude_none=True)}

@@ -35,7 +35,7 @@ describe("formatters", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    useTimeFormatStore.setState({ timeFormat: "12h" });
+    useTimeFormatStore.setState({ timeFormat: "24h" });
   });
 
   afterEach(() => {
@@ -101,11 +101,13 @@ describe("formatters", () => {
     expect(formatted.date).not.toBe("--");
   });
 
-  it("respects the configured 12h or 24h time format", () => {
+  it("formats times without AM or PM", () => {
     const iso = "2026-01-01T00:00:00.000Z";
 
-    const twelveHour = formatTimeLong(iso).time;
-    expect(twelveHour).toMatch(/AM|PM/);
+    useTimeFormatStore.getState().setTimeFormat("12h");
+
+    const twelveHourPreference = formatTimeLong(iso).time;
+    expect(twelveHourPreference).not.toMatch(/AM|PM/);
 
     useTimeFormatStore.getState().setTimeFormat("24h");
 

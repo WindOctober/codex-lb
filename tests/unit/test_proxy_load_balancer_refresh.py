@@ -1428,7 +1428,9 @@ async def test_select_account_retries_after_post_persist_quota_exceeded(monkeypa
 
     selection = await balancer.select_account()
 
-    assert account.status == AccountStatus.QUOTA_EXCEEDED
+    # Fresh below-limit usage clears the persisted quota state immediately even
+    # if quota_exceeded was injected during the previous persistence pass.
+    assert account.status == AccountStatus.ACTIVE
     assert selection.account is None
 
 

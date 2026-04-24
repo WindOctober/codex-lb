@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.core import usage as usage_core
+from app.core.account_priorities import account_configured_priority, account_routing_priority, account_routing_tier
 from app.core.auth import DEFAULT_PLAN, extract_id_token_claims
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.usage.types import UsageTrendBucket, UsageWindowRow
 from app.core.utils.time import from_epoch_seconds
-from app.db.models import Account, UsageHistory
+from app.db.models import ACCOUNT_PROVIDER_API_KEY, Account, UsageHistory
 from app.modules.accounts.schemas import (
     AccountAdditionalQuota,
     AccountAuthStatus,
@@ -99,6 +100,10 @@ def _account_to_summary(
         email=account.email,
         display_name=account.email,
         plan_type=plan_type,
+        provider_kind=account.provider_kind,
+        routing_tier=account_routing_tier(account),
+        routing_priority=account_routing_priority(account),
+        configured_priority=account_configured_priority(account),
         status=account.status.value,
         usage=AccountUsage(
             primary_remaining_percent=primary_remaining_percent,
@@ -146,6 +151,13 @@ def _to_window_row(entry: UsageHistory) -> UsageWindowRow:
 
 
 def _build_auth_status(account: Account, encryptor: TokenEncryptor) -> AccountAuthStatus:
+    if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+        return AccountAuthStatus(
+            access=AccountTokenStatus(state="stored"),
+            refresh=AccountTokenStatus(state="n/a"),
+            id_token=AccountTokenStatus(state="n/a"),
+        )
+
     access_token = _decrypt_token(encryptor, account.access_token_encrypted)
     refresh_token = _decrypt_token(encryptor, account.refresh_token_encrypted)
     id_token = _decrypt_token(encryptor, account.id_token_encrypted)

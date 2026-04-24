@@ -44,6 +44,8 @@ from app.modules.dashboard import api as dashboard_api
 from app.modules.dashboard_auth import api as dashboard_auth_api
 from app.modules.firewall import api as firewall_api
 from app.modules.health import api as health_api
+from app.modules.news import api as news_api
+from app.modules.news.service import build_news_service
 from app.modules.oauth import api as oauth_api
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy.durable_bridge_repository import missing_durable_bridge_tables
@@ -55,6 +57,8 @@ from app.modules.proxy.ring_membership import (
     RingMembershipService,
 )
 from app.modules.request_logs import api as request_logs_api
+from app.modules.scholar import api as scholar_api
+from app.modules.scholar.service import build_scholar_service
 from app.modules.settings import api as settings_api
 from app.modules.sticky_sessions import api as sticky_sessions_api
 from app.modules.sticky_sessions.cleanup_scheduler import build_sticky_session_cleanup_scheduler
@@ -126,9 +130,15 @@ async def lifespan(app: FastAPI):
     usage_scheduler = build_usage_refresh_scheduler()
     model_scheduler = build_model_refresh_scheduler()
     sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()
+    news_service = build_news_service()
+    scholar_service = build_scholar_service()
+    app.state.news_service = news_service
+    app.state.scholar_service = scholar_service
     await usage_scheduler.start()
     await model_scheduler.start()
     await sticky_session_cleanup_scheduler.start()
+    await news_service.start()
+    await scholar_service.start()
     if settings.metrics_enabled and PROMETHEUS_AVAILABLE:
         import uvicorn
 
@@ -283,6 +293,8 @@ async def lifespan(app: FastAPI):
             metrics_server.should_exit = True
 
         await cache_poller.stop()
+        await scholar_service.stop()
+        await news_service.stop()
         await sticky_session_cleanup_scheduler.stop()
         await model_scheduler.stop()
         await usage_scheduler.stop()
@@ -361,6 +373,8 @@ def create_app() -> FastAPI:
     app.include_router(firewall_api.router)
     app.include_router(sticky_sessions_api.router)
     app.include_router(api_keys_api.router)
+    app.include_router(news_api.router)
+    app.include_router(scholar_api.router)
     app.include_router(health_api.router)
 
     static_dir = Path(__file__).parent / "static"

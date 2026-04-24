@@ -24,12 +24,17 @@ def log_status(log: RequestLog) -> str:
     return normalize_log_status(log.status, log.error_code)
 
 
-def to_request_log_entry(log: RequestLog, *, api_key_name: str | None = None) -> RequestLogEntry:
+def to_request_log_entry(
+    log: RequestLog,
+    *,
+    api_key_name: str | None = None,
+    plan_type: str | None = None,
+) -> RequestLogEntry:
     log_like = typing_cast(RequestLogLike, log)
     return RequestLogEntry(
         requested_at=log.requested_at,
         account_id=log.account_id,
-        plan_type=log.plan_type,
+        plan_type=plan_type if plan_type is not None else log.plan_type,
         api_key_name=api_key_name,
         request_id=log.request_id,
         model=log.model,

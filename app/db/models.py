@@ -48,6 +48,10 @@ class StickySessionKind(str, Enum):
     PROMPT_CACHE = "prompt_cache"
 
 
+ACCOUNT_PROVIDER_OPENAI_OAUTH = "openai_oauth"
+ACCOUNT_PROVIDER_API_KEY = "api_key"
+
+
 class Account(Base):
     __tablename__ = "accounts"
 
@@ -55,6 +59,16 @@ class Account(Base):
     chatgpt_account_id: Mapped[str | None] = mapped_column(String, nullable=True)
     email: Mapped[str] = mapped_column(String, nullable=False)
     plan_type: Mapped[str] = mapped_column(String, nullable=False)
+    provider_kind: Mapped[str] = mapped_column(
+        String,
+        default=ACCOUNT_PROVIDER_OPENAI_OAUTH,
+        server_default=text(f"'{ACCOUNT_PROVIDER_OPENAI_OAUTH}'"),
+        nullable=False,
+    )
+    upstream_base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    upstream_wire_api: Mapped[str | None] = mapped_column(String, nullable=True)
+    upstream_priority: Mapped[int] = mapped_column(Integer, default=100, server_default=text("100"), nullable=False)
+    supported_models_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     access_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     refresh_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)

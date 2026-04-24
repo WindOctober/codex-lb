@@ -58,6 +58,7 @@ class DashboardOverviewResponse(DashboardModel):
     last_sync_at: datetime | None = None
     timeframe: DashboardOverviewTimeframe
     accounts: List[AccountSummary] = Field(default_factory=list)
+    grouped_accounts: List[AccountSummary] = Field(default_factory=list)
     summary: DashboardOverviewSummary
     windows: DashboardUsageWindows
     trends: MetricsTrends

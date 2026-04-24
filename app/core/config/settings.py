@@ -177,12 +177,13 @@ class Settings(BaseSettings):
     log_proxy_service_tier_trace: bool = False
     log_upstream_request_summary: bool = False
     log_upstream_request_payload: bool = False
+    log_stream_idle_timeout_debug: bool = False
     max_decompressed_body_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     image_inline_fetch_enabled: bool = True
     image_inline_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
     model_registry_enabled: bool = True
     model_registry_refresh_interval_seconds: int = Field(default=300, gt=0)
-    model_registry_client_version: str = "0.101.0"
+    model_registry_client_version: str = "0.150.0"
     model_context_window_overrides: Annotated[dict[str, int], NoDecode] = Field(default_factory=dict)
     proxy_unauthenticated_client_cidrs: Annotated[list[str], NoDecode] = Field(default_factory=list)
     firewall_trust_proxy_headers: bool = False

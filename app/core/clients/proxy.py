@@ -34,6 +34,7 @@ from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
 from multidict import CIMultiDict
 
 from app.core.clients.http import get_http_client
+from app.core.clients.upstream import build_compact_responses_url, build_responses_url
 from app.core.config.settings import Settings, get_settings
 from app.core.errors import (
     OpenAIErrorDetail,
@@ -145,7 +146,7 @@ _HOP_BY_HOP_HEADER_NAMES = frozenset(
         "upgrade",
     }
 )
-_AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES = frozenset({426})
+_AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES = frozenset({403, 426})
 _WEBSOCKET_RESPONSE_CREATE_EXCLUDED_FIELDS = frozenset({"background", "stream"})
 _WEBSOCKET_HANDSHAKE_ERROR_HINTS = (
     ("account_deactivated", "account has been deactivated"),
@@ -276,6 +277,20 @@ async def _release_bound_half_open_probe(websocket: aiohttp.ClientWebSocketRespo
 
 class StreamIdleTimeoutError(Exception):
     pass
+
+
+@dataclass(slots=True)
+class _HTTPStreamDiagnostics:
+    request_started_at: float
+    first_chunk_at: float | None = None
+    last_chunk_at: float | None = None
+    chunk_count: int = 0
+    bytes_received: int = 0
+    event_count: int = 0
+    last_event_at: float | None = None
+    last_event_type: str | None = None
+    last_event_size: int = 0
+    partial_buffer_bytes: int = 0
 
 
 class StreamEventTooLargeError(Exception):
@@ -714,6 +729,7 @@ async def _iter_sse_events(
     resp: SSEResponse,
     idle_timeout_seconds: float,
     max_event_bytes: int,
+    diagnostics: _HTTPStreamDiagnostics | None = None,
 ) -> AsyncIterator[str]:
     async def _next_chunk() -> bytes:
         return await iterator.__anext__()
@@ -737,6 +753,8 @@ async def _iter_sse_events(
             done, _ = await asyncio.wait({next_chunk}, timeout=idle_timeout_seconds)
             if not done:
                 await _cancel_pending_chunk(next_chunk)
+                if diagnostics is not None:
+                    diagnostics.partial_buffer_bytes = len(buffer)
                 raise StreamIdleTimeoutError()
             chunk = await next_chunk
         except StopAsyncIteration:
@@ -748,24 +766,92 @@ async def _iter_sse_events(
         if not chunk:
             continue
 
+        if diagnostics is not None:
+            now = time.monotonic()
+            diagnostics.chunk_count += 1
+            diagnostics.bytes_received += len(chunk)
+            diagnostics.last_chunk_at = now
+            diagnostics.partial_buffer_bytes = 0
+            if diagnostics.first_chunk_at is None:
+                diagnostics.first_chunk_at = now
+
         buffer.extend(chunk)
         while True:
             raw_event = _pop_sse_event(buffer)
             if raw_event is None:
                 if len(buffer) > max_event_bytes:
+                    if diagnostics is not None:
+                        diagnostics.partial_buffer_bytes = len(buffer)
                     raise StreamEventTooLargeError(len(buffer), max_event_bytes)
+                if diagnostics is not None:
+                    diagnostics.partial_buffer_bytes = len(buffer)
                 break
 
             if len(raw_event) > max_event_bytes:
                 raise StreamEventTooLargeError(len(raw_event), max_event_bytes)
 
             if raw_event.strip():
+                if diagnostics is not None:
+                    diagnostics.event_count += 1
+                    diagnostics.last_event_at = time.monotonic()
+                    diagnostics.last_event_size = len(raw_event)
+                    diagnostics.partial_buffer_bytes = len(buffer)
                 yield raw_event.decode("utf-8", errors="replace")
 
     if buffer:
         if len(buffer) > max_event_bytes:
+            if diagnostics is not None:
+                diagnostics.partial_buffer_bytes = len(buffer)
             raise StreamEventTooLargeError(len(buffer), max_event_bytes)
+        if diagnostics is not None:
+            diagnostics.partial_buffer_bytes = len(buffer)
         yield bytes(buffer).decode("utf-8", errors="replace")
+
+
+def _maybe_log_http_stream_idle_timeout(
+    *,
+    settings: object,
+    url: str,
+    headers: Mapping[str, str],
+    diagnostics: _HTTPStreamDiagnostics,
+    idle_timeout_seconds: float,
+) -> None:
+    if not getattr(settings, "log_stream_idle_timeout_debug", False):
+        return
+
+    now = time.monotonic()
+    request_age_ms = int((now - diagnostics.request_started_at) * 1000)
+    first_chunk_after_ms = (
+        None
+        if diagnostics.first_chunk_at is None
+        else int((diagnostics.first_chunk_at - diagnostics.request_started_at) * 1000)
+    )
+    last_chunk_ago_ms = None if diagnostics.last_chunk_at is None else int((now - diagnostics.last_chunk_at) * 1000)
+    last_event_ago_ms = None if diagnostics.last_event_at is None else int((now - diagnostics.last_event_at) * 1000)
+
+    logger.warning(
+        (
+            "http_stream_idle_timeout_debug request_id=%s target=%s account_id=%s "
+            "idle_timeout_s=%s request_age_ms=%s first_chunk_after_ms=%s "
+            "last_chunk_ago_ms=%s last_event_ago_ms=%s chunk_count=%s "
+            "event_count=%s bytes_received=%s partial_buffer_bytes=%s "
+            "last_event_type=%s last_event_size=%s"
+        ),
+        get_request_id(),
+        _summarize_upstream_target(url),
+        headers.get("chatgpt-account-id"),
+        int(idle_timeout_seconds),
+        request_age_ms,
+        first_chunk_after_ms,
+        last_chunk_ago_ms,
+        last_event_ago_ms,
+        diagnostics.chunk_count,
+        diagnostics.event_count,
+        diagnostics.bytes_received,
+        diagnostics.partial_buffer_bytes,
+        diagnostics.last_event_type,
+        diagnostics.last_event_size,
+    )
 
 
 async def _error_event_from_response(resp: ErrorResponse) -> ResponseFailedEvent:
@@ -1770,13 +1856,14 @@ async def stream_responses(
     access_token: str,
     account_id: str | None,
     base_url: str | None = None,
+    wire_api: str | None = None,
     raise_for_status: bool = False,
     session: aiohttp.ClientSession | None = None,
     upstream_stream_transport_override: str | None = None,
 ) -> AsyncIterator[str]:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
-    url = f"{upstream_base}/codex/responses"
+    url = build_responses_url(upstream_base, wire_api or "codex")
     pre_request_started_at = time.monotonic()
     # Keep a default total timeout so direct callers cannot hang forever before
     # response headers or the first SSE event. ProxyService stream attempts clamp
@@ -1828,6 +1915,7 @@ async def stream_responses(
         sock_read=None,
     )
     started_at = time.monotonic()
+    http_stream_diagnostics = _HTTPStreamDiagnostics(request_started_at=started_at)
 
     async def _stream_via_http(
         current_headers: Mapping[str, str],
@@ -1860,10 +1948,12 @@ async def stream_responses(
                 resp,
                 effective_idle_timeout,
                 settings.max_sse_event_bytes,
+                diagnostics=http_stream_diagnostics,
             ):
                 event_block = _normalize_sse_event_block(event_block)
                 event = parse_sse_event(event_block)
                 if event:
+                    http_stream_diagnostics.last_event_type = event.type
                     event_type = event.type
                     if event_type in ("response.completed", "response.failed", "response.incomplete"):
                         seen_terminal = True
@@ -1974,6 +2064,13 @@ async def stream_responses(
     except StreamIdleTimeoutError:
         error_code = "stream_idle_timeout"
         error_message = "Upstream stream idle timeout"
+        _maybe_log_http_stream_idle_timeout(
+            settings=settings,
+            url=url,
+            headers=upstream_headers,
+            diagnostics=http_stream_diagnostics,
+            idle_timeout_seconds=effective_idle_timeout,
+        )
         yield format_sse_event(
             response_failed_event(
                 "stream_idle_timeout",
@@ -2151,6 +2248,8 @@ async def compact_responses(
     headers: Mapping[str, str],
     access_token: str,
     account_id: str | None,
+    base_url: str | None = None,
+    wire_api: str | None = None,
     session: aiohttp.ClientSession | None = None,
 ) -> CompactResponsePayload:
     transport = _CompactCommandTransport(
@@ -2158,6 +2257,8 @@ async def compact_responses(
         headers=headers,
         access_token=access_token,
         account_id=account_id,
+        base_url=base_url,
+        wire_api=wire_api or "codex",
         session=session or get_http_client().session,
     )
     return await transport.execute()
@@ -2173,12 +2274,17 @@ class _CompactCommandTransport:
     headers: Mapping[str, str]
     access_token: str
     account_id: str | None
+    base_url: str | None
+    wire_api: str
     session: aiohttp.ClientSession
 
     async def execute(self) -> CompactResponsePayload:
         settings = get_settings()
-        upstream_base = settings.upstream_base_url.rstrip("/")
-        url = f"{upstream_base}/codex/responses/compact"
+        upstream_base = (self.base_url or settings.upstream_base_url).rstrip("/")
+        if self.wire_api in {"responses", "v1"}:
+            url = build_responses_url(upstream_base, self.wire_api)
+        else:
+            url = build_compact_responses_url(upstream_base)
         upstream_headers = _build_upstream_headers(
             self.headers,
             self.access_token,

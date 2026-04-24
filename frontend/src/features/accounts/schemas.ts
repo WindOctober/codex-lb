@@ -17,9 +17,12 @@ export const AccountUsageSchema = z.object({
 
 export const AccountRequestUsageSchema = z.object({
   requestCount: z.number().int().nonnegative(),
+  tokens7d: z.number().int().nonnegative().optional(),
   totalTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
   totalCostUsd: z.number().nonnegative(),
+  estimatedTotalCost: z.number().nullable().optional(),
+  estimatedTotalCostCurrency: z.string().nullable().optional(),
 });
 
 export const AccountTokenStatusSchema = z.object({
@@ -53,6 +56,10 @@ export const AccountSummarySchema = z.object({
   email: z.string(),
   displayName: z.string(),
   planType: z.string(),
+  providerKind: z.string().optional(),
+  routingTier: z.string().optional(),
+  routingPriority: z.number().int().optional(),
+  configuredPriority: z.number().int().optional(),
   status: z.string(),
   usage: AccountUsageSchema.nullable().optional(),
   resetAtPrimary: z.string().datetime({ offset: true }).nullable().optional(),
@@ -79,6 +86,36 @@ export const AccountImportResponseSchema = z.object({
   email: z.string(),
   planType: z.string(),
   status: z.string(),
+});
+
+export const ApiProviderCreateRequestSchema = z.object({
+  name: z.string().trim().min(1),
+  baseUrl: z.string().trim().min(1),
+  apiKey: z.string().trim().min(1),
+  priority: z.number().int().min(0).max(100000).default(100),
+});
+
+export const ApiProviderCreateResponseSchema = AccountImportResponseSchema.extend({
+  baseUrl: z.string(),
+  wireApi: z.string(),
+  priority: z.number().int(),
+  supportedModels: z.array(z.string()).default([]),
+});
+
+export const AccountUpdateRequestSchema = z.object({
+  configuredPriority: z.number().int().min(0).max(100000),
+});
+
+export const AccountAvailabilityResponseSchema = z.object({
+  status: z.string(),
+  targetId: z.string(),
+  testedCount: z.number().int().nonnegative(),
+  passedCount: z.number().int().nonnegative(),
+  failedCount: z.number().int().nonnegative(),
+  skippedCount: z.number().int().nonnegative(),
+  activeCount: z.number().int().nonnegative(),
+  totalCount: z.number().int().nonnegative(),
+  failedAccountIds: z.array(z.string()).default([]),
 });
 
 export const AccountActionResponseSchema = z.object({
@@ -151,6 +188,9 @@ export type AccountSummary = z.infer<typeof AccountSummarySchema>;
 export type AccountAdditionalWindow = z.infer<typeof AccountAdditionalWindowSchema>;
 export type AccountAdditionalQuota = z.infer<typeof AccountAdditionalQuotaSchema>;
 export type AccountTrendsResponse = z.infer<typeof AccountTrendsResponseSchema>;
+export type ApiProviderCreateRequest = z.infer<typeof ApiProviderCreateRequestSchema>;
+export type ApiProviderCreateResponse = z.infer<typeof ApiProviderCreateResponseSchema>;
+export type AccountAvailabilityResponse = z.infer<typeof AccountAvailabilityResponseSchema>;
 export type OauthStartResponse = z.infer<typeof OauthStartResponseSchema>;
 export type OauthStatusResponse = z.infer<typeof OauthStatusResponseSchema>;
 export type ManualOauthCallbackResponse = z.infer<typeof ManualOauthCallbackResponseSchema>;

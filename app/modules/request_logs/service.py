@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from app.modules.proxy.service import ProxyService
 from app.modules.request_logs.mappers import (
     QUOTA_CODES,
     RATE_LIMIT_CODES,
@@ -10,7 +11,7 @@ from app.modules.request_logs.mappers import (
     to_request_log_entry,
 )
 from app.modules.request_logs.repository import RequestLogsRepository
-from app.modules.request_logs.schemas import RequestLogEntry
+from app.modules.request_logs.schemas import RequestLogEntry, RequestLogSessionStatusResponse
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,84 @@ class RequestLogsService:
     def __init__(self, repo: RequestLogsRepository) -> None:
         self._repo = repo
 
+    async def get_request_session_status(
+        self,
+        request_id: str,
+        *,
+        proxy_service: ProxyService,
+    ) -> RequestLogSessionStatusResponse:
+        normalized_request_id = (request_id or "").strip()
+        if not normalized_request_id:
+            return RequestLogSessionStatusResponse(
+                request_id="",
+                log_found=False,
+                observed_state="not_found",
+                state_detail="Request id is empty.",
+                live=False,
+            )
+
+        log = await self._repo.get_latest_by_request_id(normalized_request_id)
+        live_snapshot = await proxy_service.get_http_bridge_request_status(normalized_request_id)
+
+        if live_snapshot is None:
+            if log is None:
+                return RequestLogSessionStatusResponse(
+                    request_id=normalized_request_id,
+                    log_found=False,
+                    observed_state="not_found",
+                    state_detail="No persisted request log or live HTTP bridge session matched this request id.",
+                    live=False,
+                )
+            return RequestLogSessionStatusResponse(
+                request_id=normalized_request_id,
+                log_found=True,
+                log_status=normalize_log_status(log.status, log.error_code),
+                log_error_code=log.error_code,
+                observed_state="completed_logged",
+                state_detail=(
+                    "Persisted request log exists, but no related live HTTP bridge session "
+                    "is currently tracked."
+                ),
+                live=False,
+                account_id=log.account_id,
+                request_model=log.model,
+            )
+
+        return RequestLogSessionStatusResponse(
+            request_id=normalized_request_id,
+            log_found=log is not None,
+            log_status=normalize_log_status(log.status, log.error_code) if log is not None else None,
+            log_error_code=log.error_code if log is not None else None,
+            observed_state=live_snapshot.observed_state,
+            state_detail=live_snapshot.state_detail,
+            live=live_snapshot.live,
+            matched_by=live_snapshot.matched_by,
+            account_id=live_snapshot.account_id or (log.account_id if log is not None else None),
+            request_model=live_snapshot.request_model or (log.model if log is not None else None),
+            session_affinity_kind=live_snapshot.session_affinity_kind,
+            session_affinity_key_hash=live_snapshot.session_affinity_key_hash,
+            session_api_key_id=live_snapshot.session_api_key_id,
+            session_codex=live_snapshot.session_codex,
+            session_closed=live_snapshot.session_closed,
+            reconnect_requested=live_snapshot.reconnect_requested,
+            queued_request_count=live_snapshot.queued_request_count,
+            pending_request_count=live_snapshot.pending_request_count,
+            last_used_ago_ms=live_snapshot.last_used_ago_ms,
+            last_upstream_event_ago_ms=live_snapshot.last_upstream_event_ago_ms,
+            last_downstream_emit_ago_ms=live_snapshot.last_downstream_emit_ago_ms,
+            upstream_turn_state=live_snapshot.upstream_turn_state,
+            downstream_turn_state=live_snapshot.downstream_turn_state,
+            matched_request_id=live_snapshot.matched_request_id,
+            matched_response_id=live_snapshot.matched_response_id,
+            matched_previous_response_id=live_snapshot.matched_previous_response_id,
+            awaiting_response_created=live_snapshot.awaiting_response_created,
+            replay_count=live_snapshot.replay_count,
+            downstream_connected=live_snapshot.downstream_connected,
+            request_age_ms=live_snapshot.request_age_ms,
+            request_last_upstream_event_ago_ms=live_snapshot.request_last_upstream_event_ago_ms,
+            request_last_downstream_emit_ago_ms=live_snapshot.request_last_downstream_emit_ago_ms,
+        )
+
     async def list_recent(
         self,
         limit: int = 50,
@@ -78,11 +157,14 @@ class RequestLogsService:
             error_codes_excluding=status_filter.error_codes_excluding,
         )
         api_key_ids = [log.api_key_id for log in logs if log.api_key_id]
+        missing_plan_account_ids = [log.account_id for log in logs if log.account_id and not log.plan_type]
         api_key_name_by_id = await self._repo.get_api_key_names_by_ids(api_key_ids)
+        plan_type_by_account_id = await self._repo.get_account_plan_types_by_ids(missing_plan_account_ids)
         requests = [
             to_request_log_entry(
                 log,
                 api_key_name=api_key_name_by_id.get(log.api_key_id or ""),
+                plan_type=log.plan_type or plan_type_by_account_id.get(log.account_id or ""),
             )
             for log in logs
         ]

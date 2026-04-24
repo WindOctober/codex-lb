@@ -11,7 +11,13 @@ import {
   quotaBarColor,
   quotaBarTrack,
 } from "@/utils/account-status";
-import { formatPercentNullable, formatQuotaResetLabel, formatSlug } from "@/utils/formatters";
+import {
+  formatCompactNumber,
+  formatCurrency,
+  formatPercentNullable,
+  formatQuotaResetLabel,
+  formatSlug,
+} from "@/utils/formatters";
 
 type AccountAction = "details" | "resume" | "reauth";
 
@@ -65,9 +71,55 @@ function QuotaBar({
   );
 }
 
+const cnyFormatter = new Intl.NumberFormat("zh-CN", {
+  style: "currency",
+  currency: "CNY",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+function formatProviderCost(value: unknown, currency: string | null | undefined): string {
+  if (currency === "CNY") {
+    const numeric = typeof value === "number" && Number.isFinite(value) ? value : Number(value);
+    return Number.isFinite(numeric) ? cnyFormatter.format(numeric) : "--";
+  }
+  return formatCurrency(value);
+}
+
+function ProviderUsageSummary({ account }: { account: AccountSummary }) {
+  const requestUsage = account.requestUsage ?? null;
+
+  return (
+    <div className="mt-3.5 space-y-2.5 rounded-lg border bg-muted/20 px-3 py-3">
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="text-muted-foreground">Tokens (7d)</span>
+        <span className="tabular-nums font-medium">
+          {formatCompactNumber(requestUsage?.tokens7d ?? 0)}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="text-muted-foreground">Tokens (Total)</span>
+        <span className="tabular-nums font-medium">
+          {formatCompactNumber(requestUsage?.totalTokens ?? 0)}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="text-muted-foreground">Est. Price</span>
+        <span className="tabular-nums font-medium">
+          {formatProviderCost(
+            requestUsage?.estimatedTotalCost ?? requestUsage?.totalCostUsd ?? 0,
+            requestUsage?.estimatedTotalCostCurrency ?? "USD",
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function AccountCard({ account, showAccountId = false, onAction }: AccountCardProps) {
   const blurred = usePrivacyStore((s) => s.blurred);
   const status = normalizeStatus(account.status);
+  const isApiKeyProvider = account.providerKind === "api_key";
   const primaryRemaining = account.usage?.primaryRemainingPercent ?? null;
   const secondaryRemaining = account.usage?.secondaryRemainingPercent ?? null;
   const weeklyOnly = account.windowMinutesPrimary == null && account.windowMinutesSecondary != null;
@@ -107,11 +159,14 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
         <StatusBadge status={status} />
       </div>
 
-      {/* Quota bars */}
-      <div className={cn("mt-3.5 grid gap-3", weeklyOnly ? "grid-cols-1" : "grid-cols-2")}>
-        {!weeklyOnly && <QuotaBar label="5h" percent={primaryRemaining} resetLabel={primaryReset} />}
-        <QuotaBar label="Weekly" percent={secondaryRemaining} resetLabel={secondaryReset} />
-      </div>
+      {isApiKeyProvider ? (
+        <ProviderUsageSummary account={account} />
+      ) : (
+        <div className={cn("mt-3.5 grid gap-3", weeklyOnly ? "grid-cols-1" : "grid-cols-2")}>
+          {!weeklyOnly && <QuotaBar label="5h" percent={primaryRemaining} resetLabel={primaryReset} />}
+          <QuotaBar label="Weekly" percent={secondaryRemaining} resetLabel={secondaryReset} />
+        </div>
+      )}
 
       {/* Actions */}
       <div className="mt-3 flex items-center gap-1.5 border-t pt-3">

@@ -1,10 +1,15 @@
-import { del, get, post } from "@/lib/api-client";
+import { del, get, patch, post } from "@/lib/api-client";
 
 import {
   AccountActionResponseSchema,
+  AccountAvailabilityResponseSchema,
   AccountImportResponseSchema,
+  AccountSummarySchema,
+  AccountUpdateRequestSchema,
   AccountsResponseSchema,
   AccountTrendsResponseSchema,
+  ApiProviderCreateRequestSchema,
+  ApiProviderCreateResponseSchema,
   ManualOauthCallbackRequestSchema,
   ManualOauthCallbackResponseSchema,
   OauthCompleteRequestSchema,
@@ -14,6 +19,7 @@ import {
   OauthStatusResponseSchema,
   RuntimeConnectAddressResponseSchema,
 } from "@/features/accounts/schemas";
+import type { ApiProviderCreateRequest } from "@/features/accounts/schemas";
 
 const ACCOUNTS_BASE_PATH = "/api/accounts";
 const OAUTH_BASE_PATH = "/api/oauth";
@@ -28,6 +34,27 @@ export function importAccount(file: File) {
   return post(`${ACCOUNTS_BASE_PATH}/import`, AccountImportResponseSchema, {
     body: formData,
   });
+}
+
+export function createApiProvider(payload: ApiProviderCreateRequest) {
+  const validated = ApiProviderCreateRequestSchema.parse(payload);
+  return post(`${ACCOUNTS_BASE_PATH}/providers`, ApiProviderCreateResponseSchema, {
+    body: validated,
+  });
+}
+
+export function updateAccountPriority(accountId: string, configuredPriority: number) {
+  const validated = AccountUpdateRequestSchema.parse({ configuredPriority });
+  return patch(`${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`, AccountSummarySchema, {
+    body: validated,
+  });
+}
+
+export function testAccountAvailability(accountId: string) {
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/availability`,
+    AccountAvailabilityResponseSchema,
+  );
 }
 
 export function pauseAccount(accountId: string) {

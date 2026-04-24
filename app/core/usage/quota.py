@@ -30,11 +30,10 @@ def apply_usage_quota(
                 reset_at = secondary_reset
             return status, used_percent, reset_at
         if status == AccountStatus.QUOTA_EXCEEDED:
-            if runtime_reset and runtime_reset > time.time():
-                reset_at = runtime_reset
-            else:
-                status = AccountStatus.ACTIVE
-                reset_at = None
+            # Fresh usage snapshots below the quota threshold should clear stale
+            # persisted quota flags immediately.
+            status = AccountStatus.ACTIVE
+            reset_at = None
     elif status == AccountStatus.QUOTA_EXCEEDED and secondary_reset is not None:
         reset_at = secondary_reset
 
@@ -48,11 +47,10 @@ def apply_usage_quota(
                 reset_at = _fallback_primary_reset(primary_window_minutes) or reset_at
             return status, used_percent, reset_at
         if status == AccountStatus.RATE_LIMITED:
-            if runtime_reset and runtime_reset > time.time():
-                reset_at = runtime_reset
-            else:
-                status = AccountStatus.ACTIVE
-                reset_at = None
+            # Fresh usage snapshots below the rate-limit threshold should clear
+            # stale runtime flags immediately.
+            status = AccountStatus.ACTIVE
+            reset_at = None
 
     return status, used_percent, reset_at
 

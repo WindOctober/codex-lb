@@ -10,23 +10,21 @@ describe("AppearanceSettings", () => {
   beforeEach(() => {
     window.localStorage.clear();
     useThemeStore.setState({ preference: "light", theme: "light", initialized: true });
-    useTimeFormatStore.setState({ timeFormat: "12h" });
+    useTimeFormatStore.setState({ timeFormat: "24h" });
   });
 
-  it("exposes selected state for the time-format toggle", async () => {
+  it("exposes selected state for the 24h time-format toggle", async () => {
     const user = userEvent.setup();
 
     render(<AppearanceSettings />);
 
-    const button12h = screen.getByRole("button", { name: /12h/i });
     const button24h = screen.getByRole("button", { name: /24h/i });
 
-    expect(button12h).toHaveAttribute("aria-pressed", "true");
-    expect(button24h).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("button", { name: /12h/i })).not.toBeInTheDocument();
+    expect(button24h).toHaveAttribute("aria-pressed", "true");
 
     await user.click(button24h);
 
-    expect(button12h).toHaveAttribute("aria-pressed", "false");
     expect(button24h).toHaveAttribute("aria-pressed", "true");
     expect(useTimeFormatStore.getState().timeFormat).toBe("24h");
   });

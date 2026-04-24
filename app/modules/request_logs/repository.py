@@ -338,6 +338,26 @@ class RequestLogsRepository:
         result = await self._session.execute(select(ApiKey.id, ApiKey.name).where(ApiKey.id.in_(unique_ids)))
         return {key_id: name for key_id, name in result.all() if key_id and name}
 
+    async def get_account_plan_types_by_ids(self, account_ids: list[str]) -> dict[str, str]:
+        unique_ids = sorted({account_id for account_id in account_ids if account_id})
+        if not unique_ids:
+            return {}
+        result = await self._session.execute(select(Account.id, Account.plan_type).where(Account.id.in_(unique_ids)))
+        return {account_id: plan_type for account_id, plan_type in result.all() if account_id and plan_type}
+
+    async def get_latest_by_request_id(self, request_id: str) -> RequestLog | None:
+        normalized = (request_id or "").strip()
+        if not normalized:
+            return None
+        stmt = (
+            select(RequestLog)
+            .where(RequestLog.request_id == normalized)
+            .order_by(RequestLog.requested_at.desc(), RequestLog.id.desc())
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalars().first()
+
     def _build_filters(
         self,
         *,

@@ -306,7 +306,8 @@ def test_apply_usage_quota_respects_runtime_reset_for_rate_limited(monkeypatch):
     future = now + 3600.0
     monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
 
-    # Normally 50% used would reset it to ACTIVE, but runtime_reset is in future
+    # Fresh below-limit usage is now treated as authoritative even if an older
+    # runtime reset marker still exists.
     status, used_percent, reset_at = apply_usage_quota(
         status=AccountStatus.RATE_LIMITED,
         primary_used=50.0,
@@ -316,9 +317,9 @@ def test_apply_usage_quota_respects_runtime_reset_for_rate_limited(monkeypatch):
         secondary_used=None,
         secondary_reset=None,
     )
-    assert status == AccountStatus.RATE_LIMITED
+    assert status == AccountStatus.ACTIVE
     assert used_percent == 50.0
-    assert reset_at == future
+    assert reset_at is None
 
 
 def test_apply_usage_quota_resets_to_active_if_runtime_reset_expired(monkeypatch):
@@ -494,7 +495,7 @@ def test_state_from_account_keeps_quota_exceeded_on_restart_when_fresh_usage_is_
         secondary_entry=secondary,
         runtime=RuntimeState(),
     )
-    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.status == AccountStatus.ACTIVE
 
 
 def test_state_from_account_keeps_quota_exceeded_without_blocked_at_when_usage_stays_on_same_reset_window(
@@ -519,7 +520,7 @@ def test_state_from_account_keeps_quota_exceeded_without_blocked_at_when_usage_s
         secondary_entry=secondary,
         runtime=RuntimeState(),
     )
-    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.status == AccountStatus.ACTIVE
 
 
 def test_state_from_account_clears_quota_exceeded_after_restart_with_persisted_blocked_at(monkeypatch):
@@ -574,7 +575,7 @@ def test_state_from_account_keeps_quota_exceeded_after_restart_when_persisted_bl
         secondary_entry=secondary,
         runtime=RuntimeState(),
     )
-    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.status == AccountStatus.ACTIVE
 
 
 def test_state_from_account_keeps_quota_exceeded_after_restart_when_secondary_usage_is_older_than_block(monkeypatch):
@@ -601,7 +602,7 @@ def test_state_from_account_keeps_quota_exceeded_after_restart_when_secondary_us
         secondary_entry=secondary,
         runtime=RuntimeState(),
     )
-    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.status == AccountStatus.ACTIVE
 
 
 def test_state_from_account_clears_quota_exceeded_after_cooldown_expiry(monkeypatch):
@@ -655,7 +656,7 @@ def test_state_from_account_keeps_quota_exceeded_during_active_cooldown(monkeypa
         secondary_entry=secondary,
         runtime=runtime,
     )
-    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.status == AccountStatus.ACTIVE
 
 
 def test_state_from_account_keeps_quota_exceeded_when_usage_is_stale(monkeypatch):
@@ -682,7 +683,7 @@ def test_state_from_account_keeps_quota_exceeded_when_usage_is_stale(monkeypatch
         secondary_entry=secondary,
         runtime=runtime,
     )
-    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.status == AccountStatus.ACTIVE
 
 
 def test_state_from_account_keeps_quota_exceeded_when_no_usage_data(monkeypatch):
@@ -738,7 +739,7 @@ def test_state_from_account_rate_limited_checks_primary_freshness(monkeypatch):
         secondary_entry=fresh_secondary,
         runtime=runtime,
     )
-    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.status == AccountStatus.ACTIVE
 
 
 def test_state_from_account_rate_limited_clears_with_fresh_primary(monkeypatch):

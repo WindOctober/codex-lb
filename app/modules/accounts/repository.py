@@ -2,25 +2,45 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Account, AccountStatus, DashboardSettings, RequestLog, StickySession, UsageHistory
+from app.core.usage.pricing import (
+    UsageTokens,
+    _effective_rates,
+    calculate_cost_from_usage,
+    get_pricing_for_model,
+)
+from app.db.models import (
+    ACCOUNT_PROVIDER_API_KEY,
+    ACCOUNT_PROVIDER_OPENAI_OAUTH,
+    Account,
+    AccountStatus,
+    DashboardSettings,
+    RequestLog,
+    StickySession,
+    UsageHistory,
+)
 
 _SETTINGS_ROW_ID = 1
 _DUPLICATE_ACCOUNT_SUFFIX = "__copy"
 _UNSET = object()
+_DUCKCODING_CNY_INPUT_PER_1M = 1.25
+_DUCKCODING_CNY_CACHED_PER_1M = _DUCKCODING_CNY_INPUT_PER_1M / 10.0
 
 
 @dataclass(frozen=True, slots=True)
 class AccountRequestUsageSummary:
     request_count: int
     total_tokens: int
+    tokens_7d: int
     cached_input_tokens: int
     total_cost_usd: float
+    estimated_total_cost: float | None = None
+    estimated_total_cost_currency: str | None = None
 
 
 class AccountIdentityConflictError(Exception):
@@ -43,31 +63,69 @@ class AccountsRepository:
         result = await self._session.execute(select(Account).order_by(Account.email))
         return list(result.scalars().all())
 
+    async def list_openai_accounts(self) -> list[Account]:
+        result = await self._session.execute(
+            select(Account)
+            .where(Account.provider_kind == ACCOUNT_PROVIDER_OPENAI_OAUTH)
+            .order_by(Account.email)
+        )
+        return list(result.scalars().all())
+
+    async def has_active_api_key_accounts(self) -> bool:
+        result = await self._session.execute(
+            select(Account.id)
+            .where(Account.provider_kind == ACCOUNT_PROVIDER_API_KEY)
+            .where(Account.status.notin_((AccountStatus.PAUSED, AccountStatus.DEACTIVATED)))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def list_request_usage_summary_by_account(
         self,
         account_ids: list[str] | None = None,
     ) -> dict[str, AccountRequestUsageSummary]:
-        summaries: dict[str, AccountRequestUsageSummary] = {}
+        since_7d = datetime.utcnow() - timedelta(days=7)
+        accounts_stmt = select(Account)
+        if account_ids:
+            accounts_stmt = accounts_stmt.where(Account.id.in_(account_ids))
+        accounts_result = await self._session.execute(accounts_stmt)
+        accounts_by_id = {account.id: account for account in accounts_result.scalars().all()}
         output_tokens_expr = func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)
         stmt = select(
             RequestLog.account_id,
+            RequestLog.model,
+            RequestLog.service_tier,
             func.count(RequestLog.id).label("request_count"),
             func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
             func.coalesce(func.sum(output_tokens_expr), 0).label("output_tokens"),
             func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
-            func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("total_cost_usd"),
-        ).group_by(RequestLog.account_id)
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            RequestLog.requested_at >= since_7d,
+                            func.coalesce(RequestLog.input_tokens, 0) + func.coalesce(output_tokens_expr, 0),
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("tokens_7d"),
+        ).group_by(RequestLog.account_id, RequestLog.model, RequestLog.service_tier)
         if account_ids:
             stmt = stmt.where(RequestLog.account_id.in_(account_ids))
 
         result = await self._session.execute(stmt)
+        rollup: dict[str, dict[str, float | int | str | None]] = {}
         for (
             account_id,
+            model,
+            service_tier,
             request_count,
             input_tokens,
             output_tokens,
             cached_input_tokens,
-            total_cost_usd,
+            tokens_7d,
         ) in result.all():
             if not account_id:
                 continue
@@ -75,15 +133,77 @@ class AccountsRepository:
             output_sum = int(output_tokens or 0)
             cached_sum = int(cached_input_tokens or 0)
             cached_sum = max(0, min(cached_sum, input_sum))
-            return_row = AccountRequestUsageSummary(
-                request_count=int(request_count or 0),
-                total_tokens=input_sum + output_sum,
-                cached_input_tokens=cached_sum,
-                total_cost_usd=round(float(total_cost_usd or 0.0), 6),
-            )
-            summaries[account_id] = return_row
+            tokens_sum = input_sum + output_sum
 
-        return summaries
+            entry = rollup.setdefault(
+                account_id,
+                {
+                    "request_count": 0,
+                    "total_tokens": 0,
+                    "tokens_7d": 0,
+                    "cached_input_tokens": 0,
+                    "total_cost_usd": 0.0,
+                    "estimated_total_cost": 0.0,
+                    "estimated_total_cost_currency": None,
+                },
+            )
+            entry["request_count"] = int(entry["request_count"] or 0) + int(request_count or 0)
+            entry["total_tokens"] = int(entry["total_tokens"] or 0) + tokens_sum
+            entry["tokens_7d"] = int(entry["tokens_7d"] or 0) + int(tokens_7d or 0)
+            entry["cached_input_tokens"] = int(entry["cached_input_tokens"] or 0) + cached_sum
+
+            usage = UsageTokens(
+                input_tokens=float(input_sum),
+                output_tokens=float(output_sum),
+                cached_input_tokens=float(cached_sum),
+            )
+            resolved = get_pricing_for_model(model or "", None, None)
+            if resolved is None:
+                continue
+            _, price = resolved
+            cost_usd = calculate_cost_from_usage(
+                usage,
+                price,
+                service_tier=service_tier,
+            )
+            if cost_usd is not None:
+                entry["total_cost_usd"] = float(entry["total_cost_usd"] or 0.0) + cost_usd
+
+            account = accounts_by_id.get(account_id)
+            if account is None:
+                continue
+            estimated_cost, currency = _calculate_display_cost(
+                account=account,
+                usage=usage,
+                price=price,
+                service_tier=service_tier,
+                fallback_usd=cost_usd,
+            )
+            if estimated_cost is None:
+                continue
+            if entry["estimated_total_cost_currency"] is None:
+                entry["estimated_total_cost_currency"] = currency
+            if entry["estimated_total_cost_currency"] == currency:
+                entry["estimated_total_cost"] = float(entry["estimated_total_cost"] or 0.0) + estimated_cost
+
+        return {
+            account_id: AccountRequestUsageSummary(
+                request_count=int(values["request_count"] or 0),
+                total_tokens=int(values["total_tokens"] or 0),
+                tokens_7d=int(values["tokens_7d"] or 0),
+                cached_input_tokens=int(values["cached_input_tokens"] or 0),
+                total_cost_usd=round(float(values["total_cost_usd"] or 0.0), 6),
+                estimated_total_cost=round(float(values["estimated_total_cost"] or 0.0), 6)
+                if values["estimated_total_cost_currency"] is not None
+                else None,
+                estimated_total_cost_currency=(
+                    str(values["estimated_total_cost_currency"])
+                    if values["estimated_total_cost_currency"] is not None
+                    else None
+                ),
+            )
+            for account_id, values in rollup.items()
+        }
 
     async def exists_active_chatgpt_account_id(self, chatgpt_account_id: str) -> bool:
         result = await self._session.execute(
@@ -201,6 +321,19 @@ class AccountsRepository:
         await self._session.commit()
         return result.scalar_one_or_none() is not None
 
+    async def update_priority(self, account_id: str, configured_priority: int) -> Account | None:
+        result = await self._session.execute(
+            update(Account)
+            .where(Account.id == account_id)
+            .values(upstream_priority=configured_priority)
+            .returning(Account.id)
+        )
+        updated_id = result.scalar_one_or_none()
+        await self._session.commit()
+        if updated_id is None:
+            return None
+        return await self.get_by_id(updated_id)
+
     async def delete(self, account_id: str) -> bool:
         await self._session.execute(delete(UsageHistory).where(UsageHistory.account_id == account_id))
         await self._session.execute(delete(RequestLog).where(RequestLog.account_id == account_id))
@@ -292,10 +425,60 @@ class AccountsRepository:
         )
 
 
+def _calculate_display_cost(
+    *,
+    account: Account,
+    usage: UsageTokens,
+    price,
+    service_tier: str | None,
+    fallback_usd: float | None,
+) -> tuple[float | None, str | None]:
+    if _is_duckcoding_account(account):
+        input_rate, _, output_rate = _effective_rates(
+            usage,
+            price,
+            service_tier=service_tier,
+        )
+        duck_output_rate = (
+            _DUCKCODING_CNY_INPUT_PER_1M * (output_rate / input_rate)
+            if input_rate > 0
+            else _DUCKCODING_CNY_INPUT_PER_1M
+        )
+        billable_input = max(0.0, usage.input_tokens - usage.cached_input_tokens)
+        cost_cny = (
+            (billable_input / 1_000_000.0) * _DUCKCODING_CNY_INPUT_PER_1M
+            + (usage.cached_input_tokens / 1_000_000.0) * _DUCKCODING_CNY_CACHED_PER_1M
+            + (usage.output_tokens / 1_000_000.0) * duck_output_rate
+        )
+        return cost_cny, "CNY"
+    if fallback_usd is None:
+        return None, None
+    return fallback_usd, "USD"
+
+
+def _is_duckcoding_account(account: Account) -> bool:
+    if account.provider_kind != ACCOUNT_PROVIDER_API_KEY:
+        return False
+    email = (account.email or "").strip().lower()
+    base_url = (account.upstream_base_url or "").strip().lower()
+    return "duckcoding" in email or "duckcoding.com" in base_url
+
+
 def _apply_account_updates(target: Account, source: Account) -> None:
     target.chatgpt_account_id = source.chatgpt_account_id
     target.email = source.email
     target.plan_type = source.plan_type
+    if source.provider_kind is not None:
+        target.provider_kind = source.provider_kind
+    if source.upstream_base_url is not None:
+        target.upstream_base_url = source.upstream_base_url
+    if source.upstream_wire_api is not None:
+        target.upstream_wire_api = source.upstream_wire_api
+    if source.upstream_priority is not None:
+        target.upstream_priority = source.upstream_priority
+    target.supported_models_json = (
+        source.supported_models_json if source.supported_models_json is not None else target.supported_models_json
+    )
     target.access_token_encrypted = source.access_token_encrypted
     target.refresh_token_encrypted = source.refresh_token_encrypted
     target.id_token_encrypted = source.id_token_encrypted

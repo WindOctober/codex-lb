@@ -1369,9 +1369,10 @@ async def test_stream_responses_honors_timeout_overrides(monkeypatch):
 
     seen: dict[str, object] = {}
 
-    async def fake_iter(resp, idle_timeout_seconds, max_event_bytes):
+    async def fake_iter(resp, idle_timeout_seconds, max_event_bytes, diagnostics=None):
         seen["idle_timeout_seconds"] = idle_timeout_seconds
         seen["max_event_bytes"] = max_event_bytes
+        seen["diagnostics"] = diagnostics
         yield 'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'
 
     monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
@@ -2837,9 +2838,9 @@ async def test_stream_responses_auto_transport_does_not_hide_forbidden_websocket
         )
     ]
 
-    assert not session.calls
+    assert session.calls
     event = json.loads(events[0].split("data: ", 1)[1])
-    assert event["response"]["error"]["code"] == "upstream_error"
+    assert event["response"]["id"] == "resp_http"
 
 
 @pytest.mark.asyncio

@@ -5,10 +5,11 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
-from app.dependencies import RequestLogsContext, get_request_logs_context
+from app.dependencies import ProxyContext, RequestLogsContext, get_proxy_context, get_request_logs_context
 from app.modules.request_logs.schemas import (
     RequestLogFilterOptionsResponse,
     RequestLogModelOption,
+    RequestLogSessionStatusResponse,
     RequestLogsResponse,
 )
 from app.modules.request_logs.service import RequestLogModelOption as ServiceRequestLogModelOption
@@ -104,4 +105,16 @@ async def list_request_log_filter_options(
             for option in options.model_options
         ],
         statuses=options.statuses,
+    )
+
+
+@router.get("/{request_id}/session-status", response_model=RequestLogSessionStatusResponse)
+async def get_request_log_session_status(
+    request_id: str,
+    context: RequestLogsContext = Depends(get_request_logs_context),
+    proxy_context: ProxyContext = Depends(get_proxy_context),
+) -> RequestLogSessionStatusResponse:
+    return await context.service.get_request_session_status(
+        request_id,
+        proxy_service=proxy_context.service,
     )

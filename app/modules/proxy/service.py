@@ -83,7 +83,7 @@ from app.core.metrics.prometheus import (
 )
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.models import CompactResponsePayload, OpenAIEvent, OpenAIResponsePayload
-from app.core.openai.parsing import parse_sse_event
+from app.core.openai.parsing import parse_response_payload, parse_sse_event
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.resilience.overload import is_local_overload_error_code
 from app.core.types import JsonValue
@@ -94,6 +94,7 @@ from app.core.utils.retry import backoff_seconds
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
+    ACCOUNT_PROVIDER_API_KEY,
     Account,
     AccountStatus,
     DashboardSettings,
@@ -239,6 +240,39 @@ class _AffinityPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class HTTPBridgeRequestStatusSnapshot:
+    request_id: str
+    observed_state: str
+    state_detail: str | None
+    live: bool
+    matched_by: str | None = None
+    account_id: str | None = None
+    request_model: str | None = None
+    session_affinity_kind: str | None = None
+    session_affinity_key_hash: str | None = None
+    session_api_key_id: str | None = None
+    session_codex: bool = False
+    session_closed: bool = False
+    reconnect_requested: bool = False
+    queued_request_count: int = 0
+    pending_request_count: int = 0
+    last_used_ago_ms: int | None = None
+    last_upstream_event_ago_ms: int | None = None
+    last_downstream_emit_ago_ms: int | None = None
+    upstream_turn_state: str | None = None
+    downstream_turn_state: str | None = None
+    matched_request_id: str | None = None
+    matched_response_id: str | None = None
+    matched_previous_response_id: str | None = None
+    awaiting_response_created: bool = False
+    replay_count: int = 0
+    downstream_connected: bool | None = None
+    request_age_ms: int | None = None
+    request_last_upstream_event_ago_ms: int | None = None
+    request_last_downstream_emit_ago_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _HTTPBridgeRuntimeConfig:
     enabled: bool
     idle_ttl_seconds: float
@@ -253,6 +287,28 @@ def _resolve_upstream_stream_transport(upstream_stream_transport: str) -> str | 
     if upstream_stream_transport == "default":
         return None
     return upstream_stream_transport
+
+
+def _account_upstream_base_url(account: Account) -> str | None:
+    if account.provider_kind != ACCOUNT_PROVIDER_API_KEY:
+        return None
+    return account.upstream_base_url
+
+
+def _account_upstream_wire_api(account: Account) -> str:
+    if account.provider_kind != ACCOUNT_PROVIDER_API_KEY:
+        return "codex"
+    return account.upstream_wire_api or "codex"
+
+
+def _upstream_account_header_value(account: Account) -> str | None:
+    if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+        return None
+    return _header_account_id(account.chatgpt_account_id)
+
+
+def _websocket_disabled_for_account(account: Account) -> bool:
+    return account.provider_kind == ACCOUNT_PROVIDER_API_KEY
 
 
 def _fingerprint_input_items(items: Sequence[JsonValue]) -> str:
@@ -276,6 +332,99 @@ class ProxyService:
         self._websocket_previous_response_account_index: dict[tuple[str, str | None, str | None], str] = {}
         self._http_bridge_lock = anyio.Lock()
         self._work_admission: WorkAdmissionController | None = None
+
+    async def get_http_bridge_request_status(
+        self,
+        request_id: str,
+    ) -> HTTPBridgeRequestStatusSnapshot | None:
+        target = (request_id or "").strip()
+        if not target:
+            return None
+
+        runtime_settings = get_settings()
+        now = time.monotonic()
+        stall_threshold_ms = int(
+            max(30_000.0, min(runtime_settings.stream_idle_timeout_seconds * 500.0, 120_000.0))
+        )
+        best_match: tuple[int, HTTPBridgeRequestStatusSnapshot] | None = None
+
+        async with self._http_bridge_lock:
+            sessions = list(self._http_bridge_sessions.values())
+
+        for session in sessions:
+            async with session.pending_lock:
+                pending_requests = list(session.pending_requests)
+
+            session_kwargs = {
+                "account_id": session.account.id,
+                "request_model": session.request_model,
+                "session_affinity_kind": session.key.affinity_kind,
+                "session_affinity_key_hash": (
+                    _hash_identifier(session.key.affinity_key) if session.key.affinity_key else None
+                ),
+                "session_api_key_id": session.key.api_key_id,
+                "session_codex": session.codex_session,
+                "session_closed": session.closed,
+                "reconnect_requested": session.upstream_control.reconnect_requested,
+                "queued_request_count": session.queued_request_count,
+                "pending_request_count": len(pending_requests),
+                "last_used_ago_ms": _monotonic_age_ms(now, session.last_used_at),
+                "last_upstream_event_ago_ms": None,
+                "last_downstream_emit_ago_ms": None,
+                "upstream_turn_state": session.upstream_turn_state,
+                "downstream_turn_state": session.downstream_turn_state,
+            }
+
+            for request_state in pending_requests:
+                match_kind = None
+                priority = 0
+                if request_state.request_id == target:
+                    match_kind = "request_id"
+                    priority = 100
+                elif request_state.response_id == target:
+                    match_kind = "response_id"
+                    priority = 95
+                elif request_state.previous_response_id == target:
+                    match_kind = "previous_response_id"
+                    priority = 80
+                if match_kind is None:
+                    continue
+
+                observed_state = "active_streaming"
+                state_detail = "HTTP bridge session is still tracking this live request."
+                request_age_ms = _monotonic_age_ms(now, request_state.started_at)
+                if session.upstream_control.reconnect_requested:
+                    observed_state = "active_reconnecting"
+                    state_detail = "Upstream reconnect has been requested for this live session."
+                elif request_state.awaiting_response_created:
+                    observed_state = "active_waiting_response_created"
+                    state_detail = "Request is queued and still waiting for upstream response.created."
+                    if request_age_ms is not None and request_age_ms >= stall_threshold_ms:
+                        state_detail = (
+                            "Request is still waiting for upstream response.created and has been quiet for a while."
+                        )
+
+                candidate = HTTPBridgeRequestStatusSnapshot(
+                    request_id=target,
+                    observed_state=observed_state,
+                    state_detail=state_detail,
+                    live=True,
+                    matched_by=match_kind,
+                    matched_request_id=request_state.request_id,
+                    matched_response_id=request_state.response_id,
+                    matched_previous_response_id=request_state.previous_response_id,
+                    awaiting_response_created=request_state.awaiting_response_created,
+                    replay_count=request_state.replay_count,
+                    downstream_connected=None,
+                    request_age_ms=request_age_ms,
+                    request_last_upstream_event_ago_ms=None,
+                    request_last_downstream_emit_ago_ms=None,
+                    **session_kwargs,
+                )
+                if best_match is None or priority > best_match[0]:
+                    best_match = (priority, candidate)
+
+        return best_match[1] if best_match is not None else None
 
     def _get_work_admission(self) -> WorkAdmissionController:
         if self._work_admission is None:
@@ -1424,7 +1573,9 @@ class ProxyService:
 
             async def _call_compact(target: Account) -> CompactResponsePayload:
                 access_token = self._encryptor.decrypt(target.access_token_encrypted)
-                account_id = _header_account_id(target.chatgpt_account_id)
+                account_id = _upstream_account_header_value(target)
+                base_url = _account_upstream_base_url(target)
+                wire_api = _account_upstream_wire_api(target)
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
@@ -1444,7 +1595,23 @@ class ProxyService:
                     )
                 create_lease = await self._get_work_admission().acquire_response_create(compact=True)
                 try:
-                    return await core_compact_responses(payload, filtered, access_token, account_id)
+                    if wire_api != "codex":
+                        return await _compact_response_via_stream_responses(
+                            payload,
+                            filtered,
+                            access_token,
+                            account_id,
+                            base_url=base_url,
+                            wire_api=wire_api,
+                        )
+                    return await _call_core_compact_responses(
+                        payload,
+                        filtered,
+                        access_token,
+                        account_id,
+                        base_url=base_url,
+                        wire_api=wire_api,
+                    )
                 finally:
                     create_lease.release()
                     pop_compact_timeout_overrides(timeout_tokens)
@@ -1748,7 +1915,7 @@ class ProxyService:
 
             async def _call_transcribe(target: Account) -> dict[str, JsonValue]:
                 access_token = self._encryptor.decrypt(target.access_token_encrypted)
-                account_id = _header_account_id(target.chatgpt_account_id)
+                account_id = _upstream_account_header_value(target)
                 remaining_budget = _remaining_budget_seconds(deadline)
                 if remaining_budget <= 0:
                     logger.warning(
@@ -1770,6 +1937,7 @@ class ProxyService:
                         headers=filtered,
                         access_token=access_token,
                         account_id=account_id,
+                        base_url=_account_upstream_base_url(target),
                     )
                 finally:
                     pop_transcribe_timeout_overrides(timeout_tokens)
@@ -2992,11 +3160,25 @@ class ProxyService:
         account: Account,
         headers: dict[str, str],
     ) -> UpstreamResponsesWebSocket:
+        if _websocket_disabled_for_account(account):
+            raise ProxyResponseError(
+                400,
+                openai_error(
+                    "unsupported_transport",
+                    "WebSocket transport is not supported by this upstream provider",
+                ),
+            )
         access_token = self._encryptor.decrypt(account.access_token_encrypted)
-        account_id = _header_account_id(account.chatgpt_account_id)
+        account_id = _upstream_account_header_value(account)
         connect_lease = await self._get_work_admission().acquire_websocket_connect()
         try:
-            return await connect_responses_websocket(headers, access_token, account_id)
+            return await _connect_responses_websocket_compatible(
+                headers,
+                access_token,
+                account_id,
+                base_url=_account_upstream_base_url(account),
+                wire_api=_account_upstream_wire_api(account),
+            )
         finally:
             connect_lease.release()
 
@@ -6991,7 +7173,9 @@ class ProxyService:
     ) -> AsyncIterator[str]:
         account_id_value = account.id
         access_token = self._encryptor.decrypt(account.access_token_encrypted)
-        account_id = _header_account_id(account.chatgpt_account_id)
+        account_id = _upstream_account_header_value(account)
+        base_url = _account_upstream_base_url(account)
+        wire_api = _account_upstream_wire_api(account)
         model = payload.model
         requested_service_tier = payload.service_tier
         service_tier = requested_service_tier
@@ -7010,23 +7194,16 @@ class ProxyService:
 
         try:
             response_create_lease = await self._get_work_admission().acquire_response_create()
-            if upstream_stream_transport is not None:
-                stream = core_stream_responses(
-                    payload,
-                    headers,
-                    access_token,
-                    account_id,
-                    raise_for_status=True,
-                    upstream_stream_transport_override=upstream_stream_transport,
-                )
-            else:
-                stream = core_stream_responses(
-                    payload,
-                    headers,
-                    access_token,
-                    account_id,
-                    raise_for_status=True,
-                )
+            stream = _call_core_stream_responses(
+                payload,
+                headers,
+                access_token,
+                account_id,
+                base_url=base_url,
+                wire_api=wire_api,
+                raise_for_status=True,
+                upstream_stream_transport_override=upstream_stream_transport,
+            )
             iterator = stream.__aiter__()
             try:
                 first = await iterator.__anext__()
@@ -7543,6 +7720,8 @@ class ProxyService:
         force: bool = False,
         timeout_seconds: float | None = None,
     ) -> Account:
+        if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+            return account
         token = push_token_refresh_timeout_override(timeout_seconds)
         try:
             async with self._repo_factory() as repos:
@@ -9075,6 +9254,88 @@ def _routing_strategy(settings: DashboardSettings) -> RoutingStrategy:
     return "capacity_weighted"
 
 
+def _call_core_stream_responses(
+    payload: ResponsesRequest,
+    headers: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+    *,
+    base_url: str | None,
+    wire_api: str,
+    raise_for_status: bool,
+    upstream_stream_transport_override: str | None = None,
+) -> AsyncIterator[str]:
+    kwargs: dict[str, object] = {
+        "base_url": base_url,
+        "raise_for_status": raise_for_status,
+    }
+    try:
+        parameters = inspect.signature(core_stream_responses).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "wire_api" in parameters:
+        kwargs["wire_api"] = wire_api
+    if upstream_stream_transport_override is not None and "upstream_stream_transport_override" in parameters:
+        kwargs["upstream_stream_transport_override"] = upstream_stream_transport_override
+    return core_stream_responses(
+        payload,
+        headers,
+        access_token,
+        account_id,
+        **kwargs,
+    )
+
+
+async def _call_core_compact_responses(
+    payload: ResponsesCompactRequest,
+    headers: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+    *,
+    base_url: str | None,
+    wire_api: str,
+) -> CompactResponsePayload:
+    kwargs: dict[str, object] = {}
+    try:
+        parameters = inspect.signature(core_compact_responses).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "base_url" in parameters:
+        kwargs["base_url"] = base_url
+    if "wire_api" in parameters:
+        kwargs["wire_api"] = wire_api
+    return await core_compact_responses(
+        payload,
+        headers,
+        access_token,
+        account_id,
+        **kwargs,
+    )
+
+
+async def _connect_responses_websocket_compatible(
+    headers: dict[str, str],
+    access_token: str,
+    account_id: str | None,
+    *,
+    base_url: str | None,
+    wire_api: str,
+) -> UpstreamResponsesWebSocket:
+    kwargs: dict[str, object] = {"base_url": base_url}
+    try:
+        parameters = inspect.signature(connect_responses_websocket).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "wire_api" in parameters:
+        kwargs["wire_api"] = wire_api
+    return await connect_responses_websocket(
+        headers,
+        access_token,
+        account_id,
+        **kwargs,
+    )
+
+
 def _parse_websocket_payload(text: str) -> dict[str, JsonValue] | None:
     try:
         payload = json.loads(text)
@@ -9356,6 +9617,12 @@ def _record_continuity_fail_closed(
 def _hash_identifier(value: str) -> str:
     digest = sha256(value.encode("utf-8")).hexdigest()
     return f"sha256:{digest[:12]}"
+
+
+def _monotonic_age_ms(now: float, started_at: float | None) -> int | None:
+    if started_at is None:
+        return None
+    return max(0, int((now - started_at) * 1000))
 
 
 def _summarize_input(items: JsonValue) -> str:
@@ -10364,6 +10631,69 @@ def _sticky_key_for_compact_request(
             reallocate_sticky=True,
         )
     return _AffinityPolicy()
+
+
+async def _compact_response_via_stream_responses(
+    payload: ResponsesCompactRequest,
+    headers: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+    *,
+    base_url: str | None,
+    wire_api: str,
+) -> CompactResponsePayload:
+    stream_payload = ResponsesRequest.model_validate(
+        {
+            **payload.model_dump(mode="json", exclude_none=True),
+            "stream": True,
+        }
+    )
+    async for line in _call_core_stream_responses(
+        stream_payload,
+        headers,
+        access_token,
+        account_id,
+        base_url=base_url,
+        wire_api=wire_api,
+        raise_for_status=True,
+    ):
+        event_payload = parse_sse_data_json(line)
+        if not event_payload:
+            continue
+        event_type = event_payload.get("type")
+        if event_type == "error":
+            error_value = event_payload.get("error")
+            return CompactResponsePayload.model_validate(
+                {"object": "response.compact", "status": "failed", "error": error_value}
+            )
+        if event_type not in ("response.completed", "response.incomplete", "response.failed"):
+            continue
+        response = event_payload.get("response")
+        parsed = parse_response_payload(response)
+        if parsed is None:
+            return CompactResponsePayload.model_validate(
+                {
+                    "object": "response.compact",
+                    "status": "failed",
+                    "error": openai_error("upstream_error", "Unexpected upstream payload")["error"],
+                }
+            )
+        return CompactResponsePayload.model_validate(
+            {
+                "object": "response.compact",
+                "id": parsed.id,
+                "status": parsed.status,
+                "error": parsed.error,
+                "usage": parsed.usage,
+            }
+        )
+    return CompactResponsePayload.model_validate(
+        {
+            "object": "response.compact",
+            "status": "failed",
+            "error": openai_error("upstream_error", "Upstream stream ended without response")["error"],
+        }
+    )
 
 
 def _service_tier_from_compact_payload(payload: ResponsesCompactRequest) -> str | None:

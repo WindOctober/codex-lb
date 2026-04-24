@@ -11,7 +11,6 @@ const THEME_OPTIONS: { value: ThemePreference; label: string; icon: typeof Sun }
 ];
 
 const TIME_FORMAT_OPTIONS: { value: TimeFormatPreference; label: string; preview: string }[] = [
-  { value: "12h", label: "12h", preview: "03:45 PM" },
   { value: "24h", label: "24h", preview: "15:45" },
 ];
 

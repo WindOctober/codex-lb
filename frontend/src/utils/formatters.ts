@@ -22,7 +22,7 @@ const timeFormatterMap: Record<TimeFormatPreference, Intl.DateTimeFormat> = {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hourCycle: "h12",
+    hourCycle: "h23",
   }),
   "24h": new Intl.DateTimeFormat("en-US", {
     hour: "2-digit",
@@ -37,7 +37,7 @@ const chartDateTimeFormatterMap: Record<TimeFormatPreference, Intl.DateTimeForma
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-    hourCycle: "h12",
+    hourCycle: "h23",
   }),
   "24h": new Intl.DateTimeFormat("en-US", {
     month: "short",

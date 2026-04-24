@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Collection
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
 
 from app.core import usage as usage_core
+from app.core.account_priorities import account_configured_priority, account_routing_priority
 from app.core.balancer import (
     HEALTH_TIER_DRAINING,
     HEALTH_TIER_HEALTHY,
@@ -32,7 +34,14 @@ from app.core.resilience.degradation import set_degraded, set_normal
 from app.core.usage.quota import apply_usage_quota
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
+from app.db.models import (
+    ACCOUNT_PROVIDER_API_KEY,
+    Account,
+    AccountStatus,
+    AdditionalUsageHistory,
+    StickySessionKind,
+    UsageHistory,
+)
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.additional_model_limits import get_additional_quota_key_for_model_id
 from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories
@@ -1145,6 +1154,8 @@ def _state_from_account(
         deactivation_reason=account.deactivation_reason,
         plan_type=account.plan_type,
         capacity_credits=usage_core.capacity_for_plan(account.plan_type, "secondary"),
+        source_rank=account_routing_priority(account),
+        configured_priority=account_configured_priority(account),
         health_tier=new_tier,
     )
 
@@ -1162,9 +1173,41 @@ def _usage_entry_is_recent_enough(recorded_at: datetime | None) -> bool:
 
 def _filter_accounts_for_model(accounts: list[Account], model: str) -> list[Account]:
     allowed_plans = get_model_registry().plan_types_for_model(model)
-    if allowed_plans is None:
-        return accounts
-    return [a for a in accounts if a.plan_type in allowed_plans]
+    filtered: list[Account] = []
+    for account in accounts:
+        if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+            supports_model = _account_supports_model(account, model)
+            if supports_model is False:
+                continue
+            filtered.append(account)
+            continue
+        if allowed_plans is None or account.plan_type in allowed_plans:
+            filtered.append(account)
+    return filtered
+
+
+def _account_supports_model(account: Account, model: str) -> bool | None:
+    if account.provider_kind != ACCOUNT_PROVIDER_API_KEY:
+        return None
+    supported_models = _supported_models_for_account(account)
+    if supported_models is None:
+        return None
+    return model in supported_models
+
+
+def _supported_models_for_account(account: Account) -> set[str] | None:
+    raw = account.supported_models_json
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid supported_models_json for account_id=%s", account.id)
+        return None
+    if not isinstance(payload, list):
+        return None
+    supported = {item.strip() for item in payload if isinstance(item, str) and item.strip()}
+    return supported or set()
 
 
 def _gated_limit_name_for_model(model: str | None) -> str | None:

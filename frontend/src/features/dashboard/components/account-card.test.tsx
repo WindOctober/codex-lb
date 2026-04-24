@@ -39,6 +39,33 @@ describe("AccountCard", () => {
     expect(screen.getByText("Weekly")).toBeInTheDocument();
   });
 
+  it("renders request usage for API-key providers instead of quota bars", () => {
+    const account = createAccountSummary({
+      accountId: "provider_123",
+      email: "DuckCoding (jp.duckcoding.com)",
+      displayName: "DuckCoding (jp.duckcoding.com)",
+      planType: "api_key_provider",
+      providerKind: "api_key",
+      requestUsage: {
+        requestCount: 12,
+        tokens7d: 1234,
+        totalTokens: 56789,
+        cachedInputTokens: 0,
+        totalCostUsd: 0,
+        estimatedTotalCost: 3.14,
+        estimatedTotalCostCurrency: "CNY",
+      },
+    });
+
+    render(<AccountCard account={account} />);
+
+    expect(screen.queryByText("5h")).not.toBeInTheDocument();
+    expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
+    expect(screen.getByText("Tokens (7d)")).toBeInTheDocument();
+    expect(screen.getByText("Tokens (Total)")).toBeInTheDocument();
+    expect(screen.getByText("Est. Price")).toBeInTheDocument();
+  });
+
   it("blurs the dashboard card title when privacy mode is enabled", () => {
     act(() => {
       usePrivacyStore.setState({ blurred: true });

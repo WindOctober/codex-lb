@@ -77,6 +77,7 @@ export function DashboardPage() {
   );
 
   const overview = dashboardQuery.data;
+  const groupedAccounts = overview?.groupedAccounts?.length ? overview.groupedAccounts : overview?.accounts ?? [];
   const logPage = logsQuery.data;
 
   const view = useMemo(() => {
@@ -178,7 +179,7 @@ export function DashboardPage() {
               <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">Accounts</h2>
               <div className="h-px flex-1 bg-border" />
             </div>
-            <AccountCards accounts={overview?.accounts ?? []} onAction={handleAccountAction} />
+            <AccountCards accounts={groupedAccounts} onAction={handleAccountAction} />
           </section>
 
           <section className="space-y-4">

@@ -9,9 +9,10 @@ import { usePrivacyStore } from "@/hooks/use-privacy";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
+  { to: "/news", label: "News" },
+  { to: "/scholar", label: "Scholar" },
   { to: "/dashboard", label: "Dashboard" },
   { to: "/accounts", label: "Accounts" },
-  { to: "/apis", label: "APIs" },
   { to: "/settings", label: "Settings" },
 ] as const;
 

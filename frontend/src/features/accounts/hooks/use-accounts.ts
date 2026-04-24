@@ -2,13 +2,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import {
+  createApiProvider,
   deleteAccount,
   getAccountTrends,
   importAccount,
   listAccounts,
   pauseAccount,
   reactivateAccount,
+  testAccountAvailability,
+  updateAccountPriority,
 } from "@/features/accounts/api";
+import type { ApiProviderCreateRequest } from "@/features/accounts/schemas";
 
 function invalidateAccountRelatedQueries(queryClient: ReturnType<typeof useQueryClient>) {
   void queryClient.invalidateQueries({ queryKey: ["accounts", "list"] });
@@ -31,6 +35,45 @@ export function useAccountMutations() {
     },
     onError: (error: Error) => {
       toast.error(error.message || "Import failed");
+    },
+  });
+
+  const createProviderMutation = useMutation({
+    mutationFn: (payload: ApiProviderCreateRequest) => createApiProvider(payload),
+    onSuccess: () => {
+      toast.success("Provider added");
+      invalidateAccountRelatedQueries(queryClient);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Provider setup failed");
+    },
+  });
+
+  const updatePriorityMutation = useMutation({
+    mutationFn: ({ accountId, configuredPriority }: { accountId: string; configuredPriority: number }) =>
+      updateAccountPriority(accountId, configuredPriority),
+    onSuccess: () => {
+      toast.success("Routing priority updated");
+      invalidateAccountRelatedQueries(queryClient);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Priority update failed");
+    },
+  });
+
+  const availabilityMutation = useMutation({
+    mutationFn: testAccountAvailability,
+    onSuccess: (result) => {
+      const detail = `${result.passedCount}/${result.testedCount} passed`;
+      if (result.status === "active") {
+        toast.success(`Availability check passed (${detail})`);
+      } else {
+        toast.warning(`Availability check returned ${result.status} (${detail})`);
+      }
+      invalidateAccountRelatedQueries(queryClient);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Availability check failed");
     },
   });
 
@@ -67,7 +110,15 @@ export function useAccountMutations() {
     },
   });
 
-  return { importMutation, pauseMutation, resumeMutation, deleteMutation };
+  return {
+    importMutation,
+    createProviderMutation,
+    updatePriorityMutation,
+    availabilityMutation,
+    pauseMutation,
+    resumeMutation,
+    deleteMutation,
+  };
 }
 
 export function useAccountTrends(accountId: string | null) {

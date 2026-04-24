@@ -1,0 +1,1 @@
+"""Dashboard scholar cache module."""

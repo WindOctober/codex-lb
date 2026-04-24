@@ -540,14 +540,25 @@ async def test_v1_chat_completions_rejects_audio_input(async_client):
 
 
 @pytest.mark.asyncio
-async def test_v1_chat_completions_rejects_builtin_tools(async_client):
+async def test_v1_chat_completions_allows_image_generation(async_client, monkeypatch):
+    await _import_account(async_client, "acc_chat_image_generation", "chat-image-generation@example.com")
+
+    seen = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen["payload"] = payload
+        yield _completed_event("resp_chat_image_generation")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
     payload = {
         "model": "gpt-5.2",
-        "messages": [{"role": "user", "content": "Search the web."}],
+        "messages": [{"role": "user", "content": "Generate an image."}],
         "tools": [{"type": "image_generation"}],
     }
     resp = await async_client.post("/v1/chat/completions", json=payload)
-    assert resp.status_code == 400
+    assert resp.status_code == 200
+    assert seen["payload"].tools == [{"type": "image_generation"}]
 
 
 @pytest.mark.asyncio

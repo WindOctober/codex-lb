@@ -1,0 +1,93 @@
+{
+  "generated_at": "2026-04-22",
+  "ccf_reference_note": "基于现行 CCF 推荐目录思路维护，仅保留当前三个关注领域最相关的 A 类会刊提示，供 Codex scholar worker 使用。",
+  "topics": [
+    {
+      "id": "zk_formal_verification",
+      "label": "零知识证明 + 形式化验证",
+      "keywords": [
+        "zero-knowledge proof",
+        "zk-SNARK",
+        "zk-STARK",
+        "formal verification",
+        "proof systems"
+      ],
+      "published_search_hints": [
+        "DBLP search: zero-knowledge proof formal verification",
+        "DBLP search: zk-SNARK verification",
+        "recent papers on proof systems and verification"
+      ],
+      "preprint_search_hints": [
+        "DBLP or arXiv search: zk-SNARK CoRR",
+        "DBLP or arXiv search: zero-knowledge proof formal verification preprint"
+      ],
+      "ccf_a_venues": [
+        "CCS",
+        "IEEE Symposium on Security and Privacy",
+        "USENIX Security Symposium",
+        "PLDI",
+        "Proceedings of the ACM on Programming Languages",
+        "ICSE",
+        "Foundations of Software Engineering",
+        "IEEE Transactions on Software Engineering"
+      ],
+      "why_track": "重点追踪零知识证明系统与形式化验证方法在协议设计、证明系统与验证工具链上的交叉进展。"
+    },
+    {
+      "id": "pcb_placement",
+      "label": "PCB Placement",
+      "keywords": [
+        "PCB placement",
+        "printed circuit board placement",
+        "EDA placement",
+        "routability-aware placement"
+      ],
+      "published_search_hints": [
+        "DBLP search: PCB placement",
+        "DBLP search: printed circuit board placement",
+        "recent DAC or TCAD PCB placement papers"
+      ],
+      "preprint_search_hints": [
+        "DBLP or arXiv search: PCB placement CoRR",
+        "DBLP or arXiv search: printed circuit board placement preprint"
+      ],
+      "ccf_a_venues": [
+        "DAC",
+        "IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems",
+        "ACM Transactions on Design Automation of Electronic Systems"
+      ],
+      "why_track": "重点盯高密度板级布局、可布线性、异形器件约束与学习驱动 placement 方法。"
+    },
+    {
+      "id": "formal_verification_smart_contracts",
+      "label": "形式化验证 + 智能合约",
+      "keywords": [
+        "smart contract formal verification",
+        "smart contract verification",
+        "Solidity formal verification",
+        "Ethereum analysis",
+        "Move prover"
+      ],
+      "published_search_hints": [
+        "DBLP search: smart contract formal verification",
+        "DBLP search: smart contract verification",
+        "recent security and PL venue papers on smart contract verification"
+      ],
+      "preprint_search_hints": [
+        "DBLP or arXiv search: smart contract formal verification CoRR",
+        "DBLP or arXiv search: Solidity verification preprint"
+      ],
+      "ccf_a_venues": [
+        "USENIX Security Symposium",
+        "IEEE Symposium on Security and Privacy",
+        "CCS",
+        "PLDI",
+        "Proceedings of the ACM on Programming Languages",
+        "ICSE",
+        "Foundations of Software Engineering",
+        "IEEE Transactions on Software Engineering"
+      ],
+      "why_track": "重点关注智能合约安全、属性生成、程序逻辑、模型检测与形式方法在链上程序上的落地。"
+    }
+  ]
+}

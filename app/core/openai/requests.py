@@ -26,7 +26,6 @@ UNSUPPORTED_TOOL_TYPES = {
     "code_interpreter",
     "computer_use",
     "computer_use_preview",
-    "image_generation",
 }
 
 _TOOL_TYPE_ALIASES = {

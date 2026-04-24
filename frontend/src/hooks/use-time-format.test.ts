@@ -5,11 +5,11 @@ import { getTimeFormatPreference, useTimeFormatStore } from "@/hooks/use-time-fo
 describe("useTimeFormatStore", () => {
   beforeEach(() => {
     window.localStorage.clear();
-    useTimeFormatStore.setState({ timeFormat: "12h" });
+    useTimeFormatStore.setState({ timeFormat: "24h" });
   });
 
-  it("defaults to 12h", () => {
-    expect(getTimeFormatPreference()).toBe("12h");
+  it("defaults to 24h", () => {
+    expect(getTimeFormatPreference()).toBe("24h");
   });
 
   it("persists updates to localStorage", () => {

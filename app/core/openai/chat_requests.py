@@ -198,10 +198,10 @@ def _normalize_chat_tools(tools: list[JsonValue]) -> list[JsonValue]:
             continue
         if isinstance(tool_type, str):
             normalized_type = normalize_tool_type(tool_type)
-            if normalized_type == "web_search":
-                if normalized_type != tool_type:
-                    tool = dict(tool)
-                    tool["type"] = normalized_type
+            if normalized_type != tool_type:
+                tool = dict(tool)
+                tool["type"] = normalized_type
+            if normalized_type != "function":
                 normalized.append(tool)
                 continue
         name = tool.get("name")

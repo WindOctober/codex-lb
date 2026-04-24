@@ -8,6 +8,7 @@ import { useDialogState } from "@/hooks/use-dialog-state";
 import { AccountDetail } from "@/features/accounts/components/account-detail";
 import { AccountList } from "@/features/accounts/components/account-list";
 import { AccountsSkeleton } from "@/features/accounts/components/accounts-skeleton";
+import { ApiProviderDialog } from "@/features/accounts/components/api-provider-dialog";
 import { ImportDialog } from "@/features/accounts/components/import-dialog";
 import { useAccounts } from "@/features/accounts/hooks/use-accounts";
 import { useOauth } from "@/features/accounts/hooks/use-oauth";
@@ -23,6 +24,9 @@ export function AccountsPage() {
   const {
     accountsQuery,
     importMutation,
+    createProviderMutation,
+    updatePriorityMutation,
+    availabilityMutation,
     pauseMutation,
     resumeMutation,
     deleteMutation,
@@ -30,6 +34,7 @@ export function AccountsPage() {
   const oauth = useOauth();
 
   const importDialog = useDialogState();
+  const providerDialog = useDialogState();
   const oauthDialog = useDialogState();
   const deleteDialog = useDialogState<string>();
 
@@ -63,12 +68,18 @@ export function AccountsPage() {
 
   const mutationBusy =
     importMutation.isPending ||
+    createProviderMutation.isPending ||
+    updatePriorityMutation.isPending ||
+    availabilityMutation.isPending ||
     pauseMutation.isPending ||
     resumeMutation.isPending ||
     deleteMutation.isPending;
 
   const mutationError =
     getErrorMessageOrNull(importMutation.error) ||
+    getErrorMessageOrNull(createProviderMutation.error) ||
+    getErrorMessageOrNull(updatePriorityMutation.error) ||
+    getErrorMessageOrNull(availabilityMutation.error) ||
     getErrorMessageOrNull(pauseMutation.error) ||
     getErrorMessageOrNull(resumeMutation.error) ||
     getErrorMessageOrNull(deleteMutation.error);
@@ -96,6 +107,7 @@ export function AccountsPage() {
               onSelect={handleSelectAccount}
               onOpenImport={() => importDialog.show()}
               onOpenOauth={() => oauthDialog.show()}
+              onOpenProvider={() => providerDialog.show()}
             />
           </div>
 
@@ -107,6 +119,10 @@ export function AccountsPage() {
             onResume={(accountId) => void resumeMutation.mutateAsync(accountId)}
             onDelete={(accountId) => deleteDialog.show(accountId)}
             onReauth={() => oauthDialog.show()}
+            onUpdatePriority={(accountId, configuredPriority) =>
+              updatePriorityMutation.mutateAsync({ accountId, configuredPriority }).then(() => undefined)
+            }
+            onTestAvailability={(accountId) => availabilityMutation.mutateAsync(accountId).then(() => undefined)}
           />
         </div>
       )}
@@ -118,6 +134,16 @@ export function AccountsPage() {
         onOpenChange={importDialog.onOpenChange}
         onImport={async (file) => {
           await importMutation.mutateAsync(file);
+        }}
+      />
+
+      <ApiProviderDialog
+        open={providerDialog.open}
+        busy={createProviderMutation.isPending}
+        error={getErrorMessageOrNull(createProviderMutation.error)}
+        onOpenChange={providerDialog.onOpenChange}
+        onCreate={async (payload) => {
+          await createProviderMutation.mutateAsync(payload);
         }}
       />
 

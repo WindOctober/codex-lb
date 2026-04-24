@@ -11,14 +11,13 @@ type TimeFormatState = {
 
 function readStoredPreference(): TimeFormatPreference {
   if (typeof window === "undefined") {
-    return "12h";
+    return "24h";
   }
 
   try {
-    const stored = window.localStorage.getItem(TIME_FORMAT_STORAGE_KEY);
-    return stored === "24h" ? "24h" : "12h";
+    return "24h";
   } catch {
-    return "12h";
+    return "24h";
   }
 }
 

@@ -48,6 +48,7 @@ async def fetch_usage(
     *,
     access_token: str,
     account_id: str | None,
+    account_label: str | None = None,
     base_url: str | None = None,
     timeout_seconds: float | None = None,
     max_retries: int | None = None,
@@ -75,8 +76,9 @@ async def fetch_usage(
                 code = _extract_error_code(data)
                 message = _extract_error_message(data) or f"Usage fetch failed ({resp.status})"
                 logger.warning(
-                    "Usage fetch failed request_id=%s status=%s code=%s message=%s",
+                    "Usage fetch failed request_id=%s account=%s status=%s code=%s message=%s",
                     get_request_id(),
+                    account_label,
                     resp.status,
                     code,
                     message,
@@ -86,14 +88,16 @@ async def fetch_usage(
                 return UsagePayload.model_validate(data)
             except ValidationError as exc:
                 logger.warning(
-                    "Usage fetch invalid payload request_id=%s",
+                    "Usage fetch invalid payload request_id=%s account=%s",
                     get_request_id(),
+                    account_label,
                 )
                 raise UsageFetchError(502, "Invalid usage payload") from exc
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         logger.warning(
-            "Usage fetch error request_id=%s error=%s",
+            "Usage fetch error request_id=%s account=%s error=%s",
             get_request_id(),
+            account_label,
             exc,
         )
         raise UsageFetchError(0, f"Usage fetch failed: {exc}") from exc

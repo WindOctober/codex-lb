@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
+from urllib.parse import urlparse
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -14,20 +17,27 @@ from app.core.auth import (
     parse_auth_json,
 )
 from app.core.auth.api_key_cache import get_api_key_cache
+from app.core.auth.refresh import RefreshError
 from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
+from app.core.clients.upstream import UpstreamProbeError, probe_upstream_provider
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import ACCOUNT_PROVIDER_API_KEY, ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, AccountStatus
+from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.mappers import build_account_summaries, build_account_usage_trends
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.schemas import (
     AccountAdditionalQuota,
     AccountAdditionalWindow,
+    AccountAvailabilityResponse,
     AccountImportResponse,
     AccountRequestUsage,
     AccountSummary,
     AccountTrendsResponse,
+    AccountUpdateRequest,
+    ApiProviderCreateRequest,
+    ApiProviderCreateResponse,
 )
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
@@ -42,6 +52,19 @@ class InvalidAuthJsonError(Exception):
     pass
 
 
+class InvalidApiProviderError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _AvailabilityOutcome:
+    ok: bool
+    status: AccountStatus
+    reason: str | None = None
+    reset_at: int | None = None
+    probed: bool = True
+
+
 class AccountsService:
     def __init__(
         self,
@@ -54,6 +77,7 @@ class AccountsService:
         self._additional_usage_repo = additional_usage_repo
         self._usage_updater = UsageUpdater(usage_repo, repo, additional_usage_repo) if usage_repo else None
         self._encryptor = TokenEncryptor()
+        self._auth_manager = AuthManager(repo)
 
     async def list_accounts(self) -> list[AccountSummary]:
         accounts = await self._repo.list_accounts()
@@ -68,8 +92,11 @@ class AccountsService:
             account_id: AccountRequestUsage(
                 request_count=row.request_count,
                 total_tokens=row.total_tokens,
+                tokens_7d=row.tokens_7d,
                 cached_input_tokens=row.cached_input_tokens,
                 total_cost_usd=row.total_cost_usd,
+                estimated_total_cost=row.estimated_total_cost,
+                estimated_total_cost_currency=row.estimated_total_cost_currency,
             )
             for account_id, row in request_usage_rows.items()
         }
@@ -142,6 +169,30 @@ class AccountsService:
             secondary=trend.secondary if trend else [],
         )
 
+    async def test_availability(self, target_id: str) -> AccountAvailabilityResponse | None:
+        account = await self._repo.get_by_id(target_id)
+        if account is None:
+            return None
+        outcome = await self._probe_account_availability(account)
+        if (
+            outcome.status != account.status
+            or outcome.reason != account.deactivation_reason
+            or outcome.reset_at != account.reset_at
+        ):
+            await self._repo.update_status(account.id, outcome.status, outcome.reason, outcome.reset_at)
+            get_account_selection_cache().invalidate()
+        return AccountAvailabilityResponse(
+            status="completed",
+            target_id=target_id,
+            tested_count=1 if outcome.probed else 0,
+            passed_count=1 if outcome.ok else 0,
+            failed_count=1 if outcome.probed and not outcome.ok else 0,
+            skipped_count=0 if outcome.probed else 1,
+            active_count=1 if outcome.status == AccountStatus.ACTIVE else 0,
+            total_count=1,
+            failed_account_ids=[] if outcome.ok else [account.id],
+        )
+
     async def import_account(self, raw: bytes) -> AccountImportResponse:
         try:
             auth = parse_auth_json(raw)
@@ -160,6 +211,7 @@ class AccountsService:
             chatgpt_account_id=raw_account_id,
             email=email,
             plan_type=plan_type,
+            provider_kind=ACCOUNT_PROVIDER_OPENAI_OAUTH,
             access_token_encrypted=self._encryptor.encrypt(auth.tokens.access_token),
             refresh_token_encrypted=self._encryptor.encrypt(auth.tokens.refresh_token),
             id_token_encrypted=self._encryptor.encrypt(auth.tokens.id_token),
@@ -178,6 +230,51 @@ class AccountsService:
             email=saved.email,
             plan_type=saved.plan_type,
             status=saved.status,
+        )
+
+    async def create_api_provider(self, payload: ApiProviderCreateRequest) -> ApiProviderCreateResponse:
+        name = payload.name.strip()
+        api_key = payload.api_key.strip()
+        if not name:
+            raise InvalidApiProviderError("Provider name is required")
+        if not api_key:
+            raise InvalidApiProviderError("API key is required")
+
+        try:
+            probe = await probe_upstream_provider(base_url=payload.base_url, api_key=api_key)
+        except UpstreamProbeError as exc:
+            raise InvalidApiProviderError(str(exc)) from exc
+
+        account = Account(
+            id=f"provider_{uuid4().hex[:12]}",
+            chatgpt_account_id=None,
+            email=_provider_account_label(name, probe.base_url),
+            plan_type="api_key_provider",
+            provider_kind=ACCOUNT_PROVIDER_API_KEY,
+            upstream_base_url=probe.base_url,
+            upstream_wire_api=probe.wire_api,
+            upstream_priority=payload.priority,
+            supported_models_json=json.dumps(list(probe.supported_models), ensure_ascii=True)
+            if probe.supported_models
+            else None,
+            access_token_encrypted=self._encryptor.encrypt(api_key),
+            refresh_token_encrypted=b"",
+            id_token_encrypted=b"",
+            last_refresh=utcnow(),
+            status=AccountStatus.ACTIVE,
+            deactivation_reason=None,
+        )
+        saved = await self._repo.upsert(account, merge_by_email=False)
+        get_account_selection_cache().invalidate()
+        return ApiProviderCreateResponse(
+            account_id=saved.id,
+            email=saved.email,
+            plan_type=saved.plan_type,
+            status=saved.status,
+            base_url=probe.base_url,
+            wire_api=probe.wire_api,
+            priority=saved.upstream_priority,
+            supported_models=list(probe.supported_models),
         )
 
     async def reactivate_account(self, account_id: str) -> bool:
@@ -201,3 +298,67 @@ class AccountsService:
             if poller is not None:
                 await poller.bump(NAMESPACE_API_KEY)
         return result
+
+    async def update_account(self, account_id: str, payload: AccountUpdateRequest) -> AccountSummary | None:
+        updated = await self._repo.update_priority(account_id, payload.configured_priority)
+        if updated is None:
+            return None
+        get_account_selection_cache().invalidate()
+        return build_account_summaries(
+            accounts=[updated],
+            primary_usage={},
+            secondary_usage={},
+            request_usage_by_account={},
+            additional_quotas_by_account={},
+            encryptor=self._encryptor,
+        )[0]
+
+    async def _probe_account_availability(self, account: Account) -> _AvailabilityOutcome:
+        if account.status == AccountStatus.PAUSED:
+            return _AvailabilityOutcome(
+                ok=False,
+                status=AccountStatus.PAUSED,
+                reason=account.deactivation_reason,
+                reset_at=account.reset_at,
+                probed=False,
+            )
+        if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+            try:
+                api_key = self._encryptor.decrypt(account.access_token_encrypted)
+                probe = await probe_upstream_provider(base_url=account.upstream_base_url or "", api_key=api_key)
+                if probe.supported_models:
+                    account.supported_models_json = json.dumps(list(probe.supported_models), ensure_ascii=True)
+                return _AvailabilityOutcome(ok=True, status=AccountStatus.ACTIVE)
+            except Exception as exc:
+                return _AvailabilityOutcome(
+                    ok=False,
+                    status=AccountStatus.DEACTIVATED,
+                    reason=_availability_failure_reason(str(exc) or "Provider probe failed"),
+                )
+        try:
+            await self._auth_manager.ensure_fresh(account, force=True)
+            return _AvailabilityOutcome(ok=True, status=AccountStatus.ACTIVE)
+        except RefreshError as exc:
+            return _AvailabilityOutcome(
+                ok=False,
+                status=AccountStatus.DEACTIVATED,
+                reason=_availability_failure_reason(exc.message or exc.code or "Token refresh failed"),
+            )
+        except Exception as exc:
+            return _AvailabilityOutcome(
+                ok=False,
+                status=AccountStatus.DEACTIVATED,
+                reason=_availability_failure_reason(str(exc) or "Token refresh failed"),
+            )
+
+
+def _provider_account_label(name: str, base_url: str) -> str:
+    host = urlparse(base_url).netloc
+    if not host:
+        return name
+    return f"{name} ({host})"
+
+
+def _availability_failure_reason(message: str) -> str:
+    normalized = message.strip() or "Probe request failed"
+    return f"Availability probe failed: {normalized}"
