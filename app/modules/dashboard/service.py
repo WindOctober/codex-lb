@@ -9,7 +9,12 @@ from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import utcnow
 from app.db.models import ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, UsageHistory
 from app.modules.accounts.mappers import build_account_summaries
-from app.modules.accounts.schemas import AccountRequestUsage, AccountSummary, AccountUsage
+from app.modules.accounts.schemas import (
+    AccountAvailabilityBreakdown,
+    AccountRequestUsage,
+    AccountSummary,
+    AccountUsage,
+)
 from app.modules.dashboard.builders import (
     build_dashboard_overview_summary,
     build_overview_timeframe,
@@ -379,6 +384,7 @@ def _groupable_openai_domain(account: Account) -> str | None:
 def _merge_domain_group(domain: str, members: list[AccountSummary]) -> AccountSummary:
     member_count = len(members)
     active_count = sum(1 for member in members if member.status == "active")
+    availability = _availability_breakdown(members)
     primary_remaining = _weighted_remaining_percent(
         members,
         capacity_attr="capacity_credits_primary",
@@ -411,6 +417,18 @@ def _merge_domain_group(domain: str, members: list[AccountSummary]) -> AccountSu
         capacity_credits_secondary=sum(member.capacity_credits_secondary or 0.0 for member in members),
         remaining_credits_secondary=sum(member.remaining_credits_secondary or 0.0 for member in members),
         request_usage=_sum_request_usage(member.request_usage for member in members),
+        availability=availability,
+    )
+
+
+def _availability_breakdown(members: list[AccountSummary]) -> AccountAvailabilityBreakdown:
+    return AccountAvailabilityBreakdown(
+        total=len(members),
+        active=sum(1 for member in members if member.status == "active"),
+        rate_limited=sum(1 for member in members if member.status == "rate_limited"),
+        quota_limited=sum(1 for member in members if member.status == "quota_exceeded"),
+        paused=sum(1 for member in members if member.status == "paused"),
+        deactivated=sum(1 for member in members if member.status == "deactivated"),
     )
 
 

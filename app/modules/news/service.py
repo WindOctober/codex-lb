@@ -401,7 +401,7 @@ class NewsService:
                 "-c",
                 f'model_reasoning_effort="{os.getenv("CODEX_LB_NEWS_REASONING", "medium")}"',
                 "-m",
-                os.getenv("CODEX_LB_NEWS_MODEL", "gpt-5.4"),
+                os.getenv("CODEX_LB_NEWS_MODEL", "gpt-5.5"),
                 "--output-schema",
                 str(schema_path),
                 "-o",

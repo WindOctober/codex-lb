@@ -12,7 +12,7 @@ from app.core.clients.model_fetcher import ModelFetchError, fetch_models_for_pla
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import UpstreamModel, get_model_registry
-from app.db.models import Account, AccountStatus
+from app.db.models import ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, AccountStatus
 from app.db.session import get_background_session
 from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.repository import AccountsRepository
@@ -106,6 +106,8 @@ def _group_by_plan(accounts: list[Account]) -> dict[str, list[Account]]:
     grouped: dict[str, list[Account]] = {}
     for account in accounts:
         if account.status != AccountStatus.ACTIVE:
+            continue
+        if account.provider_kind != ACCOUNT_PROVIDER_OPENAI_OAUTH:
             continue
         plan_type = account.plan_type
         if not plan_type:

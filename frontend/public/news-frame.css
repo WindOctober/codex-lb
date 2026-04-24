@@ -1,0 +1,540 @@
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/GeistSans-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #071018;
+  --bg-elevated: rgba(10, 20, 30, 0.84);
+  --ink: #f2efe7;
+  --muted: rgba(242, 239, 231, 0.68);
+  --line: rgba(242, 239, 231, 0.1);
+  --accent: #77f6c6;
+  --accent-2: #f5b66f;
+  --danger: #f08c7e;
+  --shadow: 0 28px 80px rgba(0, 0, 0, 0.34);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(119, 246, 198, 0.14), transparent 34%),
+    radial-gradient(circle at top right, rgba(245, 182, 111, 0.13), transparent 28%),
+    linear-gradient(180deg, #071018 0%, #08131a 100%);
+  color: var(--ink);
+  font-family: "Geist", "Segoe UI", sans-serif;
+}
+
+body {
+  position: relative;
+  overflow-x: hidden;
+}
+
+.news-shell {
+  position: relative;
+  min-height: 100vh;
+  padding: 36px clamp(18px, 3vw, 40px) 56px;
+}
+
+.news-backdrop {
+  position: fixed;
+  inset: auto auto 0;
+  width: 42vw;
+  height: 42vw;
+  border-radius: 999px;
+  filter: blur(60px);
+  opacity: 0.32;
+  pointer-events: none;
+}
+
+.news-backdrop-a {
+  left: -14vw;
+  bottom: -18vw;
+  background: rgba(119, 246, 198, 0.16);
+}
+
+.news-backdrop-b {
+  right: -12vw;
+  top: 10vh;
+  background: rgba(245, 182, 111, 0.14);
+}
+
+.masthead,
+.summary-panel,
+.briefing-stage,
+.rumor-stage {
+  position: relative;
+  z-index: 1;
+}
+
+.reveal {
+  opacity: 0;
+  transform: translateY(18px);
+  animation: rise-in 0.7s cubic-bezier(0.2, 0.9, 0.2, 1) forwards;
+  animation-delay: var(--delay, 0s);
+}
+
+.eyebrow,
+.section-label,
+.meta-line span,
+.source-line,
+.rumor-meta,
+.status-pill,
+.refresh-button,
+.secondary-button {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+}
+
+.masthead {
+  padding-bottom: 26px;
+  border-bottom: 1px solid var(--line);
+}
+
+.masthead-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.9fr);
+  gap: 28px;
+  align-items: end;
+}
+
+.masthead h1,
+.stage-header h2 {
+  margin: 10px 0 0;
+  font-weight: 670;
+  letter-spacing: -0.045em;
+}
+
+.masthead h1 {
+  font-size: clamp(3.4rem, 7vw, 6.8rem);
+  line-height: 0.93;
+}
+
+.lede {
+  max-width: 52rem;
+  margin: 18px 0 0;
+  color: var(--muted);
+  font-size: 1.04rem;
+  line-height: 1.7;
+}
+
+.masthead-meta {
+  display: grid;
+  gap: 12px;
+  padding: 18px 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: linear-gradient(180deg, rgba(8, 16, 24, 0.86), rgba(8, 16, 24, 0.66));
+  box-shadow: var(--shadow);
+}
+
+.meta-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.meta-line span {
+  color: var(--muted);
+}
+
+.meta-line strong {
+  text-align: right;
+  font-size: 0.92rem;
+  font-weight: 680;
+  color: #fff3d4;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.03em;
+  text-transform: none;
+}
+
+.status-pill {
+  color: var(--accent);
+}
+
+.status-pill.is-error {
+  color: var(--danger);
+}
+
+.status-pill.is-stale {
+  color: var(--accent-2);
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.refresh-button,
+.secondary-button {
+  border: 1px solid rgba(119, 246, 198, 0.32);
+  border-radius: 999px;
+  padding: 12px 14px;
+  background: rgba(119, 246, 198, 0.08);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+  transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+}
+
+.refresh-button:hover,
+.secondary-button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(119, 246, 198, 0.52);
+  background: rgba(119, 246, 198, 0.14);
+}
+
+.secondary-button {
+  border-color: rgba(245, 182, 111, 0.32);
+  background: rgba(245, 182, 111, 0.08);
+}
+
+.secondary-button:hover {
+  border-color: rgba(245, 182, 111, 0.52);
+  background: rgba(245, 182, 111, 0.14);
+}
+
+.refresh-button:disabled,
+.secondary-button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.news-layout {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 28px;
+  padding-top: 28px;
+}
+
+.summary-panel,
+.briefing-stage,
+.rumor-stage {
+  border: 1px solid var(--line);
+  border-radius: 28px;
+  background: linear-gradient(180deg, rgba(9, 18, 28, 0.88), rgba(9, 18, 28, 0.74));
+  box-shadow: var(--shadow);
+}
+
+.summary-panel {
+  padding: 22px 24px 24px;
+}
+
+.summary-copy {
+  margin: 14px 0 0;
+  max-width: 64rem;
+  color: var(--ink);
+  font-size: 1.18rem;
+  line-height: 1.7;
+}
+
+.alert-strip {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(240, 140, 126, 0.32);
+  background: rgba(240, 140, 126, 0.08);
+  color: #ffd8d1;
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.stage-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 22px 24px 0;
+  align-items: end;
+}
+
+.stage-header h2 {
+  font-size: clamp(2rem, 4vw, 3.1rem);
+}
+
+.stage-header p {
+  max-width: 30rem;
+  margin: 0 0 6px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.company-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  margin-top: 18px;
+}
+
+.company-story {
+  padding: 26px 24px 28px;
+  min-height: 100%;
+}
+
+.story-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.company-story + .company-story {
+  border-left: 1px solid var(--line);
+}
+
+.company-kicker {
+  color: var(--accent);
+  font-size: 0.82rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.new-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(119, 246, 198, 0.22), rgba(245, 182, 111, 0.24));
+  border: 1px solid rgba(119, 246, 198, 0.36);
+  color: #f9f4ea;
+  font-size: 0.68rem;
+  font-weight: 720;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  box-shadow: 0 0 0 1px rgba(119, 246, 198, 0.08), 0 10px 30px rgba(119, 246, 198, 0.12);
+}
+
+.company-story.is-new,
+.rumor-item.is-new {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(119, 246, 198, 0.08), rgba(9, 18, 28, 0)) padding-box,
+    linear-gradient(135deg, rgba(119, 246, 198, 0.4), rgba(245, 182, 111, 0.32)) border-box;
+  border: 1px solid transparent;
+}
+
+.company-story.is-new::before,
+.rumor-item.is-new::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, rgba(119, 246, 198, 0.1), transparent 26%);
+  opacity: 0.9;
+}
+
+.company-story h3 {
+  margin: 14px 0 10px;
+  font-size: clamp(1.6rem, 2.6vw, 2.45rem);
+  line-height: 1.02;
+  letter-spacing: -0.04em;
+}
+
+.company-dek {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1.65;
+}
+
+.story-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.company-points,
+.story-sources {
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.company-points li,
+.rumor-why {
+  padding-top: 14px;
+  margin-top: 14px;
+  border-top: 1px solid rgba(242, 239, 231, 0.07);
+  color: var(--ink);
+  line-height: 1.6;
+}
+
+.story-sources li {
+  padding-top: 12px;
+  margin-top: 12px;
+  border-top: 1px solid rgba(242, 239, 231, 0.07);
+}
+
+.story-sources a,
+.rumor-title a {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.story-sources a:hover,
+.rumor-title a:hover {
+  color: var(--accent);
+}
+
+.source-line {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: 0.06em;
+}
+
+.rumor-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.rumor-item {
+  padding: 24px;
+  min-height: 100%;
+  border: 1px solid rgba(242, 239, 231, 0.08);
+  border-radius: 22px;
+  background: rgba(8, 15, 22, 0.72);
+}
+
+.rumor-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  color: var(--muted);
+}
+
+.source-time,
+.rumor-time,
+#last-refresh,
+#next-refresh {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.24rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(245, 182, 111, 0.14);
+  border: 1px solid rgba(245, 182, 111, 0.28);
+  color: #fff1cf;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.03em;
+  text-transform: none;
+}
+
+#last-refresh,
+#next-refresh {
+  padding: 0.36rem 0.72rem;
+}
+
+.rumor-badge-row {
+  margin-top: 14px;
+}
+
+.rumor-title {
+  margin: 14px 0 10px;
+  font-size: 1.4rem;
+  line-height: 1.12;
+  letter-spacing: -0.03em;
+}
+
+.rumor-summary {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.rumor-why {
+  color: var(--ink);
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  border-radius: 24px;
+  min-height: 220px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.07), transparent);
+  transform: translateX(-100%);
+  animation: shimmer 1.4s infinite;
+}
+
+@keyframes shimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes rise-in {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 1024px) {
+  .masthead-grid,
+  .company-grid,
+  .rumor-list {
+    grid-template-columns: 1fr;
+  }
+
+  .company-story + .company-story,
+  .rumor-item + .rumor-item {
+    border-left: 0;
+    border-top: 0;
+  }
+}
+
+@media (max-width: 720px) {
+  .news-shell {
+    padding: 22px 14px 36px;
+  }
+
+  .action-row {
+    grid-template-columns: 1fr;
+  }
+
+  .summary-panel,
+  .briefing-stage,
+  .rumor-stage,
+  .masthead-meta {
+    border-radius: 22px;
+  }
+
+  .summary-panel,
+  .company-story,
+  .rumor-item,
+  .stage-header,
+  .masthead-meta {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}

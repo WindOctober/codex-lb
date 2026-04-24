@@ -116,10 +116,58 @@ function ProviderUsageSummary({ account }: { account: AccountSummary }) {
   );
 }
 
+function AccountAvailabilitySummary({ account }: { account: AccountSummary }) {
+  const availability = account.availability;
+  if (!availability) {
+    return null;
+  }
+
+  const reasons = [
+    {
+      label: "Rate limit",
+      value: availability.rateLimited,
+      className: "text-orange-600 dark:text-orange-400",
+    },
+    {
+      label: "Quota/limit",
+      value: availability.quotaLimited,
+      className: "text-red-600 dark:text-red-400",
+    },
+    {
+      label: "Paused",
+      value: availability.paused,
+      className: "text-amber-600 dark:text-amber-400",
+    },
+    {
+      label: "Deactivated",
+      value: availability.deactivated,
+      className: "text-muted-foreground",
+    },
+  ].filter((item) => item.value > 0);
+
+  return (
+    <div className="mt-0.5 space-y-1">
+      <p className="truncate text-xs text-muted-foreground">
+        {availability.active} available / {availability.total} total
+      </p>
+      {reasons.length > 0 ? (
+        <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[11px] leading-tight">
+          {reasons.map((reason) => (
+            <span key={reason.label} className={cn("tabular-nums", reason.className)}>
+              {reason.label} {reason.value}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function AccountCard({ account, showAccountId = false, onAction }: AccountCardProps) {
   const blurred = usePrivacyStore((s) => s.blurred);
   const status = normalizeStatus(account.status);
   const isApiKeyProvider = account.providerKind === "api_key";
+  const availability = account.availability ?? null;
   const primaryRemaining = account.usage?.primaryRemainingPercent ?? null;
   const secondaryRemaining = account.usage?.secondaryRemainingPercent ?? null;
   const weeklyOnly = account.windowMinutesPrimary == null && account.windowMinutesSecondary != null;
@@ -131,6 +179,7 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
   const compactId = formatCompactAccountId(account.accountId);
   const planLabel = formatSlug(account.planType);
   const emailSubtitle =
+    !availability &&
     account.displayName && account.displayName !== account.email
       ? account.email
       : null;
@@ -150,6 +199,7 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
             {planLabel}
             {!emailSubtitle ? idSuffix : ""}
           </p>
+          <AccountAvailabilitySummary account={account} />
           {emailSubtitle ? (
             <p className="mt-0.5 truncate text-xs text-muted-foreground" title={showAccountId ? `Account ID ${account.accountId}` : undefined}>
               <span className={blurred ? "privacy-blur" : undefined}>{emailSubtitle}</span>{showAccountId ? ` | ID ${compactId}` : ""}

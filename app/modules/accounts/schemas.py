@@ -59,6 +59,15 @@ class AccountAdditionalQuota(DashboardModel):
     secondary_window: AccountAdditionalWindow | None = None
 
 
+class AccountAvailabilityBreakdown(DashboardModel):
+    total: int = 0
+    active: int = 0
+    rate_limited: int = 0
+    quota_limited: int = 0
+    paused: int = 0
+    deactivated: int = 0
+
+
 class AccountSummary(DashboardModel):
     account_id: str
     email: str
@@ -81,6 +90,7 @@ class AccountSummary(DashboardModel):
     remaining_credits_secondary: float | None = None
     request_usage: AccountRequestUsage | None = None
     additional_quotas: list[AccountAdditionalQuota] = Field(default_factory=list)
+    availability: AccountAvailabilityBreakdown | None = None
     deactivation_reason: str | None = None
     auth: AccountAuthStatus | None = None
 

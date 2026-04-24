@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex LB Scholar</title>
+    <link rel="stylesheet" href="/scholar-frame.css?v=20260422-scholar" />
+    <script type="module" src="/scholar-frame.js?v=20260422-scholar"></script>
+  </head>
+  <body>
+    <div class="scholar-shell">
+      <div class="scholar-glow scholar-glow-a"></div>
+      <div class="scholar-glow scholar-glow-b"></div>
+      <header class="scholar-masthead reveal" style="--delay: 0.05s">
+        <div class="eyebrow">Scholar Desk</div>
+        <div class="masthead-grid">
+          <div>
+            <h1>学术</h1>
+            <p class="lede">围绕固定 topic 组合追踪最近的 CCF-A 已发表论文与最新预印本，由 Codex 结合现有 MCP 做窄范围检索和整理。</p>
+          </div>
+          <div class="masthead-meta">
+            <div class="meta-line"><span>当前状态</span><strong id="status-pill" class="status-pill">启动中</strong></div>
+            <div class="meta-line"><span>最近刷新</span><strong id="last-refresh">等待中</strong></div>
+            <div class="meta-line"><span>下次计划</span><strong id="next-refresh">待定</strong></div>
+            <button id="refresh-button" class="refresh-button" type="button">立即刷新</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="scholar-layout">
+        <section class="summary-panel reveal" style="--delay: 0.12s">
+          <div class="section-label">总览</div>
+          <p id="summary-text" class="summary-copy">Scholar 面板正在准备首轮文献刷新。</p>
+          <div id="alert-strip" class="alert-strip" hidden></div>
+        </section>
+
+        <section class="topic-stage reveal" style="--delay: 0.18s">
+          <div class="stage-header">
+            <div>
+              <div class="section-label">领域面板</div>
+              <h2>Published + Preprint</h2>
+            </div>
+            <p>每个 topic 固定拆成两块：一块只看 CCF-A 已发表，一块只看近期预印本。</p>
+          </div>
+          <div id="topic-grid" class="topic-grid"></div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

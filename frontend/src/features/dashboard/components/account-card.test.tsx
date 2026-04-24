@@ -66,6 +66,31 @@ describe("AccountCard", () => {
     expect(screen.getByText("Est. Price")).toBeInTheDocument();
   });
 
+  it("renders grouped account availability reasons without a fail count", () => {
+    const account = createAccountSummary({
+      accountId: "domain:example.com",
+      email: "2 available / 7 total",
+      displayName: "example.com",
+      status: "active",
+      availability: {
+        total: 7,
+        active: 2,
+        rateLimited: 1,
+        quotaLimited: 2,
+        paused: 1,
+        deactivated: 0,
+      },
+    });
+
+    render(<AccountCard account={account} />);
+
+    expect(screen.getByText("2 available / 7 total")).toBeInTheDocument();
+    expect(screen.getByText("Rate limit 1")).toBeInTheDocument();
+    expect(screen.getByText("Quota/limit 2")).toBeInTheDocument();
+    expect(screen.getByText("Paused 1")).toBeInTheDocument();
+    expect(screen.queryByText(/fail/i)).not.toBeInTheDocument();
+  });
+
   it("blurs the dashboard card title when privacy mode is enabled", () => {
     act(() => {
       usePrivacyStore.setState({ blurred: true });

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex LB 情报页</title>
+    <link rel="stylesheet" href="/news-frame.css?v=20260423-news" />
+    <script type="module" src="/news-frame.js?v=20260423-news"></script>
+  </head>
+  <body>
+    <div class="news-shell">
+      <div class="news-backdrop news-backdrop-a"></div>
+      <div class="news-backdrop news-backdrop-b"></div>
+      <header class="masthead reveal" style="--delay: 0.05s">
+        <div class="eyebrow">AI 情报台</div>
+        <div class="masthead-grid">
+          <div>
+            <h1>新闻</h1>
+            <p class="lede">
+              一页面向操作和判断的 AI 情报简报，由 Codex 结合实时 X 检索与当前信源整理生成。
+            </p>
+          </div>
+          <div class="masthead-meta">
+            <div class="meta-line">
+              <span>当前状态</span>
+              <strong id="status-pill" class="status-pill">启动中</strong>
+            </div>
+            <div class="meta-line">
+              <span>最近刷新</span>
+              <strong id="last-refresh">等待中</strong>
+            </div>
+            <div class="meta-line">
+              <span>下次计划</span>
+              <strong id="next-refresh">待定</strong>
+            </div>
+            <div class="action-row">
+              <button id="refresh-button" class="refresh-button" type="button">立即刷新</button>
+              <button id="mark-read-button" class="secondary-button" type="button">标记当前已读</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="news-layout">
+        <section class="summary-panel reveal" style="--delay: 0.12s">
+          <div class="section-label">总览</div>
+          <p id="summary-text" class="summary-copy">正在生成首版 AI 情报简报。</p>
+          <div id="alert-strip" class="alert-strip" hidden></div>
+        </section>
+
+        <section class="briefing-stage reveal" style="--delay: 0.2s">
+          <div class="stage-header">
+            <div>
+              <div class="section-label">已确认动态</div>
+              <h2>OpenAI + Anthropic</h2>
+            </div>
+            <p>当前最值得盯住的两条主线，一条看产品发布，一条看算力与分发能力。</p>
+          </div>
+          <div id="company-grid" class="company-grid"></div>
+        </section>
+
+        <section class="rumor-stage reveal" style="--delay: 0.28s">
+          <div class="stage-header">
+            <div>
+              <div class="section-label">未证实信号</div>
+              <h2>高热度 X 讨论</h2>
+            </div>
+            <p>过去三天里热度较高、但尚未被官方确认的 AI 相关信源，默认按传闻处理，当前目标展示约 9 条。</p>
+          </div>
+          <div id="rumor-list" class="rumor-list"></div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

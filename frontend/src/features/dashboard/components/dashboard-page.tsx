@@ -27,6 +27,65 @@ import { formatModelLabel, formatSlug } from "@/utils/formatters";
 
 const MODEL_OPTION_DELIMITER = ":::";
 
+function domainFromEmail(email: string | null | undefined): string | null {
+  const normalized = (email ?? "").trim().toLowerCase();
+  const at = normalized.lastIndexOf("@");
+  if (at <= 0 || at === normalized.length - 1) {
+    return null;
+  }
+  return normalized.slice(at + 1);
+}
+
+function domainForGroupedAccount(account: AccountSummary): string | null {
+  if (account.accountId.startsWith("domain:")) {
+    return account.accountId.slice("domain:".length).trim().toLowerCase() || null;
+  }
+  const displayName = account.displayName?.trim().toLowerCase();
+  if (displayName && !displayName.includes("@")) {
+    return displayName;
+  }
+  return null;
+}
+
+function enrichGroupedAccountAvailability(
+  groupedAccounts: AccountSummary[],
+  sourceAccounts: AccountSummary[],
+): AccountSummary[] {
+  const byDomain = new Map<string, AccountSummary[]>();
+  for (const account of sourceAccounts) {
+    if ((account.providerKind ?? "openai_oauth") !== "openai_oauth") {
+      continue;
+    }
+    const domain = domainFromEmail(account.email);
+    if (!domain) {
+      continue;
+    }
+    byDomain.set(domain, [...(byDomain.get(domain) ?? []), account]);
+  }
+
+  return groupedAccounts.map((account) => {
+    if (account.availability) {
+      return account;
+    }
+    const domain = domainForGroupedAccount(account);
+    const members = domain ? byDomain.get(domain) : null;
+    if (!members || members.length <= 1) {
+      return account;
+    }
+    return {
+      ...account,
+      availability: {
+        total: members.length,
+        active: members.filter((member) => member.status === "active").length,
+        rateLimited: members.filter((member) => member.status === "rate_limited").length,
+        quotaLimited: members.filter((member) => member.status === "quota_exceeded").length,
+        paused: members.filter((member) => member.status === "paused").length,
+        deactivated: members.filter((member) => member.status === "deactivated").length,
+      },
+    };
+  });
+}
+
 export function DashboardPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -77,7 +136,13 @@ export function DashboardPage() {
   );
 
   const overview = dashboardQuery.data;
-  const groupedAccounts = overview?.groupedAccounts?.length ? overview.groupedAccounts : overview?.accounts ?? [];
+  const groupedAccounts = useMemo(() => {
+    if (!overview) {
+      return [];
+    }
+    const accounts = overview.groupedAccounts?.length ? overview.groupedAccounts : overview.accounts;
+    return enrichGroupedAccountAvailability(accounts, overview.accounts);
+  }, [overview]);
   const logPage = logsQuery.data;
 
   const view = useMemo(() => {

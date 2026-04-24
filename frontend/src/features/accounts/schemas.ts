@@ -51,6 +51,15 @@ export const AccountAdditionalQuotaSchema = z.object({
   secondaryWindow: AccountAdditionalWindowSchema.nullable().optional(),
 });
 
+export const AccountAvailabilityBreakdownSchema = z.object({
+  total: z.number().int().nonnegative(),
+  active: z.number().int().nonnegative(),
+  rateLimited: z.number().int().nonnegative(),
+  quotaLimited: z.number().int().nonnegative(),
+  paused: z.number().int().nonnegative(),
+  deactivated: z.number().int().nonnegative(),
+});
+
 export const AccountSummarySchema = z.object({
   accountId: z.string(),
   email: z.string(),
@@ -69,6 +78,7 @@ export const AccountSummarySchema = z.object({
   requestUsage: AccountRequestUsageSchema.nullable().optional(),
   auth: AccountAuthSchema.nullable().optional(),
   additionalQuotas: z.array(AccountAdditionalQuotaSchema).default([]),
+  availability: AccountAvailabilityBreakdownSchema.nullable().optional(),
 });
 
 export const AccountTrendsResponseSchema = z.object({

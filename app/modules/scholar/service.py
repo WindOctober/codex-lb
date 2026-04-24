@@ -254,7 +254,7 @@ class ScholarService:
                 "-c",
                 f'model_reasoning_effort="{os.getenv("CODEX_LB_SCHOLAR_REASONING", "medium")}"',
                 "-m",
-                os.getenv("CODEX_LB_SCHOLAR_MODEL", "gpt-5.4"),
+                os.getenv("CODEX_LB_SCHOLAR_MODEL", "gpt-5.5"),
                 "--output-schema",
                 str(schema_path),
                 "-o",
