@@ -83,7 +83,12 @@ function enrichGroupedAccountAvailability(
         deactivated: members.filter((member) => member.status === "deactivated").length,
       },
     };
-  });
+  }).filter((account) => !isFullyDeactivatedGroupedAccount(account));
+}
+
+function isFullyDeactivatedGroupedAccount(account: AccountSummary): boolean {
+  const availability = account.availability;
+  return Boolean(availability && availability.total > 0 && availability.deactivated >= availability.total);
 }
 
 export function DashboardPage() {

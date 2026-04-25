@@ -364,6 +364,8 @@ def _build_grouped_dashboard_accounts(
         if domain in emitted_domains:
             continue
         emitted_domains.add(domain)
+        if _all_members_deactivated(domain_members):
+            continue
         grouped.append(_merge_domain_group(domain, domain_members))
 
     return grouped
@@ -430,6 +432,10 @@ def _availability_breakdown(members: list[AccountSummary]) -> AccountAvailabilit
         paused=sum(1 for member in members if member.status == "paused"),
         deactivated=sum(1 for member in members if member.status == "deactivated"),
     )
+
+
+def _all_members_deactivated(members: list[AccountSummary]) -> bool:
+    return bool(members) and all(member.status == "deactivated" for member in members)
 
 
 def _aggregate_group_status(statuses: list[str] | tuple[str, ...] | object) -> str:
