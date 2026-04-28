@@ -10,7 +10,7 @@ from websockets.http11 import Response
 
 import app.core.clients.proxy_websocket as proxy_websocket_module
 from app.core.clients.proxy import ProxyResponseError
-from app.core.clients.proxy_websocket import connect_responses_websocket
+from app.core.clients.proxy_websocket import HTTPResponsesWebSocket, connect_responses_websocket
 
 
 def _proxy_error_code(exc: ProxyResponseError) -> str | None:
@@ -47,6 +47,30 @@ class _FakeConnection:
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_connect_responses_websocket_uses_http_transport_for_responses_wire_api(monkeypatch):
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=False,
+        ),
+    )
+
+    websocket = await connect_responses_websocket(
+        {"openai-beta": "responses_websockets=2026-02-06"},
+        "access-token",
+        None,
+        base_url="https://provider.example/v1",
+        wire_api="responses",
+    )
+
+    assert isinstance(websocket, HTTPResponsesWebSocket)
 
 
 @pytest.mark.asyncio

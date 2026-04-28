@@ -2,7 +2,9 @@ from __future__ import annotations
 
 # ruff: noqa: E501
 import asyncio
+import hashlib
 import json
+import logging
 import os
 import re
 import signal
@@ -13,6 +15,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.db.session import SessionLocal
+from app.modules.news.repository import NewsHistoryRecord, NewsRepository
+
+logger = logging.getLogger(__name__)
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -22,6 +31,8 @@ RUMOR_TARGET_COUNT = 9
 RUMOR_ITEMS_PER_LANE = 4
 RUMOR_BACKFILL_MAX_ATTEMPTS = 2
 ITEM_STATE_RETENTION_DAYS = 30
+HISTORY_LOOKBACK_DAYS = 30
+HISTORY_COMPACT_LIMIT = 240
 
 
 COMPANY_BRIEF_SCHEMA: dict[str, Any] = {
@@ -165,6 +176,12 @@ class NewsService:
             ),
         )
         self._max_parallel_jobs = max(1, min(8, int(os.getenv("CODEX_LB_NEWS_MAX_PARALLEL", "8"))))
+        self._history_lookback_days = max(
+            1, int(os.getenv("CODEX_LB_NEWS_HISTORY_LOOKBACK_DAYS", str(HISTORY_LOOKBACK_DAYS)))
+        )
+        self._history_compact_limit = max(
+            20, int(os.getenv("CODEX_LB_NEWS_HISTORY_COMPACT_LIMIT", str(HISTORY_COMPACT_LIMIT)))
+        )
         self._refresh_lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
         self._refresh_task: asyncio.Task[None] | None = None
@@ -176,6 +193,7 @@ class NewsService:
         self._reconcile_loaded_snapshot()
         self._ensure_bootstrap_content()
         self._ensure_item_state(seed_existing_items=True)
+        await self._seed_history_from_snapshot()
         self._loop_task = asyncio.create_task(self._run_loop(), name="codex-lb-news-loop")
 
     async def stop(self) -> None:
@@ -247,22 +265,41 @@ class NewsService:
             previous_rumors = self._sort_rumors(previous_snapshot.get("rumors", []))
             current_companies = self._sort_companies(payload.get("companies", []))
             current_rumors = self._sort_rumors(payload.get("rumors", []))
+            history_companies, history_rumors = await asyncio.gather(
+                self._recent_history_compacts("companies"),
+                self._recent_history_compacts("rumors"),
+            )
+            if not history_companies:
+                history_companies = self._compact_items_for_history("companies", previous_companies)
+            if not history_rumors:
+                history_rumors = self._compact_items_for_history("rumors", previous_rumors)
             company_new_flags, rumor_new_flags = await asyncio.gather(
                 self._classify_semantic_novelty(
                     job_name="novelty-companies",
                     section="companies",
-                    previous=previous_companies,
+                    previous=history_companies,
                     current=current_companies,
                 ),
                 self._classify_semantic_novelty(
                     job_name="novelty-rumors",
                     section="rumors",
-                    previous=previous_rumors,
+                    previous=history_rumors,
                     current=current_rumors,
                 ),
             )
+            current_companies, company_new_flags = self._filter_new_or_latest_company_items(
+                current_companies, company_new_flags
+            )
+            current_rumors, rumor_new_flags = self._filter_new_or_latest_rumor_items(
+                current_rumors, rumor_new_flags, target_count=RUMOR_TARGET_COUNT
+            )
             companies = self._mark_company_novelty(current_companies, completed_at, company_new_flags)
             rumors = self._mark_rumor_novelty(current_rumors, completed_at, rumor_new_flags)
+            await self._record_history_items(
+                companies=companies,
+                rumors=rumors,
+                generated_at=self._parse_datetime(payload.get("generated_at")) or self._sort_timestamp(completed_at),
+            )
             self._snapshot.update(
                 {
                     "status": "ready",
@@ -270,7 +307,7 @@ class NewsService:
                     "last_completed_at": completed_at,
                     "last_error": None,
                     "generated_at": payload.get("generated_at", completed_at),
-                    "summary": payload.get("summary", ""),
+                    "summary": self._build_summary(companies, rumors),
                     "companies": companies,
                     "rumors": rumors,
                     "disclaimers": payload.get("disclaimers", []),
@@ -312,7 +349,13 @@ class NewsService:
         )
 
         try:
-            openai_payload, anthropic_payload, rumors_openai_payload, rumors_anthropic_payload, rumors_general_payload = await asyncio.gather(
+            (
+                openai_payload,
+                anthropic_payload,
+                rumors_openai_payload,
+                rumors_anthropic_payload,
+                rumors_general_payload,
+            ) = await asyncio.gather(
                 openai_task,
                 anthropic_task,
                 rumors_openai_task,
@@ -516,15 +559,12 @@ class NewsService:
                 if headline or url:
                     exclusion_lines.append(f"- {headline} | {url}")
             if exclusion_lines:
-                exclusion_block = (
-                    "\n\nAlready selected rumors to avoid repeating in this run:\n"
-                    + "\n".join(exclusion_lines[:24])
+                exclusion_block = "\n\nAlready selected rumors to avoid repeating in this run:\n" + "\n".join(
+                    exclusion_lines[:24]
                 )
         unique_target_line = ""
         if min_unique_needed is not None:
-            unique_target_line = (
-                f"\n- at least {max(1, min_unique_needed)} of the returned posts must be new unique additions beyond the exclusion list"
-            )
+            unique_target_line = f"\n- at least {max(1, min_unique_needed)} of the returned posts must be new unique additions beyond the exclusion list"
         return textwrap.dedent(
             f"""
             Build the X rumor board as strict JSON.
@@ -685,6 +725,232 @@ class NewsService:
             prepared.append(base)
         return prepared
 
+    def _filter_new_items(self, items: list[dict[str, Any]], novelty_flags: list[bool]) -> list[dict[str, Any]]:
+        return [item for index, item in enumerate(items) if index >= len(novelty_flags) or novelty_flags[index]]
+
+    def _filter_new_or_latest_rumor_items(
+        self,
+        items: list[dict[str, Any]],
+        novelty_flags: list[bool],
+        *,
+        target_count: int,
+    ) -> tuple[list[dict[str, Any]], list[bool]]:
+        if not items or target_count <= 0:
+            return [], []
+
+        resolved_flags = [novelty_flags[index] if index < len(novelty_flags) else True for index, _ in enumerate(items)]
+        keep_indices = {index for index, flag in enumerate(resolved_flags) if flag}
+        desired_count = min(target_count, len(items))
+        if len(keep_indices) < desired_count:
+            fallback_indices = sorted(
+                (index for index, flag in enumerate(resolved_flags) if not flag),
+                key=lambda index: self._sort_timestamp(items[index].get("posted_at")),
+                reverse=True,
+            )
+            keep_indices.update(fallback_indices[: desired_count - len(keep_indices)])
+
+        ordered_indices = [index for index in range(len(items)) if index in keep_indices]
+        if len(ordered_indices) > target_count:
+            ordered_indices = sorted(
+                ordered_indices,
+                key=lambda index: self._sort_timestamp(items[index].get("posted_at")),
+                reverse=True,
+            )[:target_count]
+            ordered_indices.sort()
+
+        filtered_items = [items[index] for index in ordered_indices]
+        filtered_flags = [resolved_flags[index] for index in ordered_indices]
+        return filtered_items, filtered_flags
+
+    def _filter_new_or_latest_company_items(
+        self,
+        items: list[dict[str, Any]],
+        novelty_flags: list[bool],
+    ) -> tuple[list[dict[str, Any]], list[bool]]:
+        if not items:
+            return [], []
+
+        resolved_flags = [novelty_flags[index] if index < len(novelty_flags) else True for index, _ in enumerate(items)]
+        lanes_with_new = {
+            self._company_lane_key(item, index) for index, item in enumerate(items) if resolved_flags[index]
+        }
+        latest_index_by_lane: dict[str, int] = {}
+        for index, item in enumerate(items):
+            lane = self._company_lane_key(item, index)
+            previous_index = latest_index_by_lane.get(lane)
+            if previous_index is None or self._company_sort_key(item) > self._company_sort_key(items[previous_index]):
+                latest_index_by_lane[lane] = index
+
+        keep_indices = {index for index, flag in enumerate(resolved_flags) if flag}
+        keep_indices.update(index for lane, index in latest_index_by_lane.items() if lane not in lanes_with_new)
+        filtered_items = [item for index, item in enumerate(items) if index in keep_indices]
+        filtered_flags = [resolved_flags[index] for index, _ in enumerate(items) if index in keep_indices]
+        return filtered_items, filtered_flags
+
+    def _company_lane_key(self, item: dict[str, Any], index: int) -> str:
+        company = self._normalize_text(str(item.get("company", "")))
+        if company:
+            return company
+        identity = self._company_identity(item)
+        if identity:
+            return identity
+        return f"unknown-company-{index}"
+
+    async def _recent_history_compacts(self, section: str) -> list[dict[str, Any]]:
+        cutoff = utcnow() - timedelta(days=self._history_lookback_days)
+        try:
+            async with SessionLocal() as session:
+                return await NewsRepository(session).list_recent_compact_items(
+                    section=section,
+                    since=cutoff,
+                    limit=self._history_compact_limit,
+                )
+        except SQLAlchemyError:
+            logger.warning("Failed to load news history for section=%s", section, exc_info=True)
+            return []
+
+    async def _record_history_items(
+        self,
+        *,
+        companies: list[dict[str, Any]],
+        rumors: list[dict[str, Any]],
+        generated_at: datetime,
+    ) -> int:
+        records = [
+            *self._history_records_for_items("companies", companies, generated_at),
+            *self._history_records_for_items("rumors", rumors, generated_at),
+        ]
+        if not records:
+            return 0
+        try:
+            async with SessionLocal() as session:
+                return await NewsRepository(session).add_history_records(records)
+        except SQLAlchemyError:
+            logger.warning("Failed to record news history", exc_info=True)
+            return 0
+
+    async def _seed_history_from_snapshot(self) -> None:
+        companies = self._sort_companies(self._snapshot.get("companies", []))
+        rumors = self._sort_rumors(self._snapshot.get("rumors", []))
+        if not companies and not rumors:
+            return
+        generated_at = (
+            self._parse_datetime(self._snapshot.get("generated_at"))
+            or self._parse_datetime(self._snapshot.get("last_completed_at"))
+            or utcnow()
+        )
+        await self._record_history_items(companies=companies, rumors=rumors, generated_at=generated_at)
+
+    def _history_records_for_items(
+        self,
+        section: str,
+        items: list[dict[str, Any]],
+        generated_at: datetime,
+    ) -> list[NewsHistoryRecord]:
+        records: list[NewsHistoryRecord] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            compact = self._compact_item_for_history(section, item)
+            item_identity = str(compact.get("item_identity", "")).strip()
+            if not item_identity:
+                continue
+            records.append(
+                NewsHistoryRecord(
+                    section=section,
+                    item_identity=item_identity,
+                    semantic_signature=str(compact.get("semantic_signature", "")).strip() or None,
+                    full=dict(item),
+                    compact=compact,
+                    source_url=self._history_source_url(section, item) or None,
+                    source_published_at=self._history_source_published_at(section, item) or None,
+                    generated_at=generated_at,
+                    recorded_at=utcnow(),
+                )
+            )
+        return records
+
+    def _compact_items_for_history(self, section: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [self._compact_item_for_history(section, item) for item in items if isinstance(item, dict)]
+
+    def _compact_item_for_history(self, section: str, item: dict[str, Any]) -> dict[str, Any]:
+        if section == "companies":
+            raw_sources = item.get("sources", [])
+            source_items = raw_sources if isinstance(raw_sources, list) else []
+            sources = [
+                {
+                    "title": str(source.get("title", "")).strip(),
+                    "publisher": str(source.get("publisher", "")).strip(),
+                    "published_at": str(source.get("published_at", "")).strip(),
+                    "source_type": str(source.get("source_type", "")).strip(),
+                }
+                for source in source_items
+                if isinstance(source, dict)
+            ]
+            semantic_signature = self._company_semantic_signature(item)
+            item_identity = self._company_identity(item) or self._hashed_identity(section, semantic_signature)
+            return {
+                "section": section,
+                "item_identity": item_identity,
+                "semantic_signature": semantic_signature,
+                "company": str(item.get("company", "")).strip(),
+                "headline": str(item.get("headline", "")).strip(),
+                "dek": str(item.get("dek", "")).strip(),
+                "theme": str(item.get("theme", "")).strip(),
+                "confidence": str(item.get("confidence", "")).strip(),
+                "bullets": [
+                    str(value).strip()
+                    for value in (item.get("bullets", []) if isinstance(item.get("bullets"), list) else [])
+                    if str(value).strip()
+                ],
+                "sources": sources,
+            }
+
+        semantic_signature = self._rumor_semantic_signature(item)
+        item_identity = self._rumor_identity(item) or self._hashed_identity(section, semantic_signature)
+        return {
+            "section": section,
+            "item_identity": item_identity,
+            "semantic_signature": semantic_signature,
+            "headline": str(item.get("headline", "")).strip(),
+            "summary": str(item.get("summary", "")).strip(),
+            "display_name": str(item.get("display_name", "")).strip(),
+            "handle": str(item.get("handle", "")).strip(),
+            "url": self._normalize_url(str(item.get("url", "")).strip()),
+            "posted_at": str(item.get("posted_at", "")).strip(),
+            "engagement_hint": str(item.get("engagement_hint", "")).strip(),
+            "why_it_matters": str(item.get("why_it_matters", "")).strip(),
+            "verification_status": str(item.get("verification_status", "")).strip(),
+        }
+
+    def _history_source_url(self, section: str, item: dict[str, Any]) -> str:
+        if section == "rumors":
+            return self._normalize_url(str(item.get("url", "")).strip())
+        sources = item.get("sources", [])
+        if isinstance(sources, list):
+            for source in sources:
+                if isinstance(source, dict):
+                    url = self._normalize_url(str(source.get("url", "")).strip())
+                    if url:
+                        return url
+        return ""
+
+    def _history_source_published_at(self, section: str, item: dict[str, Any]) -> str:
+        if section == "rumors":
+            return str(item.get("posted_at", "")).strip()
+        sources = item.get("sources", [])
+        if isinstance(sources, list):
+            for source in sources:
+                if isinstance(source, dict):
+                    published_at = str(source.get("published_at", "")).strip()
+                    if published_at:
+                        return published_at
+        return ""
+
+    def _hashed_identity(self, section: str, value: str) -> str:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return f"{section}:sha256:{digest}"
+
     def _load_cache(self) -> None:
         if not self._cache_file.is_file():
             return
@@ -701,12 +967,18 @@ class NewsService:
         if self._snapshot.get("last_completed_at"):
             self._snapshot["status"] = "ready"
         else:
-            self._snapshot["status"] = "ready" if self._snapshot.get("companies") or self._snapshot.get("rumors") else "error"
-            self._snapshot["last_error"] = self._snapshot.get("last_error") or "上一次 News 刷新在进程重启或中断后未完成。"
+            self._snapshot["status"] = (
+                "ready" if self._snapshot.get("companies") or self._snapshot.get("rumors") else "error"
+            )
+            self._snapshot["last_error"] = (
+                self._snapshot.get("last_error") or "上一次 News 刷新在进程重启或中断后未完成。"
+            )
         self._normalize_item_state()
 
     def _ensure_bootstrap_content(self) -> None:
-        if (self._snapshot.get("companies") or self._snapshot.get("rumors")) and not self._looks_like_legacy_english_bootstrap():
+        if (
+            self._snapshot.get("companies") or self._snapshot.get("rumors")
+        ) and not self._looks_like_legacy_english_bootstrap():
             return
         self._snapshot.update(self._bootstrap_snapshot())
         self._write_cache()
@@ -745,7 +1017,9 @@ class NewsService:
             except asyncio.CancelledError:
                 pass
         self._snapshot["refresh_in_progress"] = False
-        self._snapshot["status"] = "ready" if self._snapshot.get("companies") or self._snapshot.get("rumors") else "error"
+        self._snapshot["status"] = (
+            "ready" if self._snapshot.get("companies") or self._snapshot.get("rumors") else "error"
+        )
         self._snapshot["last_error"] = reason
         self._write_cache()
 
@@ -1009,11 +1283,38 @@ class NewsService:
         previous: list[dict[str, Any]],
         current: list[dict[str, Any]],
     ) -> list[bool]:
+        previous_identities = {
+            str(item.get("item_identity", "")).strip()
+            for item in previous
+            if isinstance(item, dict) and str(item.get("item_identity", "")).strip()
+        }
         if section == "companies":
-            previous_signatures = {self._company_semantic_signature(item) for item in previous if isinstance(item, dict)}
-            return [self._company_semantic_signature(item) not in previous_signatures for item in current]
+            previous_signatures = {
+                self._company_semantic_signature(item) for item in previous if isinstance(item, dict)
+            }
+            previous_texts = [
+                self._history_comparison_text(section, item) for item in previous if isinstance(item, dict)
+            ]
+            return [
+                self._company_identity(item) not in previous_identities
+                and self._company_semantic_signature(item) not in previous_signatures
+                and not self._matches_previous_history_text(
+                    self._history_comparison_text(section, item),
+                    previous_texts,
+                )
+                for item in current
+            ]
         previous_signatures = {self._rumor_semantic_signature(item) for item in previous if isinstance(item, dict)}
-        return [self._rumor_semantic_signature(item) not in previous_signatures for item in current]
+        previous_texts = [self._history_comparison_text(section, item) for item in previous if isinstance(item, dict)]
+        return [
+            self._rumor_identity(item) not in previous_identities
+            and self._rumor_semantic_signature(item) not in previous_signatures
+            and not self._matches_previous_history_text(
+                self._history_comparison_text(section, item),
+                previous_texts,
+            )
+            for item in current
+        ]
 
     def _company_semantic_signature(self, item: dict[str, Any]) -> str:
         source_titles = " ".join(
@@ -1038,6 +1339,56 @@ class NewsService:
                 self._normalize_text(str(item.get("why_it_matters", ""))),
             ]
         )
+
+    def _history_comparison_text(self, section: str, item: dict[str, Any]) -> str:
+        if section == "companies":
+            source_titles = " ".join(
+                str(source.get("title", "")).strip() for source in item.get("sources", []) if isinstance(source, dict)
+            )
+            return " ".join(
+                [
+                    str(item.get("company", "")).strip(),
+                    str(item.get("headline", "")).strip(),
+                    str(item.get("dek", "")).strip(),
+                    str(item.get("theme", "")).strip(),
+                    source_titles,
+                ]
+            )
+        return " ".join(
+            [
+                str(item.get("headline", "")).strip(),
+                str(item.get("summary", "")).strip(),
+                str(item.get("why_it_matters", "")).strip(),
+            ]
+        )
+
+    def _matches_previous_history_text(self, current_text: str, previous_texts: list[str]) -> bool:
+        current_tokens = self._semantic_tokens(current_text)
+        return any(
+            self._semantic_overlap_ratio(current_tokens, previous_text) >= 0.58 for previous_text in previous_texts
+        )
+
+    def _matches_current_rumor_text(self, current_text: str, previous_texts: list[str]) -> bool:
+        current_tokens = self._semantic_tokens(current_text)
+        return any(
+            self._semantic_overlap_ratio(current_tokens, previous_text) >= 0.42 for previous_text in previous_texts
+        )
+
+    def _semantic_overlap_ratio(self, current_tokens: set[str], previous_text: str) -> float:
+        if not current_tokens:
+            return 0.0
+        previous_tokens = self._semantic_tokens(previous_text)
+        if not previous_tokens:
+            return 0.0
+        overlap = len(current_tokens & previous_tokens)
+        return overlap / max(1, min(len(current_tokens), len(previous_tokens)))
+
+    def _semantic_tokens(self, value: str) -> set[str]:
+        normalized = self._normalize_text(value)
+        tokens = set(re.findall(r"[a-z0-9]{2,}", normalized))
+        cjk_chars = re.findall(r"[\u4e00-\u9fff]", normalized)
+        tokens.update("".join(cjk_chars[index : index + 2]) for index in range(max(0, len(cjk_chars) - 1)))
+        return tokens
 
     def _company_identity(self, item: dict[str, Any]) -> str:
         source_urls = "|".join(
@@ -1076,6 +1427,8 @@ class NewsService:
     def _merge_rumors(self, *groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        seen_signatures: set[str] = set()
+        seen_texts: list[str] = []
         for group in groups:
             for item in group:
                 if not isinstance(item, dict):
@@ -1083,8 +1436,17 @@ class NewsService:
                 identity = self._rumor_identity(item)
                 if identity and identity in seen_ids:
                     continue
+                signature = self._rumor_semantic_signature(item)
+                if signature and signature in seen_signatures:
+                    continue
+                comparison_text = self._history_comparison_text("rumors", item)
+                if self._matches_current_rumor_text(comparison_text, seen_texts):
+                    continue
                 if identity:
                     seen_ids.add(identity)
+                if signature:
+                    seen_signatures.add(signature)
+                seen_texts.append(comparison_text)
                 merged.append(item)
         return self._sort_rumors(merged)[:RUMOR_TARGET_COUNT]
 
@@ -1184,8 +1546,7 @@ class NewsService:
         changed = False
         has_existing_items = bool(self._current_identities())
         is_uninitialized_state = (
-            not self._snapshot["item_state"]["seen_at"]
-            and not self._snapshot["item_state"]["read_at"]
+            not self._snapshot["item_state"]["seen_at"] and not self._snapshot["item_state"]["read_at"]
         )
 
         if seed_existing_items and has_existing_items and is_uninitialized_state:

@@ -17,22 +17,22 @@ from app.db.models import Account
 
 PLAN_CAPACITY_CREDITS_PRIMARY = {
     "free": 33.75,
-    "plus": 225.0,
-    "business": 225.0,
-    "team": 225.0,
-    "edu": 225.0,
-    "pro": 1500.0,
-    "enterprise": 1500.0,
+    "plus": 337.5,
+    "business": 337.5,
+    "team": 337.5,
+    "edu": 337.5,
+    "pro": 2250.0,
+    "enterprise": 2250.0,
 }
 
 PLAN_CAPACITY_CREDITS_SECONDARY = {
     "free": 1134.0,
-    "plus": 7560.0,
-    "business": 7560.0,
-    "team": 7560.0,
-    "edu": 7560.0,
-    "pro": 50400.0,
-    "enterprise": 50400.0,
+    "plus": 11340.0,
+    "business": 11340.0,
+    "team": 11340.0,
+    "edu": 11340.0,
+    "pro": 75600.0,
+    "enterprise": 75600.0,
 }
 
 DEFAULT_WINDOW_MINUTES_PRIMARY = 300

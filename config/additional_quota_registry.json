@@ -2,8 +2,35 @@
   {
     "quota_key": "codex_spark",
     "display_label": "GPT-5.3-Codex-Spark",
-    "model_ids": ["gpt-5.3-codex-spark"],
-    "limit_name_aliases": ["codex_other", "GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark"],
-    "metered_feature_aliases": ["codex_bengalfox"]
+    "model_ids": [
+      "gpt-5.3-codex-spark"
+    ],
+    "limit_name_aliases": [
+      "codex_other",
+      "GPT-5.3-Codex-Spark",
+      "gpt-5.3-codex-spark"
+    ],
+    "metered_feature_aliases": [
+      "codex_bengalfox"
+    ]
+  },
+  {
+    "quota_key": "gpt_5_5",
+    "display_label": "GPT-5.5",
+    "model_ids": [
+      "gpt-5.5"
+    ],
+    "quota_key_aliases": [
+      "latest_model"
+    ],
+    "limit_name_aliases": [
+      "gpt-5.5",
+      "GPT-5.5",
+      "gpt_5_5"
+    ],
+    "metered_feature_aliases": [
+      "gpt_5_5"
+    ],
+    "role": "latest_model"
   }
 ]

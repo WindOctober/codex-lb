@@ -708,7 +708,7 @@ def test_state_from_account_keeps_quota_exceeded_when_no_usage_data(monkeypatch)
     assert state.status == AccountStatus.QUOTA_EXCEEDED
 
 
-def test_state_from_account_rate_limited_checks_primary_freshness(monkeypatch):
+def test_state_from_account_keeps_rate_limited_when_primary_usage_is_older_than_block(monkeypatch):
     now = 1_700_000_000.0
     blocked = now - 130.0
     future_reset = int(now + 3600)
@@ -739,7 +739,8 @@ def test_state_from_account_rate_limited_checks_primary_freshness(monkeypatch):
         secondary_entry=fresh_secondary,
         runtime=runtime,
     )
-    assert state.status == AccountStatus.ACTIVE
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.blocked_at == blocked
 
 
 def test_state_from_account_rate_limited_clears_with_fresh_primary(monkeypatch):
@@ -998,6 +999,32 @@ def test_select_account_capacity_weighted_same_tier_lower_usage_selected_more():
     low_ratio = counts["plus-low"] / n
     expected_low_ratio = 0.8
     assert abs(low_ratio - expected_low_ratio) <= 0.05
+
+
+def test_select_account_capacity_weighted_respects_source_rank_before_capacity():
+    high_priority = AccountState(
+        "oauth-plus",
+        AccountStatus.ACTIVE,
+        used_percent=10.0,
+        secondary_used_percent=90.0,
+        plan_type="plus",
+        capacity_credits=7560.0,
+        source_rank=0,
+    )
+    low_priority = AccountState(
+        "provider",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        plan_type="api_key_provider",
+        capacity_credits=1_000_000.0,
+        source_rank=100,
+    )
+
+    for _ in range(100):
+        result = select_account([high_priority, low_priority], routing_strategy="capacity_weighted")
+        assert result.account is not None
+        assert result.account.account_id == "oauth-plus"
 
 
 def test_select_account_capacity_weighted_all_exhausted_falls_back_deterministically():

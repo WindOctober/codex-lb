@@ -241,6 +241,8 @@ def select_account(
         candidate_pool = (
             _prefer_earlier_reset_candidates(effective_pool, current) if prefer_earlier_reset else effective_pool
         )
+        min_source_rank = min(state.source_rank for state in candidate_pool)
+        candidate_pool = [state for state in candidate_pool if state.source_rank == min_source_rank]
         if deterministic_probe:
             selected = min(candidate_pool, key=_capacity_probe_sort_key)
         else:

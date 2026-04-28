@@ -82,6 +82,7 @@ from app.core.metrics.prometheus import (
     continuity_owner_resolution_total,
 )
 from app.core.openai.exceptions import ClientPayloadError
+from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import CompactResponsePayload, OpenAIEvent, OpenAIResponsePayload
 from app.core.openai.parsing import parse_response_payload, parse_sse_event
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
@@ -97,6 +98,7 @@ from app.db.models import (
     ACCOUNT_PROVIDER_API_KEY,
     Account,
     AccountStatus,
+    AdditionalUsageHistory,
     DashboardSettings,
     HttpBridgeSessionState,
     StickySessionKind,
@@ -136,7 +138,7 @@ from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeOwnerClient,
     OwnerForwardRelayFailure,
 )
-from app.modules.proxy.load_balancer import AccountSelection, LoadBalancer
+from app.modules.proxy.load_balancer import AccountSelection, LoadBalancer, _clone_account
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories
 from app.modules.proxy.request_policy import (
@@ -158,6 +160,7 @@ from app.modules.proxy.types import (
 )
 from app.modules.proxy.work_admission import AdmissionLease, WorkAdmissionController
 from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
+from app.modules.usage.latest_model import get_latest_model_quota_key
 from app.modules.usage.updater import UsageUpdater
 
 logger = logging.getLogger(__name__)
@@ -229,6 +232,12 @@ _WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES = frozenset(
     }
 )
 _WEBSOCKET_PREVIOUS_RESPONSE_ACCOUNT_CACHE_LIMIT = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class _DurableAccountBinding:
+    account_id: str | None
+    supports_request_model: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,7 +317,7 @@ def _upstream_account_header_value(account: Account) -> str | None:
 
 
 def _websocket_disabled_for_account(account: Account) -> bool:
-    return account.provider_kind == ACCOUNT_PROVIDER_API_KEY
+    return account.provider_kind == ACCOUNT_PROVIDER_API_KEY and _account_upstream_wire_api(account) == "codex"
 
 
 def _fingerprint_input_items(items: Sequence[JsonValue]) -> str:
@@ -333,6 +342,34 @@ class ProxyService:
         self._http_bridge_lock = anyio.Lock()
         self._work_admission: WorkAdmissionController | None = None
 
+    async def _durable_account_binding(
+        self,
+        durable_lookup: DurableBridgeLookup | None,
+        *,
+        request_model: str | None,
+    ) -> _DurableAccountBinding:
+        if durable_lookup is None or durable_lookup.account_id is None:
+            return _DurableAccountBinding(account_id=None, supports_request_model=True)
+        try:
+            async with self._repo_factory() as repos:
+                account = await repos.accounts.get_by_id(durable_lookup.account_id)
+                account = _clone_account(account) if account is not None else None
+        except Exception:
+            logger.warning(
+                "Failed to validate durable HTTP bridge account model support; preserving durable binding",
+                exc_info=True,
+            )
+            return _DurableAccountBinding(
+                account_id=durable_lookup.account_id,
+                supports_request_model=True,
+            )
+        if account is None or account.status != AccountStatus.ACTIVE:
+            return _DurableAccountBinding(account_id=None, supports_request_model=False)
+        return _DurableAccountBinding(
+            account_id=account.id,
+            supports_request_model=_account_supports_http_bridge_request_model(account, request_model),
+        )
+
     async def get_http_bridge_request_status(
         self,
         request_id: str,
@@ -343,9 +380,7 @@ class ProxyService:
 
         runtime_settings = get_settings()
         now = time.monotonic()
-        stall_threshold_ms = int(
-            max(30_000.0, min(runtime_settings.stream_idle_timeout_seconds * 500.0, 120_000.0))
-        )
+        stall_threshold_ms = int(max(30_000.0, min(runtime_settings.stream_idle_timeout_seconds * 500.0, 120_000.0)))
         best_match: tuple[int, HTTPBridgeRequestStatusSnapshot] | None = None
 
         async with self._http_bridge_lock:
@@ -636,6 +671,10 @@ class ProxyService:
         except Exception:
             logger.warning("Durable bridge lookup failed; falling back to non-durable request handling", exc_info=True)
             durable_lookup = None
+        durable_account_binding = await self._durable_account_binding(
+            durable_lookup,
+            request_model=payload.model,
+        )
         effective_payload = payload
         proxy_injected_previous_response_id = False
         fresh_upstream_request_text: str | None = None
@@ -657,6 +696,7 @@ class ProxyService:
                 and payload.previous_response_id is None
                 and bridge_session_key.strength == "hard"
                 and durable_lookup.latest_response_id is not None
+                and durable_account_binding.supports_request_model
                 and not _http_bridge_payload_looks_like_full_resend(payload)
             ):
                 effective_payload = payload.model_copy(
@@ -696,9 +736,10 @@ class ProxyService:
             durable_lookup=durable_lookup,
         )
         request_state.preferred_account_id = (
-            durable_lookup.account_id
+            durable_account_binding.account_id
             if (
                 durable_lookup is not None
+                and durable_account_binding.supports_request_model
                 and (
                     request_state.previous_response_id is not None
                     or bridge_session_key.strength == "hard"
@@ -717,6 +758,7 @@ class ProxyService:
                 incoming_turn_state=incoming_turn_state_header,
                 previous_response_id=request_state.previous_response_id,
                 api_key=api_key,
+                request_model=effective_payload.model,
             )
         if request_state.previous_response_id is not None and request_state.preferred_account_id is None:
             request_state.preferred_account_id = await self._resolve_websocket_previous_response_owner(
@@ -757,6 +799,7 @@ class ProxyService:
             forwarded_affinity_kind=forwarded_affinity_kind,
             forwarded_affinity_key=forwarded_affinity_key,
             durable_lookup=durable_lookup,
+            durable_account_supports_request_model=durable_account_binding.supports_request_model,
             request_stage=request_state.request_stage,
             preferred_account_id=request_state.preferred_account_id,
         )
@@ -833,6 +876,7 @@ class ProxyService:
                     allow_previous_response_recovery_rebind=should_attempt_previous_response_recovery,
                     allow_bootstrap_owner_rebind=should_attempt_bootstrap_rebind,
                     durable_lookup=durable_lookup,
+                    durable_account_supports_request_model=durable_account_binding.supports_request_model,
                     request_stage="reattach",
                     preferred_account_id=request_state.preferred_account_id,
                 )
@@ -956,7 +1000,9 @@ class ProxyService:
                 payload=effective_payload,
                 durable_lookup=durable_lookup,
             )
-            request_state.preferred_account_id = durable_lookup.account_id if durable_lookup is not None else None
+            request_state.preferred_account_id = (
+                durable_account_binding.account_id if durable_account_binding.supports_request_model else None
+            )
             request_state.proxy_injected_previous_response_id = True
             request_state.fresh_upstream_request_text = fresh_upstream_request_text
             # Session-level anchor injection may be attached to a payload
@@ -1166,6 +1212,7 @@ class ProxyService:
                 forwarded_request=False,
                 allow_previous_response_recovery_rebind=allow_previous_response_recovery_rebind,
                 durable_lookup=durable_lookup,
+                durable_account_supports_request_model=durable_account_binding.supports_request_model,
                 request_stage=retry_request_stage,
                 preferred_account_id=retry_preferred_account_id,
             )
@@ -1327,6 +1374,7 @@ class ProxyService:
         incoming_turn_state: str | None,
         previous_response_id: str,
         api_key: ApiKeyData | None,
+        request_model: str | None,
     ) -> str | None:
         api_key_id = api_key.id if api_key is not None else None
         candidate_keys: list[_HTTPBridgeSessionKey] = [key]
@@ -1352,6 +1400,7 @@ class ProxyService:
                     key=candidate_key,
                     incoming_turn_state=incoming_turn_state,
                     previous_response_id=previous_response_id,
+                    request_model=request_model,
                 ):
                     continue
                 _record_continuity_owner_resolution(
@@ -3242,6 +3291,7 @@ class ProxyService:
         allow_previous_response_recovery_rebind: bool = False,
         allow_bootstrap_owner_rebind: bool = False,
         durable_lookup: DurableBridgeLookup | None = None,
+        durable_account_supports_request_model: bool = True,
         request_stage: str = "first_turn",
         preferred_account_id: str | None = None,
     ) -> "_HTTPBridgeSession": ...
@@ -3266,6 +3316,7 @@ class ProxyService:
         allow_previous_response_recovery_rebind: bool = False,
         allow_bootstrap_owner_rebind: bool = False,
         durable_lookup: DurableBridgeLookup | None = None,
+        durable_account_supports_request_model: bool = True,
         request_stage: str = "first_turn",
         preferred_account_id: str | None = None,
     ) -> "_HTTPBridgeSession | _HTTPBridgeOwnerForward": ...
@@ -3289,6 +3340,7 @@ class ProxyService:
         allow_previous_response_recovery_rebind: bool = False,
         allow_bootstrap_owner_rebind: bool = False,
         durable_lookup: DurableBridgeLookup | None = None,
+        durable_account_supports_request_model: bool = True,
         request_stage: str = "first_turn",
         preferred_account_id: str | None = None,
     ) -> "_HTTPBridgeSession | _HTTPBridgeOwnerForward":
@@ -3445,6 +3497,7 @@ class ProxyService:
                         key=key,
                         incoming_turn_state=incoming_turn_state,
                         previous_response_id=previous_response_id,
+                        request_model=request_model,
                     )
                     and _http_bridge_session_matches_preferred_account(
                         session=existing,
@@ -4042,6 +4095,7 @@ class ProxyService:
                         key=key,
                         incoming_turn_state=incoming_turn_state,
                         previous_response_id=previous_response_id,
+                        request_model=request_model,
                     )
                     and _http_bridge_session_matches_preferred_account(
                         session=session,
@@ -4068,6 +4122,11 @@ class ProxyService:
             created_session: _HTTPBridgeSession | None = None
             session_registered = False
             require_preferred_account = previous_response_id is not None and preferred_account_id is not None
+            allow_durable_takeover = (
+                force_durable_takeover
+                or not durable_account_supports_request_model
+                or _http_bridge_allow_durable_takeover(durable_lookup)
+            )
             try:
                 created_session = await self._create_http_bridge_session_compatible(
                     key,
@@ -4082,7 +4141,7 @@ class ProxyService:
                 )
                 await self._claim_durable_http_bridge_session(
                     created_session,
-                    allow_takeover=force_durable_takeover or _http_bridge_allow_durable_takeover(durable_lookup),
+                    allow_takeover=allow_durable_takeover,
                 )
                 async with self._http_bridge_lock:
                     current_future = self._http_bridge_inflight_sessions.get(key)
@@ -4889,6 +4948,20 @@ class ProxyService:
 
                 if message.kind == "text" and message.text is not None:
                     await self._process_http_bridge_upstream_text(session, message.text)
+                    if session.upstream_control.reconnect_requested:
+                        should_close = session.upstream_control.replay_request_state is not None
+                        if not should_close:
+                            async with session.pending_lock:
+                                should_close = not session.pending_requests
+                        if should_close:
+                            try:
+                                await session.upstream.close()
+                            except Exception:
+                                logger.debug(
+                                    "Failed to close HTTP bridge upstream websocket for reconnect",
+                                    exc_info=True,
+                                )
+                            break
                     continue
 
                 retried = await self._retry_http_bridge_precreated_request(session)
@@ -7565,17 +7638,21 @@ class ProxyService:
         if not account_map:
             return []
         latest = await repos.usage.latest_by_account(window=window)
-        return [
-            UsageWindowRow(
-                account_id=entry.account_id,
-                used_percent=entry.used_percent,
-                reset_at=entry.reset_at,
-                window_minutes=entry.window_minutes,
-                recorded_at=entry.recorded_at,
-            )
+        rows_by_account = {
+            entry.account_id: _usage_window_row_from_entry(entry)
             for entry in latest.values()
             if entry.account_id in account_map
-        ]
+        }
+        latest_quota_key = get_latest_model_quota_key()
+        if latest_quota_key:
+            latest_additional = await repos.additional_usage.latest_by_account(
+                latest_quota_key,
+                window,
+                account_ids=list(account_map),
+            )
+            for entry in latest_additional.values():
+                rows_by_account[entry.account_id] = _usage_window_row_from_additional_entry(entry)
+        return list(rows_by_account.values())
 
     async def _latest_usage_entries(
         self,
@@ -9245,6 +9322,26 @@ def _websocket_receive_timeout_for_pending_requests(
     )
 
 
+def _usage_window_row_from_entry(entry: UsageHistory) -> UsageWindowRow:
+    return UsageWindowRow(
+        account_id=entry.account_id,
+        used_percent=entry.used_percent,
+        reset_at=entry.reset_at,
+        window_minutes=entry.window_minutes,
+        recorded_at=entry.recorded_at,
+    )
+
+
+def _usage_window_row_from_additional_entry(entry: AdditionalUsageHistory) -> UsageWindowRow:
+    return UsageWindowRow(
+        account_id=entry.account_id,
+        used_percent=entry.used_percent,
+        reset_at=entry.reset_at,
+        window_minutes=entry.window_minutes,
+        recorded_at=entry.recorded_at,
+    )
+
+
 def _routing_strategy(settings: DashboardSettings) -> RoutingStrategy:
     value = settings.routing_strategy or "capacity_weighted"
     if value == "round_robin":
@@ -9908,7 +10005,10 @@ def _http_bridge_session_reusable_for_request(
     key: "_HTTPBridgeSessionKey",
     incoming_turn_state: str | None,
     previous_response_id: str | None,
+    request_model: str | None,
 ) -> bool:
+    if not _http_bridge_session_account_supports_request_model(session, request_model):
+        return False
     if key.affinity_kind != "prompt_cache":
         return True
     if incoming_turn_state is not None:
@@ -9916,6 +10016,41 @@ def _http_bridge_session_reusable_for_request(
     if previous_response_id is not None:
         return True
     return not session.codex_session
+
+
+def _http_bridge_session_account_supports_request_model(
+    session: "_HTTPBridgeSession",
+    request_model: str | None,
+) -> bool:
+    return _account_supports_http_bridge_request_model(session.account, request_model)
+
+
+def _account_supports_http_bridge_request_model(
+    account: Account,
+    request_model: str | None,
+) -> bool:
+    if request_model is None:
+        return True
+    if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+        supported_models = _supported_models_for_account(account)
+        return supported_models is None or request_model in supported_models
+    allowed_plans = get_model_registry().plan_types_for_model(request_model)
+    return allowed_plans is not None and account.plan_type in allowed_plans
+
+
+def _supported_models_for_account(account: Account) -> set[str] | None:
+    raw = account.supported_models_json
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid supported_models_json for account_id=%s", account.id)
+        return None
+    if not isinstance(payload, list):
+        return None
+    supported = {item.strip() for item in payload if isinstance(item, str) and item.strip()}
+    return supported or set()
 
 
 def _http_bridge_session_matches_preferred_account(

@@ -166,6 +166,22 @@ class RequestLog(Base):
     )
 
 
+class NewsItem(Base):
+    __tablename__ = "news_items"
+    __table_args__ = (UniqueConstraint("section", "item_identity", name="uq_news_items_section_identity"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    section: Mapped[str] = mapped_column(String, nullable=False)
+    item_identity: Mapped[str] = mapped_column(String, nullable=False)
+    semantic_signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    full_json: Mapped[str] = mapped_column(Text, nullable=False)
+    compact_json: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_published_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
@@ -663,6 +679,9 @@ Index(
     RequestLog.requested_at.desc(),
     RequestLog.id.desc(),
 )
+Index("idx_news_items_section_recorded_at", NewsItem.section, NewsItem.recorded_at.desc())
+Index("idx_news_items_section_generated_at", NewsItem.section, NewsItem.generated_at.desc())
+Index("idx_news_items_recorded_at", NewsItem.recorded_at.desc())
 Index("idx_sticky_account", StickySession.account_id)
 Index("idx_sticky_kind_updated_at", StickySession.kind, StickySession.updated_at.desc())
 Index("idx_api_keys_hash", ApiKey.key_hash)

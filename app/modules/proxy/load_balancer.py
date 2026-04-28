@@ -425,7 +425,11 @@ class LoadBalancer:
                 allowed_account_ids = set(account_ids)
                 accounts = [account for account in accounts if account.id in allowed_account_ids]
             pre_model_filter_accounts = accounts
-            if model and (effective_limit_name is None or _mapped_model_has_registry_entry(model)):
+            if model and (
+                effective_limit_name is None
+                or _mapped_model_has_registry_entry(model)
+                or _accounts_have_explicit_provider_support(pre_model_filter_accounts, model)
+            ):
                 accounts = _filter_accounts_for_model(pre_model_filter_accounts, model)
             if model and not accounts:
                 if not all_accounts:
@@ -499,6 +503,24 @@ class LoadBalancer:
                 repos.usage.latest_by_account(),
                 repos.usage.latest_by_account(window="secondary"),
             )
+            if effective_limit_name:
+                quota_account_ids = [account.id for account in accounts]
+                additional_primary, additional_secondary = await asyncio.gather(
+                    _latest_additional_by_key(
+                        repos.additional_usage,
+                        effective_limit_name,
+                        "primary",
+                        account_ids=quota_account_ids,
+                    ),
+                    _latest_additional_by_key(
+                        repos.additional_usage,
+                        effective_limit_name,
+                        "secondary",
+                        account_ids=quota_account_ids,
+                    ),
+                )
+                latest_primary = _overlay_additional_usage(latest_primary, additional_primary)
+                latest_secondary = _overlay_additional_usage(latest_secondary, additional_secondary)
             selection_inputs = _SelectionInputs(
                 accounts=[_clone_account(account) for account in accounts],
                 latest_primary={
@@ -559,6 +581,10 @@ class LoadBalancer:
         eligible_accounts: list[Account] = []
         blocked_by_data = False
         for account in accounts:
+            if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+                if account.status == AccountStatus.ACTIVE:
+                    eligible_accounts.append(account)
+                continue
             eligibility = _additional_quota_eligibility(
                 account_id=account.id,
                 latest_primary=latest_primary,
@@ -573,6 +599,17 @@ class LoadBalancer:
                 blocked_by_data = True
 
         if not eligible_accounts:
+            if blocked_by_data and not fresh_account_ids and not latest_primary and not latest_secondary:
+                logger.warning(
+                    (
+                        "Allowing gated model routing with stale additional quota data "
+                        "model=%s limit_name=%s candidate_accounts=%s"
+                    ),
+                    model,
+                    limit_name,
+                    len(accounts),
+                )
+                return accounts, None, None
             error_code = ADDITIONAL_QUOTA_DATA_UNAVAILABLE if blocked_by_data else NO_ADDITIONAL_QUOTA_ELIGIBLE_ACCOUNTS
             error_message = (
                 f"No fresh additional quota data available for model '{model}'"
@@ -1090,11 +1127,29 @@ def _state_from_account(
             if recorded_epoch > effective_blocked_at:
                 effective_runtime_reset = None
 
+    primary_entry_after_block = _usage_entry_recorded_after(primary_entry, effective_blocked_at)
+    primary_used_for_quota = primary_used
+    primary_reset_for_quota = primary_reset
+    primary_window_minutes_for_quota = primary_window_minutes
+    if (
+        account.status == AccountStatus.RATE_LIMITED
+        and effective_blocked_at is not None
+        and primary_entry is not None
+        and not primary_entry_after_block
+        and primary_used is not None
+        and primary_used < 100.0
+    ):
+        # A rate-limit error is fresher than this usage row. Do not let an
+        # older below-limit snapshot immediately re-enable the same account.
+        primary_used_for_quota = None
+        primary_reset_for_quota = None
+        primary_window_minutes_for_quota = None
+
     status, used_percent, reset_at = apply_usage_quota(
         status=account.status,
-        primary_used=primary_used,
-        primary_reset=primary_reset,
-        primary_window_minutes=primary_window_minutes,
+        primary_used=primary_used_for_quota,
+        primary_reset=primary_reset_for_quota,
+        primary_window_minutes=primary_window_minutes_for_quota,
         runtime_reset=effective_runtime_reset,
         secondary_used=secondary_used,
         secondary_reset=secondary_reset,
@@ -1171,19 +1226,45 @@ def _usage_entry_is_recent_enough(recorded_at: datetime | None) -> bool:
     return recorded_time >= current_time - timedelta(seconds=interval_seconds)
 
 
+def _usage_entry_recorded_after(entry: UsageHistory | None, epoch_seconds: float | None) -> bool:
+    if entry is None or entry.recorded_at is None or epoch_seconds is None:
+        return False
+    recorded_time = (
+        entry.recorded_at if entry.recorded_at.tzinfo is not None else entry.recorded_at.replace(tzinfo=timezone.utc)
+    )
+    return recorded_time.timestamp() > epoch_seconds
+
+
 def _filter_accounts_for_model(accounts: list[Account], model: str) -> list[Account]:
     allowed_plans = get_model_registry().plan_types_for_model(model)
+    explicit_provider_support = _accounts_have_explicit_provider_support(accounts, model)
     filtered: list[Account] = []
     for account in accounts:
         if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+            if account.status != AccountStatus.ACTIVE:
+                continue
             supports_model = _account_supports_model(account, model)
             if supports_model is False:
+                continue
+            filtered.append(account)
+            continue
+        if explicit_provider_support and not allowed_plans:
+            if account.plan_type == "free":
                 continue
             filtered.append(account)
             continue
         if allowed_plans is None or account.plan_type in allowed_plans:
             filtered.append(account)
     return filtered
+
+
+def _accounts_have_explicit_provider_support(accounts: list[Account], model: str) -> bool:
+    return any(
+        account.provider_kind == ACCOUNT_PROVIDER_API_KEY
+        and account.status == AccountStatus.ACTIVE
+        and _account_supports_model(account, model) is True
+        for account in accounts
+    )
 
 
 def _account_supports_model(account: Account, model: str) -> bool | None:
@@ -1248,6 +1329,29 @@ def _clone_account(account: Account) -> Account:
 def _clone_usage_history(entry: UsageHistory) -> UsageHistory:
     data = {column.name: getattr(entry, column.name) for column in UsageHistory.__table__.columns}
     return UsageHistory(**data)
+
+
+def _overlay_additional_usage(
+    base: dict[str, UsageHistory],
+    latest: dict[str, AdditionalUsageHistory],
+) -> dict[str, UsageHistory]:
+    if not latest:
+        return base
+    merged = dict(base)
+    for account_id, entry in latest.items():
+        merged[account_id] = _additional_usage_to_usage_history(entry)
+    return merged
+
+
+def _additional_usage_to_usage_history(entry: AdditionalUsageHistory) -> UsageHistory:
+    return UsageHistory(
+        account_id=entry.account_id,
+        used_percent=entry.used_percent,
+        reset_at=entry.reset_at,
+        window=entry.window,
+        window_minutes=entry.window_minutes,
+        recorded_at=entry.recorded_at,
+    )
 
 
 def _clone_selection_inputs(selection_inputs: SelectionInputs) -> SelectionInputs:

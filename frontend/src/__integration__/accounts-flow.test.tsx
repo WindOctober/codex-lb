@@ -14,9 +14,10 @@ describe("accounts flow integration", () => {
 
     expect(await screen.findByRole("heading", { name: "Accounts" })).toBeInTheDocument();
     expect((await screen.findAllByText("primary@example.com")).length).toBeGreaterThan(0);
-    expect(screen.getByText("secondary@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("secondary@example.com")).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox")).toHaveTextContent("Active");
 
-    await user.click(screen.getByText("secondary@example.com"));
+    await user.click(screen.getAllByText("primary@example.com")[0]);
     expect(await screen.findByText("Token Status")).toBeInTheDocument();
 
     const resumeButton = screen.queryByRole("button", { name: "Resume" });

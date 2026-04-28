@@ -9,7 +9,7 @@ from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.usage.types import UsageTrendBucket, UsageWindowRow
 from app.core.utils.time import from_epoch_seconds
-from app.db.models import ACCOUNT_PROVIDER_API_KEY, Account, UsageHistory
+from app.db.models import ACCOUNT_PROVIDER_API_KEY, Account, AdditionalUsageHistory, UsageHistory
 from app.modules.accounts.schemas import (
     AccountAdditionalQuota,
     AccountAuthStatus,
@@ -25,8 +25,8 @@ from app.modules.accounts.schemas import (
 def build_account_summaries(
     *,
     accounts: list[Account],
-    primary_usage: dict[str, UsageHistory],
-    secondary_usage: dict[str, UsageHistory],
+    primary_usage: dict[str, UsageHistory | AdditionalUsageHistory],
+    secondary_usage: dict[str, UsageHistory | AdditionalUsageHistory],
     request_usage_by_account: dict[str, AccountRequestUsage] | None = None,
     additional_quotas_by_account: dict[str, list[AccountAdditionalQuota]] | None = None,
     encryptor: TokenEncryptor,
@@ -48,8 +48,8 @@ def build_account_summaries(
 
 def _account_to_summary(
     account: Account,
-    primary_usage: UsageHistory | None,
-    secondary_usage: UsageHistory | None,
+    primary_usage: UsageHistory | AdditionalUsageHistory | None,
+    secondary_usage: UsageHistory | AdditionalUsageHistory | None,
     request_usage: AccountRequestUsage | None,
     additional_quotas: list[AccountAdditionalQuota] | None,
     encryptor: TokenEncryptor,
@@ -126,9 +126,9 @@ def _account_to_summary(
 
 
 def _effective_usage_windows(
-    primary_usage: UsageHistory | None,
-    secondary_usage: UsageHistory | None,
-) -> tuple[UsageHistory | None, UsageHistory | None]:
+    primary_usage: UsageHistory | AdditionalUsageHistory | None,
+    secondary_usage: UsageHistory | AdditionalUsageHistory | None,
+) -> tuple[UsageHistory | AdditionalUsageHistory | None, UsageHistory | AdditionalUsageHistory | None]:
     if primary_usage is None:
         return None, secondary_usage
     if not usage_core.is_weekly_window_minutes(primary_usage.window_minutes):
@@ -140,7 +140,7 @@ def _effective_usage_windows(
     return None, secondary_usage
 
 
-def _to_window_row(entry: UsageHistory) -> UsageWindowRow:
+def _to_window_row(entry: UsageHistory | AdditionalUsageHistory) -> UsageWindowRow:
     return UsageWindowRow(
         account_id=entry.account_id,
         used_percent=entry.used_percent,
@@ -198,7 +198,7 @@ def _token_expiry(token: str | None) -> datetime | None:
     return None
 
 
-def _normalize_used_percent(entry: UsageHistory | None) -> float | None:
+def _normalize_used_percent(entry: UsageHistory | AdditionalUsageHistory | None) -> float | None:
     if not entry:
         return None
     return entry.used_percent

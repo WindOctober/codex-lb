@@ -77,7 +77,7 @@ async def test_dashboard_overview_combines_data(async_client, db_setup):
         "bucketSeconds": 21600,
         "bucketCount": 28,
     }
-    assert payload["summary"]["primaryWindow"]["capacityCredits"] == pytest.approx(225.0)
+    assert payload["summary"]["primaryWindow"]["capacityCredits"] == pytest.approx(337.5)
     assert payload["summary"]["cost"]["totalUsd"] == pytest.approx(0.000625)
     assert payload["summary"]["metrics"]["requests"] == 1
     assert payload["summary"]["metrics"]["tokens"] == 150

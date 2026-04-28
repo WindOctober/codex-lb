@@ -75,9 +75,13 @@ class DashboardRepository:
         return await self._additional_usage_repo.list_quota_keys(account_ids=account_ids, since=since)
 
     async def latest_additional_usage_by_account(
-        self, quota_key: str, window: str
+        self,
+        quota_key: str,
+        window: str,
+        *,
+        account_ids: Collection[str] | None = None,
     ) -> dict[str, AdditionalUsageHistory]:
-        return await self._additional_usage_repo.latest_by_account(quota_key, window)
+        return await self._additional_usage_repo.latest_by_account(quota_key, window, account_ids=account_ids)
 
     async def latest_additional_recorded_at(self) -> datetime | None:
         return await self._additional_usage_repo.latest_recorded_at()

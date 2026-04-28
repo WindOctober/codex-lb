@@ -23,7 +23,14 @@ from app.core.clients.upstream import UpstreamProbeError, probe_upstream_provide
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
-from app.db.models import ACCOUNT_PROVIDER_API_KEY, ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, AccountStatus
+from app.db.models import (
+    ACCOUNT_PROVIDER_API_KEY,
+    ACCOUNT_PROVIDER_OPENAI_OAUTH,
+    Account,
+    AccountStatus,
+    AdditionalUsageHistory,
+    UsageHistory,
+)
 from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.mappers import build_account_summaries, build_account_usage_trends
 from app.modules.accounts.repository import AccountsRepository
@@ -41,6 +48,7 @@ from app.modules.accounts.schemas import (
 )
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
+from app.modules.usage.latest_model import get_latest_model_quota_key
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.updater import AdditionalUsageRepositoryPort, UsageUpdater
 
@@ -63,6 +71,17 @@ class _AvailabilityOutcome:
     reason: str | None = None
     reset_at: int | None = None
     probed: bool = True
+
+
+def _overlay_latest_model_usage(
+    base: dict[str, UsageHistory],
+    latest: dict[str, AdditionalUsageHistory],
+) -> dict[str, UsageHistory | AdditionalUsageHistory]:
+    if not latest:
+        return base
+    merged = dict(base)
+    merged.update(latest)
+    return merged
 
 
 class AccountsService:
@@ -103,6 +122,16 @@ class AccountsService:
         additional_quotas_by_account: dict[str, list[AccountAdditionalQuota]] = {}
         additional_usage_repo = cast(AdditionalUsageRepository | None, self._additional_usage_repo)
         if additional_usage_repo:
+            latest_quota_key = get_latest_model_quota_key()
+            if latest_quota_key:
+                latest_primary = await additional_usage_repo.latest_by_account(
+                    latest_quota_key, "primary", account_ids=account_ids
+                )
+                latest_secondary = await additional_usage_repo.latest_by_account(
+                    latest_quota_key, "secondary", account_ids=account_ids
+                )
+                primary_usage = _overlay_latest_model_usage(primary_usage, latest_primary)
+                secondary_usage = _overlay_latest_model_usage(secondary_usage, latest_secondary)
             quota_keys = await additional_usage_repo.list_quota_keys(account_ids=account_ids)
             for quota_key in quota_keys:
                 primary_entries = await additional_usage_repo.latest_by_account(quota_key, "primary")

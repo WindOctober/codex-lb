@@ -1055,11 +1055,14 @@ def _resolve_stream_transport(
     *,
     transport: str,
     transport_override: str | None,
+    wire_api: str | None = None,
     model: str | None,
     headers: Mapping[str, str],
     has_image_generation_tool: bool = False,
 ) -> str:
     configured = _configured_stream_transport(transport=transport, transport_override=transport_override)
+    if wire_api in {"responses", "v1"}:
+        return "http"
     if configured == "websocket":
         return "websocket"
     if configured == "http":
@@ -1894,6 +1897,7 @@ async def stream_responses(
     transport = _resolve_stream_transport(
         transport=settings.upstream_stream_transport,
         transport_override=upstream_stream_transport_override,
+        wire_api=wire_api,
         model=payload.model,
         headers=headers,
         has_image_generation_tool=_payload_uses_image_generation_tool(payload_dict),

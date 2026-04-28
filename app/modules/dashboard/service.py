@@ -5,9 +5,10 @@ from datetime import datetime, timedelta
 
 from app.core import usage as usage_core
 from app.core.crypto import TokenEncryptor
+from app.core.openai.model_registry import get_model_registry
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import utcnow
-from app.db.models import ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, UsageHistory
+from app.db.models import ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, AdditionalUsageHistory, UsageHistory
 from app.modules.accounts.mappers import build_account_summaries
 from app.modules.accounts.schemas import (
     AccountAvailabilityBreakdown,
@@ -37,6 +38,7 @@ from app.modules.usage.depletion_service import (
     compute_aggregate_depletion,
     compute_depletion_for_account,
 )
+from app.modules.usage.latest_model import get_latest_model_id, get_latest_model_quota_key
 
 
 class DashboardService:
@@ -51,7 +53,9 @@ class DashboardService:
         now = utcnow()
         overview_timeframe = resolve_overview_timeframe(timeframe_key)
         accounts = await self._repo.list_accounts()
-        request_usage_rows = await self._repo.list_request_usage_summary_by_account([account.id for account in accounts])
+        request_usage_rows = await self._repo.list_request_usage_summary_by_account(
+            [account.id for account in accounts]
+        )
         request_usage_by_account = {
             account_id: AccountRequestUsage(
                 request_count=row.request_count,
@@ -66,6 +70,17 @@ class DashboardService:
         }
         primary_usage = await self._repo.latest_usage_by_account("primary")
         secondary_usage = await self._repo.latest_usage_by_account("secondary")
+        latest_quota_key = get_latest_model_quota_key()
+        if latest_quota_key:
+            account_ids = [account.id for account in accounts]
+            latest_primary = await self._repo.latest_additional_usage_by_account(
+                latest_quota_key, "primary", account_ids=account_ids
+            )
+            latest_secondary = await self._repo.latest_additional_usage_by_account(
+                latest_quota_key, "secondary", account_ids=account_ids
+            )
+            primary_usage = _overlay_latest_model_usage(primary_usage, latest_primary)
+            secondary_usage = _overlay_latest_model_usage(secondary_usage, latest_secondary)
 
         account_summaries = build_account_summaries(
             accounts=accounts,
@@ -283,7 +298,18 @@ def _build_depletion_by_window(
     return _aggregate(primary_history, "primary"), _aggregate(secondary_history, "secondary")
 
 
-def _rows_from_latest(latest: dict[str, UsageHistory]) -> list[UsageWindowRow]:
+def _overlay_latest_model_usage(
+    base: dict[str, UsageHistory],
+    latest: dict[str, AdditionalUsageHistory],
+) -> dict[str, UsageHistory | AdditionalUsageHistory]:
+    if not latest:
+        return base
+    merged = dict(base)
+    merged.update(latest)
+    return merged
+
+
+def _rows_from_latest(latest: dict[str, UsageHistory | AdditionalUsageHistory]) -> list[UsageWindowRow]:
     return [
         UsageWindowRow(
             account_id=entry.account_id,
@@ -297,8 +323,8 @@ def _rows_from_latest(latest: dict[str, UsageHistory]) -> list[UsageWindowRow]:
 
 
 def _should_use_weekly_primary_history(
-    primary_entry: UsageHistory,
-    secondary_entry: UsageHistory | None,
+    primary_entry: UsageHistory | AdditionalUsageHistory,
+    secondary_entry: UsageHistory | AdditionalUsageHistory | None,
 ) -> bool:
     return usage_core.should_use_weekly_primary(
         _usage_history_to_window_row(primary_entry),
@@ -306,7 +332,7 @@ def _should_use_weekly_primary_history(
     )
 
 
-def _usage_history_to_window_row(entry: UsageHistory) -> UsageWindowRow:
+def _usage_history_to_window_row(entry: UsageHistory | AdditionalUsageHistory) -> UsageWindowRow:
     return UsageWindowRow(
         account_id=entry.account_id,
         used_percent=entry.used_percent,
@@ -317,8 +343,8 @@ def _usage_history_to_window_row(entry: UsageHistory) -> UsageWindowRow:
 
 
 def _latest_recorded_at(
-    primary_usage: dict[str, UsageHistory],
-    secondary_usage: dict[str, UsageHistory],
+    primary_usage: dict[str, UsageHistory | AdditionalUsageHistory],
+    secondary_usage: dict[str, UsageHistory | AdditionalUsageHistory],
     additional_ts: datetime | None = None,
 ):
     timestamps = [
@@ -387,13 +413,14 @@ def _merge_domain_group(domain: str, members: list[AccountSummary]) -> AccountSu
     member_count = len(members)
     active_count = sum(1 for member in members if member.status == "active")
     availability = _availability_breakdown(members)
+    quota_members = _quota_members_for_latest_model(members)
     primary_remaining = _weighted_remaining_percent(
-        members,
+        quota_members,
         capacity_attr="capacity_credits_primary",
         remaining_attr="remaining_credits_primary",
     )
     secondary_remaining = _weighted_remaining_percent(
-        members,
+        quota_members,
         capacity_attr="capacity_credits_secondary",
         remaining_attr="remaining_credits_secondary",
     )
@@ -414,13 +441,34 @@ def _merge_domain_group(domain: str, members: list[AccountSummary]) -> AccountSu
             primary_remaining_percent=primary_remaining,
             secondary_remaining_percent=secondary_remaining,
         ),
-        capacity_credits_primary=sum(member.capacity_credits_primary or 0.0 for member in members),
-        remaining_credits_primary=sum(member.remaining_credits_primary or 0.0 for member in members),
-        capacity_credits_secondary=sum(member.capacity_credits_secondary or 0.0 for member in members),
-        remaining_credits_secondary=sum(member.remaining_credits_secondary or 0.0 for member in members),
+        capacity_credits_primary=sum(member.capacity_credits_primary or 0.0 for member in quota_members),
+        remaining_credits_primary=sum(member.remaining_credits_primary or 0.0 for member in quota_members),
+        capacity_credits_secondary=sum(member.capacity_credits_secondary or 0.0 for member in quota_members),
+        remaining_credits_secondary=sum(member.remaining_credits_secondary or 0.0 for member in quota_members),
         request_usage=_sum_request_usage(member.request_usage for member in members),
         availability=availability,
     )
+
+
+def _quota_members_for_latest_model(members: list[AccountSummary]) -> list[AccountSummary]:
+    latest_model_id = get_latest_model_id()
+    return [
+        member
+        for member in members
+        if member.status != "deactivated" and _summary_supports_latest_model(member, latest_model_id)
+    ]
+
+
+def _summary_supports_latest_model(member: AccountSummary, latest_model_id: str | None) -> bool:
+    if latest_model_id is None:
+        return True
+    if member.provider_kind != ACCOUNT_PROVIDER_OPENAI_OAUTH:
+        return True
+
+    allowed_plans = get_model_registry().plan_types_for_model(latest_model_id)
+    if not allowed_plans:
+        return member.plan_type != "free"
+    return member.plan_type in allowed_plans
 
 
 def _availability_breakdown(members: list[AccountSummary]) -> AccountAvailabilityBreakdown:
@@ -489,9 +537,7 @@ def _sum_request_usage(values) -> AccountRequestUsage | None:
     currencies = {row.estimated_total_cost_currency for row in rows if row.estimated_total_cost_currency}
     display_currency = next(iter(currencies)) if len(currencies) == 1 else None
     display_amount = (
-        round(sum(row.estimated_total_cost or 0.0 for row in rows), 6)
-        if display_currency is not None
-        else None
+        round(sum(row.estimated_total_cost or 0.0 for row in rows), 6) if display_currency is not None else None
     )
     return AccountRequestUsage(
         request_count=sum(row.request_count for row in rows),

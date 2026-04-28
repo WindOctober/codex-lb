@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import ModelRegistrySnapshot
 from app.core.utils.time import utcnow
 from app.db.models import (
+    ACCOUNT_PROVIDER_API_KEY,
     Account,
     AccountStatus,
     AdditionalUsageHistory,
@@ -56,6 +58,19 @@ def _make_account(account_id: str, email: str = "a@example.com") -> Account:
         status=AccountStatus.ACTIVE,
         deactivation_reason=None,
     )
+
+
+def _make_api_key_provider_account(
+    account_id: str,
+    *,
+    supported_models: list[str],
+    email: str = "provider@example.com",
+) -> Account:
+    account = _make_account(account_id, email)
+    account.provider_kind = ACCOUNT_PROVIDER_API_KEY
+    account.plan_type = "api_key_provider"
+    account.supported_models_json = json.dumps(supported_models)
+    return account
 
 
 class StubAccountsRepository(AccountsRepository):
@@ -1814,6 +1829,102 @@ async def test_select_account_skips_registry_plan_filter_for_mapped_model(monkey
 
 
 @pytest.mark.asyncio
+async def test_select_account_keeps_paid_oauth_when_provider_explicitly_supports_unknown_model(monkeypatch) -> None:
+    free_account = _make_account("acc-free-unknown-model", "free-unknown-model@example.com")
+    free_account.plan_type = "free"
+    plus_account = _make_account("acc-plus-unknown-model", "plus-unknown-model@example.com")
+    plus_account.plan_type = "plus"
+    provider_account = _make_api_key_provider_account(
+        "provider-unknown-model",
+        supported_models=["gpt-6.0"],
+        email="provider-unknown-model@example.com",
+    )
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    accounts = [free_account, plus_account, provider_account]
+    usage_rows = {
+        account.id: UsageHistory(
+            id=index,
+            account_id=account.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=5.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        )
+        for index, account in enumerate(accounts, start=1)
+    }
+    accounts_repo = StubAccountsRepository(accounts)
+    usage_repo = StubUsageRepository(primary=usage_rows, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(
+            get_snapshot=lambda: SimpleNamespace(model_plans={}),
+            plan_types_for_model=lambda _model: frozenset(),
+        ),
+    )
+
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+    selection = await balancer.select_account(model="gpt-6.0")
+
+    assert selection.account is not None
+    assert selection.account.id in {plus_account.id, provider_account.id}
+    assert selection.account.id != free_account.id
+    assert selection.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_select_account_excludes_oauth_for_gated_provider_model_without_registry_entry(monkeypatch) -> None:
+    free_account = _make_account("acc-free-gated-gpt55", "free-gated-gpt55@example.com")
+    free_account.plan_type = "free"
+    provider_account = _make_api_key_provider_account(
+        "provider-gated-gpt55",
+        supported_models=["gpt-5.5"],
+        email="provider-gated-gpt55@example.com",
+    )
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    accounts = [free_account, provider_account]
+    usage_rows = {
+        account.id: UsageHistory(
+            id=index,
+            account_id=account.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=5.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        )
+        for index, account in enumerate(accounts, start=1)
+    }
+    accounts_repo = StubAccountsRepository(accounts)
+    usage_repo = StubUsageRepository(primary=usage_rows, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    additional_usage_repo = StubAdditionalUsageRepository()
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(
+            get_snapshot=lambda: SimpleNamespace(model_plans={}),
+            plan_types_for_model=lambda _model: frozenset(),
+        ),
+    )
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_additional_quota_key_for_model_id",
+        lambda model: "gpt_5_5" if model == "gpt-5.5" else None,
+    )
+
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo, additional_usage_repo))
+    selection = await balancer.select_account(model="gpt-5.5")
+
+    assert selection.account is not None
+    assert selection.account.id == provider_account.id
+    assert selection.error_code is None
+
+
+@pytest.mark.asyncio
 async def test_select_account_respects_registry_plan_filter_for_mapped_model(monkeypatch) -> None:
     account = _make_account("acc-gated-plan-filtered", "gated-plan-filtered@example.com")
     now = utcnow()
@@ -2082,6 +2193,195 @@ async def test_select_account_returns_data_unavailable_when_secondary_window_is_
 
     assert selection.account is None
     assert selection.error_code == ADDITIONAL_QUOTA_DATA_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_select_account_uses_latest_model_additional_quota_for_budget(monkeypatch) -> None:
+    pressured_account = _make_account("acc-gpt55-pressured", "gpt55-pressured@example.com")
+    safe_account = _make_account("acc-gpt55-safe", "gpt55-safe@example.com")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    accounts = [pressured_account, safe_account]
+    accounts_repo = StubAccountsRepository(accounts)
+    usage_repo = StubUsageRepository(
+        primary={
+            account.id: UsageHistory(
+                id=index,
+                account_id=account.id,
+                recorded_at=now,
+                window="primary",
+                used_percent=5.0,
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+            )
+            for index, account in enumerate(accounts, start=1)
+        },
+        secondary={
+            account.id: UsageHistory(
+                id=index + 10,
+                account_id=account.id,
+                recorded_at=now,
+                window="secondary",
+                used_percent=5.0,
+                reset_at=now_epoch + 3600,
+                window_minutes=10080,
+            )
+            for index, account in enumerate(accounts, start=1)
+        },
+    )
+    sticky_repo = StubStickySessionsRepository()
+    additional_usage_repo = StubAdditionalUsageRepository(
+        primary={
+            account.id: _additional_entry(
+                index + 20,
+                account_id=account.id,
+                quota_key="gpt_5_5",
+                limit_name="GPT-5.5",
+                window="primary",
+                used_percent=10.0,
+                reset_at=now_epoch + 300,
+                recorded_at=now,
+            )
+            for index, account in enumerate(accounts, start=1)
+        },
+        secondary={
+            pressured_account.id: _additional_entry(
+                31,
+                account_id=pressured_account.id,
+                quota_key="gpt_5_5",
+                limit_name="GPT-5.5",
+                window="secondary",
+                used_percent=99.0,
+                reset_at=now_epoch + 3600,
+                recorded_at=now,
+            ),
+            safe_account.id: _additional_entry(
+                32,
+                account_id=safe_account.id,
+                quota_key="gpt_5_5",
+                limit_name="GPT-5.5",
+                window="secondary",
+                used_percent=10.0,
+                reset_at=now_epoch + 3600,
+                recorded_at=now,
+            ),
+        },
+    )
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(plan_types_for_model=lambda _model: frozenset({"plus"})),
+    )
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_additional_quota_key_for_model_id",
+        lambda model: "gpt_5_5" if model == "gpt-5.5" else None,
+    )
+
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo, additional_usage_repo))
+    selection = await balancer.select_account(model="gpt-5.5")
+
+    assert selection.account is not None
+    assert selection.account.id == safe_account.id
+    assert selection.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_select_account_allows_gated_model_when_quota_key_has_no_history(monkeypatch) -> None:
+    account = _make_account("acc-gated-no-history", "gated-no-history@example.com")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary_entry = UsageHistory(
+        id=1,
+        account_id=account.id,
+        recorded_at=now,
+        window="primary",
+        used_percent=5.0,
+        reset_at=now_epoch + 300,
+        window_minutes=5,
+    )
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={account.id: primary_entry}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    additional_usage_repo = StubAdditionalUsageRepository()
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(plan_types_for_model=lambda _model: frozenset({"plus"})),
+    )
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_additional_quota_key_for_model_id",
+        lambda model: "gpt_5_5" if model == "gpt-5.5" else None,
+    )
+
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            accounts_repo,
+            usage_repo,
+            sticky_repo,
+            additional_usage_repo,
+        )
+    )
+    selection = await balancer.select_account(model="gpt-5.5")
+
+    assert selection.account is not None
+    assert selection.account.id == account.id
+    assert selection.error_code is None
+
+
+@pytest.mark.asyncio
+async def test_select_account_ignores_paused_provider_for_gated_model(monkeypatch) -> None:
+    oauth_account = _make_account("acc-gated-oauth", "gated-oauth@example.com")
+    paused_provider = _make_api_key_provider_account(
+        "provider-gated-paused",
+        supported_models=["gpt-5.5"],
+        email="paused-provider@example.com",
+    )
+    paused_provider.status = AccountStatus.PAUSED
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    accounts = [oauth_account, paused_provider]
+    usage_rows = {
+        account.id: UsageHistory(
+            id=index,
+            account_id=account.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=5.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        )
+        for index, account in enumerate(accounts, start=1)
+    }
+    accounts_repo = StubAccountsRepository(accounts)
+    usage_repo = StubUsageRepository(primary=usage_rows, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    additional_usage_repo = StubAdditionalUsageRepository()
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(
+            get_snapshot=lambda: SimpleNamespace(model_plans={}),
+            plan_types_for_model=lambda _model: frozenset(),
+        ),
+    )
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_additional_quota_key_for_model_id",
+        lambda model: "gpt_5_5" if model == "gpt-5.5" else None,
+    )
+
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            accounts_repo,
+            usage_repo,
+            sticky_repo,
+            additional_usage_repo,
+        )
+    )
+    selection = await balancer.select_account(model="gpt-5.5")
+
+    assert selection.account is not None
+    assert selection.account.id == oauth_account.id
+    assert selection.error_code is None
 
 
 @pytest.mark.asyncio

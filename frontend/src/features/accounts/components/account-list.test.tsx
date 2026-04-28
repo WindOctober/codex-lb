@@ -37,14 +37,15 @@ describe("AccountList", () => {
     );
 
     expect(screen.getByText("primary@example.com")).toBeInTheDocument();
-    expect(screen.getByText("secondary@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("secondary@example.com")).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox")).toHaveTextContent("Active");
 
-    await user.type(screen.getByPlaceholderText("Search accounts..."), "secondary");
-    expect(screen.queryByText("primary@example.com")).not.toBeInTheDocument();
-    expect(screen.getByText("secondary@example.com")).toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText("Search accounts..."), "primary");
+    expect(screen.getByText("primary@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("secondary@example.com")).not.toBeInTheDocument();
 
-    await user.click(screen.getByText("secondary@example.com"));
-    expect(onSelect).toHaveBeenCalledWith("acc-2");
+    await user.click(screen.getByText("primary@example.com"));
+    expect(onSelect).toHaveBeenCalledWith("acc-1");
   });
 
   it("shows empty state when no items match filter", async () => {

@@ -32,6 +32,7 @@ from app.core.middleware import (
 )
 from app.core.middleware.inflight import InFlightMiddleware
 from app.core.openai.model_refresh_scheduler import build_model_refresh_scheduler
+from app.core.openai.provider_model_refresh import refresh_api_provider_model_snapshots_on_startup
 from app.core.resilience.backpressure import BackpressureMiddleware
 from app.core.resilience.bulkhead import BulkheadMiddleware, get_bulkhead
 from app.core.resilience.memory_monitor import configure as configure_memory_monitor
@@ -127,6 +128,18 @@ async def lifespan(app: FastAPI):
     bridge_durable_schema_ready = await _ensure_bridge_durable_schema_ready(settings)
     if bridge_durable_schema_ready:
         startup_module.mark_bridge_durable_schema_ready()
+    try:
+        provider_refresh = await refresh_api_provider_model_snapshots_on_startup()
+        if provider_refresh.checked:
+            logger.info(
+                "API provider model snapshots refreshed checked=%d refreshed=%d changed=%d failed=%d",
+                provider_refresh.checked,
+                provider_refresh.refreshed,
+                provider_refresh.changed,
+                provider_refresh.failed,
+            )
+    except Exception:
+        logger.warning("API provider model snapshot startup refresh failed", exc_info=True)
     usage_scheduler = build_usage_refresh_scheduler()
     model_scheduler = build_model_refresh_scheduler()
     sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()

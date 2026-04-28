@@ -407,6 +407,16 @@ async def test_stream_via_http_bridge_turn_state_request_ignores_prompt_cache_ow
     )
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(
+        service,
+        "_durable_account_binding",
+        AsyncMock(
+            return_value=proxy_service._DurableAccountBinding(
+                account_id="acc-1",
+                supports_request_model=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
         service._durable_bridge,
         "lookup_request_targets",
         AsyncMock(
@@ -756,6 +766,145 @@ async def test_stream_via_http_bridge_injects_durable_previous_response_anchor(
 
     assert chunks == []
     assert captured["previous_response_id"] == "resp_latest"
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_ignores_durable_anchor_for_unsupported_account_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {"model": "gpt-5.5", "instructions": "hi", "input": "hello"},
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-unsupported-durable-account",
+        model="gpt-5.5",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        event_queue=asyncio.Queue(),
+        transport="http",
+    )
+    event_queue = request_state.event_queue
+    assert event_queue is not None
+    await event_queue.put(None)
+    captured: dict[str, object] = {}
+
+    def fake_prepare(
+        prepared_payload: proxy_service.ResponsesRequest,
+        _headers: dict[str, str] | Any,
+        *,
+        api_key: proxy_service.ApiKeyData | None,
+        api_key_reservation: proxy_service.ApiKeyUsageReservationData | None,
+        request_id: str,
+    ) -> tuple[proxy_service._WebSocketRequestState, str]:
+        del api_key, api_key_reservation, request_id
+        captured["previous_response_id"] = prepared_payload.previous_response_id
+        return request_state, '{"type":"response.create"}'
+
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-legacy", None),
+        headers={"x-codex-session-id": "sid-legacy"},
+        affinity=proxy_service._AffinityPolicy(
+            key="sid-legacy",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        request_model="gpt-5.5",
+        account=cast(Any, SimpleNamespace(id="provider-1", status=AccountStatus.ACTIVE)),
+        upstream=cast(UpstreamResponsesWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=0,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: cast(
+            Any,
+            SimpleNamespace(
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        sticky_threads_enabled=False,
+                        openai_cache_affinity_max_age_seconds=1800,
+                        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+                        http_responses_session_bridge_gateway_safe_mode=False,
+                    )
+                )
+            ),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(
+        service._durable_bridge,
+        "lookup_request_targets",
+        AsyncMock(
+            return_value=proxy_service.DurableBridgeLookup(
+                session_id="legacy-free-session",
+                canonical_kind="session_header",
+                canonical_key="sid-legacy",
+                api_key_scope="__anonymous__",
+                account_id="free-legacy",
+                owner_instance_id="instance-a",
+                owner_epoch=1,
+                lease_expires_at=datetime.now(timezone.utc),
+                state=HttpBridgeSessionState.ACTIVE,
+                latest_turn_state="http_turn_legacy",
+                latest_response_id="resp_legacy",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_durable_account_binding",
+        AsyncMock(
+            return_value=proxy_service._DurableAccountBinding(
+                account_id="free-legacy",
+                supports_request_model=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(service, "_prepare_http_bridge_request", fake_prepare)
+
+    async def fake_get_or_create(
+        *args: object,
+        **kwargs: object,
+    ) -> proxy_service._HTTPBridgeSession:
+        captured["preferred_account_id"] = kwargs.get("preferred_account_id")
+        captured["durable_account_supports_request_model"] = kwargs.get("durable_account_supports_request_model")
+        return session
+
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", fake_get_or_create)
+    monkeypatch.setattr(service, "_submit_http_bridge_request", AsyncMock())
+    monkeypatch.setattr(service, "_detach_http_bridge_request", AsyncMock())
+
+    chunks = [
+        chunk
+        async for chunk in service._stream_via_http_bridge(
+            payload,
+            headers={"x-codex-session-id": "sid-legacy"},
+            codex_session_affinity=True,
+            propagate_http_errors=False,
+            openai_cache_affinity=False,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120.0,
+            codex_idle_ttl_seconds=1800.0,
+            max_sessions=8,
+            queue_limit=4,
+        )
+    ]
+
+    assert chunks == []
+    assert captured["previous_response_id"] is None
+    assert captured["preferred_account_id"] is None
+    assert captured["durable_account_supports_request_model"] is False
 
 
 @pytest.mark.asyncio
@@ -2791,6 +2940,7 @@ async def test_http_bridge_local_owner_account_id_records_resolution_source(
         incoming_turn_state=None,
         previous_response_id="resp_prev_local_owner_metric",
         api_key=None,
+        request_model="gpt-5.4",
     )
 
     assert owner == "acc-1"

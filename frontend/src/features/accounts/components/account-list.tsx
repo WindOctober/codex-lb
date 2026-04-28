@@ -36,7 +36,7 @@ export function AccountList({
   onOpenProvider = () => undefined,
 }: AccountListProps) {
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<string>("active");
   const [helpOpen, setHelpOpen] = useState(false);
 
   const filtered = useMemo(() => {

@@ -51,7 +51,7 @@ from app.core.types import JsonValue
 from app.core.usage.types import UsageWindowRow
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
-from app.db.models import ACCOUNT_PROVIDER_API_KEY, Account, AccountStatus, UsageHistory
+from app.db.models import ACCOUNT_PROVIDER_API_KEY, Account, AccountStatus, AdditionalUsageHistory, UsageHistory
 from app.db.session import get_background_session
 from app.dependencies import ProxyContext, get_proxy_context, get_proxy_websocket_context
 from app.modules.accounts.repository import AccountsRepository
@@ -92,7 +92,8 @@ from app.modules.proxy.types import (
     RateLimitStatusPayloadData,
     RateLimitWindowSnapshotData,
 )
-from app.modules.usage.repository import UsageRepository
+from app.modules.usage.latest_model import get_latest_model_quota_key
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 logger = logging.getLogger(__name__)
 
@@ -497,8 +498,24 @@ async def _build_aggregate_credit_limits(session: AsyncSession) -> dict[str, V1U
     primary_latest = await usage_repository.latest_by_account(window="primary")
     secondary_latest = await usage_repository.latest_by_account(window="secondary")
 
-    primary_rows = [_usage_entry_to_window_row(entry) for entry in primary_latest.values()]
-    secondary_rows = [_usage_entry_to_window_row(entry) for entry in secondary_latest.values()]
+    primary_rows_by_account = {entry.account_id: _usage_entry_to_window_row(entry) for entry in primary_latest.values()}
+    secondary_rows_by_account = {
+        entry.account_id: _usage_entry_to_window_row(entry) for entry in secondary_latest.values()
+    }
+    latest_quota_key = get_latest_model_quota_key()
+    if latest_quota_key:
+        additional_repository = AdditionalUsageRepository(session)
+        latest_primary = await additional_repository.latest_by_account(latest_quota_key, "primary")
+        latest_secondary = await additional_repository.latest_by_account(latest_quota_key, "secondary")
+        primary_rows_by_account.update(
+            (entry.account_id, _additional_usage_entry_to_window_row(entry)) for entry in latest_primary.values()
+        )
+        secondary_rows_by_account.update(
+            (entry.account_id, _additional_usage_entry_to_window_row(entry)) for entry in latest_secondary.values()
+        )
+
+    primary_rows = list(primary_rows_by_account.values())
+    secondary_rows = list(secondary_rows_by_account.values())
     primary_rows, secondary_rows = usage_core.normalize_weekly_only_rows(primary_rows, secondary_rows)
 
     account_ids = {row.account_id for row in primary_rows} | {row.account_id for row in secondary_rows}
@@ -551,6 +568,16 @@ async def _load_accounts_by_id(session: AsyncSession, account_ids: set[str]) -> 
 
 
 def _usage_entry_to_window_row(entry: UsageHistory) -> UsageWindowRow:
+    return UsageWindowRow(
+        account_id=entry.account_id,
+        used_percent=entry.used_percent,
+        reset_at=entry.reset_at,
+        window_minutes=entry.window_minutes,
+        recorded_at=entry.recorded_at,
+    )
+
+
+def _additional_usage_entry_to_window_row(entry: AdditionalUsageHistory) -> UsageWindowRow:
     return UsageWindowRow(
         account_id=entry.account_id,
         used_percent=entry.used_percent,
@@ -647,13 +674,11 @@ async def _build_models_response(api_key: ApiKeyData | None) -> Response:
     for slug, model in models.items():
         if not is_public_model(model, allowed_models):
             continue
-        items_by_id[slug] = (
-            ModelListItem(
-                id=slug,
-                created=created,
-                owned_by="codex-lb",
-                metadata=_to_model_metadata(model),
-            )
+        items_by_id[slug] = ModelListItem(
+            id=slug,
+            created=created,
+            owned_by="codex-lb",
+            metadata=_to_model_metadata(model),
         )
     async with get_background_session() as session:
         accounts_repo = AccountsRepository(session)

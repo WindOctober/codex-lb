@@ -82,12 +82,12 @@ async def test_usage_history_aggregates_per_account(async_client, db_setup):
     acc_b = accounts["acc_b"]
 
     assert acc_a["remainingPercentAvg"] == pytest.approx(80.0)
-    assert acc_a["capacityCredits"] == pytest.approx(225.0)
-    assert acc_a["remainingCredits"] == pytest.approx(180.0)
+    assert acc_a["capacityCredits"] == pytest.approx(337.5)
+    assert acc_a["remainingCredits"] == pytest.approx(270.0)
 
     assert acc_b["remainingPercentAvg"] == pytest.approx(100.0)
-    assert acc_b["capacityCredits"] == pytest.approx(225.0)
-    assert acc_b["remainingCredits"] == pytest.approx(225.0)
+    assert acc_b["capacityCredits"] == pytest.approx(337.5)
+    assert acc_b["remainingCredits"] == pytest.approx(337.5)
 
 
 @pytest.mark.asyncio
@@ -115,8 +115,8 @@ async def test_usage_window_secondary_uses_latest_window_minutes(async_client, d
     accounts = {item["accountId"]: item for item in payload["accounts"]}
     entry = accounts["acc_sec"]
     assert entry["remainingPercentAvg"] == pytest.approx(60.0)
-    assert entry["capacityCredits"] == pytest.approx(7560.0)
-    assert entry["remainingCredits"] == pytest.approx(4536.0)
+    assert entry["capacityCredits"] == pytest.approx(11340.0)
+    assert entry["remainingCredits"] == pytest.approx(6804.0)
 
 
 @pytest.mark.asyncio
@@ -209,8 +209,8 @@ async def test_usage_history_team_plan_has_capacity(async_client, db_setup):
     entry = accounts["acc_team"]
 
     assert entry["remainingPercentAvg"] == pytest.approx(80.0)
-    assert entry["capacityCredits"] == pytest.approx(225.0)
-    assert entry["remainingCredits"] == pytest.approx(180.0)
+    assert entry["capacityCredits"] == pytest.approx(337.5)
+    assert entry["remainingCredits"] == pytest.approx(270.0)
 
 
 @pytest.mark.asyncio
