@@ -912,6 +912,10 @@ class ProxyService:
                     retry_request_state.transport = _REQUEST_TRANSPORT_HTTP
                     retry_request_state.request_stage = "reattach"
                     retry_request_state.preferred_account_id = request_state.preferred_account_id
+                    _set_request_budget(
+                        retry_request_state,
+                        get_settings().proxy_reconnect_request_budget_seconds,
+                    )
 
                     await self._submit_http_bridge_request(
                         session,
@@ -1303,6 +1307,10 @@ class ProxyService:
         propagate_http_errors: bool,
         downstream_turn_state: str | None,
     ) -> AsyncGenerator[str, None]:
+        _set_request_budget(
+            request_state,
+            _http_bridge_request_budget_seconds(session, request_state, get_settings()),
+        )
         await self._submit_http_bridge_request(
             session,
             request_state=request_state,
@@ -2138,6 +2146,11 @@ class ProxyService:
                 if replay_request_state is not None:
                     request_state = replay_request_state
                     replay_request_state = None
+                    _set_request_budget(
+                        request_state,
+                        runtime_settings.proxy_reconnect_request_budget_seconds,
+                        restart_from_now=True,
+                    )
                     request_affinity = request_state.affinity_policy
                     text_data = request_state.request_text
                     if text_data is None:
@@ -3396,7 +3409,7 @@ class ProxyService:
             owner_forward: _HTTPBridgeOwnerForward | None = None
             force_durable_takeover = False
             missing_turn_state_alias = False
-            used_session_header_fallback = False
+            allow_missing_turn_state_fresh_session = False
             preserve_durable_canonical_key = (
                 incoming_turn_state is not None
                 and forwarded_affinity is None
@@ -3478,8 +3491,9 @@ class ProxyService:
                             if previous_key is not None:
                                 self._http_bridge_previous_response_index.pop(previous_alias_key, None)
                         if incoming_session_key is not None:
-                            key = _HTTPBridgeSessionKey("session_header", incoming_session_key, api_key_id)
-                            used_session_header_fallback = True
+                            # Missing generated turn-state aliases are not precise enough to reuse session_header state.
+                            key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
+                            allow_missing_turn_state_fresh_session = True
                         else:
                             key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
                             missing_turn_state_alias = True
@@ -3932,7 +3946,7 @@ class ProxyService:
                                 self._http_bridge_previous_response_index.pop(previous_alias_key, None)
                     if (
                         previous_response_id is not None
-                        and not used_session_header_fallback
+                        and not allow_missing_turn_state_fresh_session
                         and not allow_previous_response_recovery_rebind
                         and durable_lookup is None
                     ):
@@ -4512,7 +4526,13 @@ class ProxyService:
             started_at=time.monotonic(),
             transport=_REQUEST_TRANSPORT_HTTP,
         )
-        deadline = _websocket_connect_deadline(request_state, get_settings().proxy_request_budget_seconds)
+        runtime_settings = get_settings()
+        connect_budget_seconds = (
+            runtime_settings.proxy_reconnect_request_budget_seconds
+            if request_stage in {"reattach", "context_overflow_recover"}
+            else runtime_settings.proxy_request_budget_seconds
+        )
+        deadline = _websocket_connect_deadline(request_state, connect_budget_seconds)
         settings = await get_settings_cache().get()
         excluded_account_ids: set[str] = set()
         retry_same_account_once = preferred_account_id is not None
@@ -5126,7 +5146,13 @@ class ProxyService:
         except Exception:
             logger.debug("Failed to close HTTP bridge upstream websocket before reconnect", exc_info=True)
 
-        deadline = _websocket_connect_deadline(request_state, get_settings().proxy_request_budget_seconds)
+        runtime_settings = get_settings()
+        _set_request_budget(
+            request_state,
+            runtime_settings.proxy_reconnect_request_budget_seconds,
+            restart_from_now=True,
+        )
+        deadline = _websocket_connect_deadline(request_state, runtime_settings.proxy_reconnect_request_budget_seconds)
         settings = await get_settings_cache().get()
         session.api_key = request_state.api_key
         excluded_account_ids: set[str] = set()
@@ -5206,6 +5232,7 @@ class ProxyService:
         session.account = account
         session.headers = connect_headers
         session.upstream = upstream
+        session.upstream_reconnect_count += 1
         session.upstream_control = _WebSocketUpstreamControl()
         session.closed = False
         session.upstream_turn_state = _upstream_turn_state_from_socket(upstream) or session.upstream_turn_state
@@ -5987,9 +6014,9 @@ class ProxyService:
         stream_idle_timeout_seconds: float,
     ) -> _WebSocketReceiveTimeout | None:
         async with pending_lock:
-            started_ats = [request_state.started_at for request_state in pending_requests]
+            requests = list(pending_requests)
         return _websocket_receive_timeout_for_pending_requests(
-            started_ats,
+            requests,
             proxy_request_budget_seconds=proxy_request_budget_seconds,
             stream_idle_timeout_seconds=stream_idle_timeout_seconds,
         )
@@ -6026,7 +6053,7 @@ class ProxyService:
             expired_requests = [
                 request_state
                 for request_state in list(pending_requests)
-                if now >= request_state.started_at + request_budget_seconds
+                if now >= _request_deadline_at(request_state, request_budget_seconds)
             ]
             for request_state in expired_requests:
                 pending_requests.remove(request_state)
@@ -8022,6 +8049,8 @@ class _WebSocketRequestState:
     reasoning_effort: str | None
     api_key_reservation: ApiKeyUsageReservationData | None
     started_at: float
+    request_budget_seconds: float | None = None
+    request_deadline_at: float | None = None
     latency_first_token_ms: int | None = None
     request_log_id: str | None = None
     requested_service_tier: str | None = None
@@ -8116,6 +8145,7 @@ class _HTTPBridgeSession:
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None
+    upstream_reconnect_count: int = 0
     closed: bool = False
 
 
@@ -9290,17 +9320,24 @@ def _upstream_websocket_disconnect_message(message: UpstreamWebSocketMessage) ->
 
 
 def _websocket_receive_timeout_for_pending_requests(
-    started_ats: Sequence[float],
+    pending_requests: Sequence[float | _WebSocketRequestState],
     *,
     proxy_request_budget_seconds: float,
     stream_idle_timeout_seconds: float,
 ) -> _WebSocketReceiveTimeout | None:
-    if not started_ats:
+    if not pending_requests:
         return None
 
     idle_timeout_seconds = max(0.001, stream_idle_timeout_seconds)
-    oldest_started_at = min(started_ats)
-    remaining_budget = _remaining_budget_seconds(oldest_started_at + proxy_request_budget_seconds)
+    request_deadline = min(
+        (
+            request_or_started_at + proxy_request_budget_seconds
+            if isinstance(request_or_started_at, (int, float))
+            else _request_deadline_at(request_or_started_at, proxy_request_budget_seconds)
+        )
+        for request_or_started_at in pending_requests
+    )
+    remaining_budget = _remaining_budget_seconds(request_deadline)
 
     if remaining_budget <= 0:
         return _WebSocketReceiveTimeout(
@@ -9479,7 +9516,48 @@ def _remaining_budget_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
+def _request_budget_seconds(request_state: _WebSocketRequestState, default_budget_seconds: float) -> float:
+    configured = request_state.request_budget_seconds
+    if configured is not None and configured > 0:
+        return configured
+    return default_budget_seconds
+
+
+def _request_deadline_at(request_state: _WebSocketRequestState, default_budget_seconds: float) -> float:
+    if request_state.request_deadline_at is not None:
+        return request_state.request_deadline_at
+    return request_state.started_at + _request_budget_seconds(request_state, default_budget_seconds)
+
+
+def _set_request_budget(
+    request_state: _WebSocketRequestState,
+    budget_seconds: float,
+    *,
+    restart_from_now: bool = False,
+) -> None:
+    request_state.request_budget_seconds = budget_seconds
+    deadline_start = time.monotonic() if restart_from_now else request_state.started_at
+    request_state.request_deadline_at = deadline_start + budget_seconds
+
+
+def _http_bridge_request_budget_seconds(
+    session: _HTTPBridgeSession,
+    request_state: _WebSocketRequestState,
+    settings: Settings,
+) -> float:
+    if (
+        session.upstream_reconnect_count > 0
+        or session.upstream_control.reconnect_requested
+        or request_state.replay_count > 0
+        or request_state.request_stage in {"reattach", "context_overflow_recover"}
+    ):
+        return settings.proxy_reconnect_request_budget_seconds
+    return settings.proxy_request_budget_seconds
+
+
 def _websocket_connect_deadline(request_state: _WebSocketRequestState, budget_seconds: float) -> float:
+    if request_state.request_deadline_at is not None:
+        return request_state.request_deadline_at
     started_at = request_state.started_at if request_state.started_at > 0 else time.monotonic()
     return started_at + budget_seconds
 
@@ -10031,11 +10109,15 @@ def _account_supports_http_bridge_request_model(
 ) -> bool:
     if request_model is None:
         return True
-    if account.provider_kind == ACCOUNT_PROVIDER_API_KEY:
+    provider_kind = getattr(account, "provider_kind", None)
+    if provider_kind == ACCOUNT_PROVIDER_API_KEY:
         supported_models = _supported_models_for_account(account)
         return supported_models is None or request_model in supported_models
+    plan_type = getattr(account, "plan_type", None)
+    if plan_type is None:
+        return True
     allowed_plans = get_model_registry().plan_types_for_model(request_model)
-    return allowed_plans is not None and account.plan_type in allowed_plans
+    return allowed_plans is not None and plan_type in allowed_plans
 
 
 def _supported_models_for_account(account: Account) -> set[str] | None:
