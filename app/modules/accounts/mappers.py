@@ -104,6 +104,7 @@ def _account_to_summary(
         routing_tier=account_routing_tier(account),
         routing_priority=account_routing_priority(account),
         configured_priority=account_configured_priority(account),
+        kyc_enabled=bool(getattr(account, "kyc_enabled", False)),
         status=account.status.value,
         usage=AccountUsage(
             primary_remaining_percent=primary_remaining_percent,

@@ -237,7 +237,7 @@ async def test_stream_responses_prefers_forwarded_downstream_turn_state(monkeypa
     def fake_apply_api_key_enforcement(_payload, _api_key):
         return None
 
-    def fake_validate_model_access(_api_key, _model):
+    async def fake_validate_model_access(_api_key, _model):
         return None
 
     async def fake_enforce_request_limits(_api_key, *, request_model=None, request_service_tier=None):
@@ -264,7 +264,7 @@ async def test_stream_responses_prefers_forwarded_downstream_turn_state(monkeypa
         yield event_block
 
     monkeypatch.setattr(proxy_api_module, "apply_api_key_enforcement", fake_apply_api_key_enforcement)
-    monkeypatch.setattr(proxy_api_module, "validate_model_access", fake_validate_model_access)
+    monkeypatch.setattr(proxy_api_module, "_validate_model_access_for_request", fake_validate_model_access)
     monkeypatch.setattr(proxy_api_module, "_enforce_request_limits", fake_enforce_request_limits)
     monkeypatch.setattr(proxy_api_module, "_release_reservation", fake_release_reservation)
     monkeypatch.setattr(
@@ -320,7 +320,7 @@ async def test_stream_responses_does_not_release_forwarded_reservation_on_intern
     def fake_apply_api_key_enforcement(_payload, _api_key):
         return None
 
-    def fake_validate_model_access(_api_key, _model):
+    async def fake_validate_model_access(_api_key, _model):
         return None
 
     async def fake_rate_limit_headers():
@@ -335,7 +335,7 @@ async def test_stream_responses_does_not_release_forwarded_reservation_on_intern
         yield ""
 
     monkeypatch.setattr(proxy_api_module, "apply_api_key_enforcement", fake_apply_api_key_enforcement)
-    monkeypatch.setattr(proxy_api_module, "validate_model_access", fake_validate_model_access)
+    monkeypatch.setattr(proxy_api_module, "_validate_model_access_for_request", fake_validate_model_access)
     monkeypatch.setattr(proxy_api_module, "_release_reservation", release_reservation)
     monkeypatch.setattr(
         proxy_api_module.proxy_service_module,

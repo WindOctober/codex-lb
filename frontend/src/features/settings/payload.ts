@@ -10,6 +10,7 @@ export function buildSettingsUpdateRequest(
     preferEarlierResetAccounts: settings.preferEarlierResetAccounts,
     routingStrategy: settings.routingStrategy,
     openaiCacheAffinityMaxAgeSeconds: settings.openaiCacheAffinityMaxAgeSeconds,
+    kycRoutingEnforcementEnabled: settings.kycRoutingEnforcementEnabled,
     importWithoutOverwrite: settings.importWithoutOverwrite,
     totpRequiredOnLogin: settings.totpRequiredOnLogin,
     apiKeyAuthEnabled: settings.apiKeyAuthEnabled,

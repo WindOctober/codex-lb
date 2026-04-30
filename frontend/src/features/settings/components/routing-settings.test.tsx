@@ -11,6 +11,7 @@ const BASE_SETTINGS: DashboardSettings = {
   preferEarlierResetAccounts: true,
   routingStrategy: "usage_weighted",
   openaiCacheAffinityMaxAgeSeconds: 300,
+  kycRoutingEnforcementEnabled: true,
   importWithoutOverwrite: false,
   totpRequiredOnLogin: false,
   totpConfigured: false,
@@ -36,6 +37,7 @@ describe("RoutingSettings", () => {
       preferEarlierResetAccounts: true,
       routingStrategy: "usage_weighted",
       openaiCacheAffinityMaxAgeSeconds: 180,
+      kycRoutingEnforcementEnabled: true,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       apiKeyAuthEnabled: true,
@@ -58,6 +60,7 @@ describe("RoutingSettings", () => {
       preferEarlierResetAccounts: true,
       routingStrategy: "usage_weighted",
       openaiCacheAffinityMaxAgeSeconds: 240,
+      kycRoutingEnforcementEnabled: true,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       apiKeyAuthEnabled: true,
@@ -85,6 +88,27 @@ describe("RoutingSettings", () => {
       preferEarlierResetAccounts: true,
       routingStrategy: "usage_weighted",
       openaiCacheAffinityMaxAgeSeconds: 300,
+      kycRoutingEnforcementEnabled: true,
+      importWithoutOverwrite: false,
+      totpRequiredOnLogin: false,
+      apiKeyAuthEnabled: true,
+    });
+  });
+
+  it("saves the KYC routing enforcement toggle", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<RoutingSettings settings={BASE_SETTINGS} busy={false} onSave={onSave} />);
+
+    await user.click(screen.getAllByRole("switch")[2]!);
+
+    expect(onSave).toHaveBeenCalledWith({
+      stickyThreadsEnabled: false,
+      upstreamStreamTransport: "default",
+      preferEarlierResetAccounts: true,
+      routingStrategy: "usage_weighted",
+      openaiCacheAffinityMaxAgeSeconds: 300,
+      kycRoutingEnforcementEnabled: false,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       apiKeyAuthEnabled: true,

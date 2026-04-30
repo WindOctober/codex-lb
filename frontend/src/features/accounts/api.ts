@@ -43,8 +43,11 @@ export function createApiProvider(payload: ApiProviderCreateRequest) {
   });
 }
 
-export function updateAccountPriority(accountId: string, configuredPriority: number) {
-  const validated = AccountUpdateRequestSchema.parse({ configuredPriority });
+export function updateAccountRouting(
+  accountId: string,
+  payload: { configuredPriority: number; kycEnabled?: boolean },
+) {
+  const validated = AccountUpdateRequestSchema.parse(payload);
   return patch(`${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`, AccountSummarySchema, {
     body: validated,
   });

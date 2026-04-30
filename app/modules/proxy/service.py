@@ -165,6 +165,7 @@ from app.modules.usage.updater import UsageUpdater
 
 logger = logging.getLogger(__name__)
 
+
 # Stay below the common 16 MiB websocket message ceiling so we can slim or fail
 # early before upstream closes the session with 1009.
 _UPSTREAM_RESPONSE_CREATE_WARN_BYTES = 12 * 1024 * 1024
@@ -7883,6 +7884,8 @@ class ProxyService:
         try:
             with anyio.fail_after(remaining_budget):
                 settings = await get_settings_cache().get()
+                kyc_enforcement_enabled = bool(getattr(settings, "kyc_routing_enforcement_enabled", True))
+                kyc_only = bool(api_key and api_key.kyc_only) if kyc_enforcement_enabled else None
                 if (
                     preferred_account_id is not None
                     and preferred_account_id not in excluded_account_ids_set
@@ -7898,6 +7901,8 @@ class ProxyService:
                         model=model,
                         additional_limit_name=additional_limit_name,
                         account_ids={preferred_account_id},
+                        kyc_only=kyc_only,
+                        kyc_routing_enforcement_enabled=kyc_enforcement_enabled,
                         budget_threshold_pct=settings.sticky_reallocation_budget_threshold_pct,
                     )
                     if preferred_selection.account is not None:
@@ -7920,6 +7925,8 @@ class ProxyService:
                     additional_limit_name=additional_limit_name,
                     account_ids=scoped_account_ids,
                     exclude_account_ids=excluded_account_ids_set,
+                    kyc_only=kyc_only,
+                    kyc_routing_enforcement_enabled=kyc_enforcement_enabled,
                     budget_threshold_pct=settings.sticky_reallocation_budget_threshold_pct,
                 )
                 if selection.account is not None and selection.account.id in excluded_account_ids_set:

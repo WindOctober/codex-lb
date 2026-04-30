@@ -17,12 +17,14 @@ export type ModelMultiSelectProps = {
   value: string[];
   onChange: (value: string[]) => void;
   placeholder?: string;
+  emptySelectionLabel?: string;
 };
 
 export function ModelMultiSelect({
   value,
   onChange,
   placeholder = "All models",
+  emptySelectionLabel = "All models",
 }: ModelMultiSelectProps) {
   const { data: models = [], isLoading } = useModels();
   const [search, setSearch] = useState("");
@@ -93,7 +95,7 @@ export function ModelMultiSelect({
             onCheckedChange={selectAll}
             onSelect={(e) => e.preventDefault()}
           >
-            All models
+            {emptySelectionLabel}
           </DropdownMenuCheckboxItem>
           <DropdownMenuSeparator />
           {filtered.map((model) => (

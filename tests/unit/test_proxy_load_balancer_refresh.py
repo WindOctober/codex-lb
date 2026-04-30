@@ -33,6 +33,7 @@ from app.modules.proxy.load_balancer import (
     NO_PLAN_SUPPORT_FOR_MODEL,
     LoadBalancer,
     RuntimeState,
+    _filter_accounts_for_kyc_access,
 )
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickySessionsRepository
@@ -71,6 +72,48 @@ def _make_api_key_provider_account(
     account.plan_type = "api_key_provider"
     account.supported_models_json = json.dumps(supported_models)
     return account
+
+
+def test_filter_accounts_for_kyc_access_enforces_kyc_only_keys() -> None:
+    normal = _make_account("normal")
+    kyc = _make_account("kyc")
+    kyc.kyc_enabled = True
+
+    filtered = _filter_accounts_for_kyc_access(
+        [normal, kyc],
+        kyc_only=True,
+        kyc_routing_enforcement_enabled=True,
+    )
+
+    assert [account.id for account in filtered] == ["kyc"]
+
+
+def test_filter_accounts_for_kyc_access_blocks_kyc_accounts_for_regular_keys() -> None:
+    normal = _make_account("normal")
+    kyc = _make_account("kyc")
+    kyc.kyc_enabled = True
+
+    filtered = _filter_accounts_for_kyc_access(
+        [normal, kyc],
+        kyc_only=False,
+        kyc_routing_enforcement_enabled=True,
+    )
+
+    assert [account.id for account in filtered] == ["normal"]
+
+
+def test_filter_accounts_for_kyc_access_ignores_flag_when_enforcement_disabled() -> None:
+    normal = _make_account("normal")
+    kyc = _make_account("kyc")
+    kyc.kyc_enabled = True
+
+    filtered = _filter_accounts_for_kyc_access(
+        [normal, kyc],
+        kyc_only=True,
+        kyc_routing_enforcement_enabled=False,
+    )
+
+    assert [account.id for account in filtered] == ["normal", "kyc"]
 
 
 class StubAccountsRepository(AccountsRepository):
@@ -1258,6 +1301,7 @@ async def test_select_account_does_not_open_repo_before_runtime_lock(monkeypatch
         model: str | None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
+        **_: object,
     ):
         del model, additional_limit_name, account_ids
         return load_balancer_module._SelectionInputs(
@@ -1512,6 +1556,7 @@ async def test_select_account_reloads_inputs_after_version_conflict(monkeypatch)
         model: str | None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
+        **kwargs: object,
     ):
         nonlocal load_calls
         load_calls += 1
@@ -1519,6 +1564,7 @@ async def test_select_account_reloads_inputs_after_version_conflict(monkeypatch)
             model=model,
             additional_limit_name=additional_limit_name,
             account_ids=account_ids,
+            **kwargs,
         )
 
     original_select_account = load_balancer_module.select_account
@@ -1652,6 +1698,7 @@ async def test_select_account_sticky_reloads_inputs_after_stale_selected_persist
         model: str | None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
+        **kwargs: object,
     ):
         nonlocal load_calls
         load_calls += 1
@@ -1659,6 +1706,7 @@ async def test_select_account_sticky_reloads_inputs_after_stale_selected_persist
             model=model,
             additional_limit_name=additional_limit_name,
             account_ids=account_ids,
+            **kwargs,
         )
 
     async def pinned_account_id(
@@ -1736,6 +1784,7 @@ async def test_select_account_sticky_does_not_return_stale_selection_at_retry_ca
         model: str | None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
+        **kwargs: object,
     ):
         nonlocal load_calls
         load_calls += 1
@@ -1743,6 +1792,7 @@ async def test_select_account_sticky_does_not_return_stale_selection_at_retry_ca
             model=model,
             additional_limit_name=additional_limit_name,
             account_ids=account_ids,
+            **kwargs,
         )
 
     async def pinned_account_id(

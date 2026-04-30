@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { ExpiryPicker } from "@/features/api-keys/components/expiry-picker";
 import { LimitRulesEditor } from "@/features/api-keys/components/limit-rules-editor";
 import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-select";
@@ -51,6 +52,7 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
   const [enforcedModel, setEnforcedModel] = useState("");
   const [enforcedReasoningEffort, setEnforcedReasoningEffort] = useState("none");
   const [enforcedServiceTier, setEnforcedServiceTier] = useState("none");
+  const [kycOnly, setKycOnly] = useState(false);
 
   const handleSubmit = async (values: FormValues) => {
     const validLimits = limitRules.filter((r) => r.maxValue > 0);
@@ -60,6 +62,7 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
       enforcedModel: enforcedModel.trim() ? enforcedModel.trim() : null,
       enforcedReasoningEffort: enforcedReasoningEffort === "none" ? null : enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
       enforcedServiceTier: enforcedServiceTier === "none" ? null : enforcedServiceTier as ServiceTierType,
+      kycOnly,
       expiresAt: expiresAt?.toISOString(),
       limits: validLimits.length > 0 ? validLimits : undefined,
     };
@@ -75,6 +78,7 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
     setEnforcedModel("");
     setEnforcedReasoningEffort("none");
     setEnforcedServiceTier("none");
+    setKycOnly(false);
     onOpenChange(false);
   };
 
@@ -110,6 +114,16 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
                 <div className="space-y-1">
                   <label className="text-sm font-medium">Allowed models</label>
                   <ModelMultiSelect value={selectedModels} onChange={setSelectedModels} />
+                </div>
+
+                <div className="flex items-center justify-between rounded-md border p-2">
+                  <div>
+                    <div className="text-sm font-medium">KYC-only</div>
+                    <div className="text-xs text-muted-foreground">
+                      This key can only route accounts marked as KYC.
+                    </div>
+                  </div>
+                  <Switch checked={kycOnly} onCheckedChange={setKycOnly} />
                 </div>
 
                 <div className="space-y-1">

@@ -321,11 +321,20 @@ class AccountsRepository:
         await self._session.commit()
         return result.scalar_one_or_none() is not None
 
-    async def update_priority(self, account_id: str, configured_priority: int) -> Account | None:
+    async def update_routing_settings(
+        self,
+        account_id: str,
+        *,
+        configured_priority: int,
+        kyc_enabled: bool | None = None,
+    ) -> Account | None:
+        values: dict[str, object] = {"upstream_priority": configured_priority}
+        if kyc_enabled is not None:
+            values["kyc_enabled"] = kyc_enabled
         result = await self._session.execute(
             update(Account)
             .where(Account.id == account_id)
-            .values(upstream_priority=configured_priority)
+            .values(**values)
             .returning(Account.id)
         )
         updated_id = result.scalar_one_or_none()
@@ -333,6 +342,9 @@ class AccountsRepository:
         if updated_id is None:
             return None
         return await self.get_by_id(updated_id)
+
+    async def update_priority(self, account_id: str, configured_priority: int) -> Account | None:
+        return await self.update_routing_settings(account_id, configured_priority=configured_priority)
 
     async def delete(self, account_id: str) -> bool:
         await self._session.execute(delete(UsageHistory).where(UsageHistory.account_id == account_id))
@@ -479,6 +491,7 @@ def _apply_account_updates(target: Account, source: Account) -> None:
     target.supported_models_json = (
         source.supported_models_json if source.supported_models_json is not None else target.supported_models_json
     )
+    target.kyc_enabled = bool(getattr(source, "kyc_enabled", False))
     target.access_token_encrypted = source.access_token_encrypted
     target.refresh_token_encrypted = source.refresh_token_encrypted
     target.id_token_encrypted = source.id_token_encrypted

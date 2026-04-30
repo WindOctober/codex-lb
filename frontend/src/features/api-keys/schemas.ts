@@ -47,6 +47,7 @@ export const ApiKeySchema = z.object({
     .enum(SERVICE_TIERS)
     .nullable()
     .default(null),
+  kycOnly: z.boolean().default(false),
   expiresAt: z.string().datetime({ offset: true }).nullable(),
   isActive: z.boolean(),
   accountAssignmentScopeEnabled: z.boolean().default(false),
@@ -69,6 +70,7 @@ export const ApiKeyCreateRequestSchema = z.object({
     .enum(SERVICE_TIERS)
     .nullable()
     .optional(),
+  kycOnly: z.boolean().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
   limits: z.array(LimitRuleCreateSchema).optional(),
@@ -90,6 +92,7 @@ export const ApiKeyUpdateRequestSchema = z.object({
     .enum(SERVICE_TIERS)
     .nullable()
     .optional(),
+  kycOnly: z.boolean().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
   isActive: z.boolean().optional(),

@@ -119,8 +119,8 @@ export function AccountsPage() {
             onResume={(accountId) => void resumeMutation.mutateAsync(accountId)}
             onDelete={(accountId) => deleteDialog.show(accountId)}
             onReauth={() => oauthDialog.show()}
-            onUpdatePriority={(accountId, configuredPriority) =>
-              updatePriorityMutation.mutateAsync({ accountId, configuredPriority }).then(() => undefined)
+            onUpdateRouting={(accountId, configuredPriority, kycEnabled) =>
+              updatePriorityMutation.mutateAsync({ accountId, configuredPriority, kycEnabled }).then(() => undefined)
             }
             onTestAvailability={(accountId) => availabilityMutation.mutateAsync(accountId).then(() => undefined)}
           />

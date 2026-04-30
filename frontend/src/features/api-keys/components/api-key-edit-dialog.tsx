@@ -92,6 +92,7 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
   const [enforcedServiceTier, setEnforcedServiceTier] = useState<string>(
     apiKey.enforcedServiceTier || "none",
   );
+  const [kycOnly, setKycOnly] = useState<boolean>(apiKey.kycOnly);
 
   const handleSubmit = async (values: FormValues) => {
     const normalizedLimits = normalizeLimitRules(limitRules);
@@ -104,6 +105,7 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
       enforcedModel: enforcedModel.trim() ? enforcedModel.trim() : null,
       enforcedReasoningEffort: enforcedReasoningEffort === "none" ? null : enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
       enforcedServiceTier: enforcedServiceTier === "none" ? null : enforcedServiceTier as ServiceTierType,
+      kycOnly,
       expiresAt: expiresAt?.toISOString() ?? null,
       isActive: values.isActive,
     };
@@ -151,6 +153,16 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
             <div className="space-y-1">
               <div className="text-sm font-medium">Assigned accounts</div>
               <AccountMultiSelect value={selectedAccountIds} onChange={setSelectedAccountIds} />
+            </div>
+
+            <div className="flex items-center justify-between rounded-md border p-2">
+              <div>
+                <div className="text-sm font-medium">KYC-only</div>
+                <div className="text-xs text-muted-foreground">
+                  This key can only route accounts marked as KYC.
+                </div>
+              </div>
+              <Switch checked={kycOnly} onCheckedChange={setKycOnly} />
             </div>
 
             <div className="space-y-1">

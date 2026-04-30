@@ -13,6 +13,7 @@ describe("DashboardSettingsSchema", () => {
       preferEarlierResetAccounts: false,
       routingStrategy: "round_robin",
       openaiCacheAffinityMaxAgeSeconds: 300,
+      kycRoutingEnforcementEnabled: false,
       importWithoutOverwrite: true,
       totpRequiredOnLogin: true,
       totpConfigured: false,
@@ -23,6 +24,7 @@ describe("DashboardSettingsSchema", () => {
     expect(parsed.upstreamStreamTransport).toBe("default");
     expect(parsed.routingStrategy).toBe("round_robin");
     expect(parsed.openaiCacheAffinityMaxAgeSeconds).toBe(300);
+    expect(parsed.kycRoutingEnforcementEnabled).toBe(false);
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.apiKeyAuthEnabled).toBe(true);
   });
@@ -36,6 +38,7 @@ describe("SettingsUpdateRequestSchema", () => {
       preferEarlierResetAccounts: true,
       routingStrategy: "usage_weighted",
       openaiCacheAffinityMaxAgeSeconds: 120,
+      kycRoutingEnforcementEnabled: false,
       importWithoutOverwrite: true,
       totpRequiredOnLogin: true,
       apiKeyAuthEnabled: false,
@@ -45,6 +48,7 @@ describe("SettingsUpdateRequestSchema", () => {
     expect(parsed.upstreamStreamTransport).toBe("websocket");
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.routingStrategy).toBe("usage_weighted");
+    expect(parsed.kycRoutingEnforcementEnabled).toBe(false);
     expect(parsed.totpRequiredOnLogin).toBe(true);
     expect(parsed.apiKeyAuthEnabled).toBe(false);
   });

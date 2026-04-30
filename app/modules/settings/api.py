@@ -84,6 +84,7 @@ async def get_settings(
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=settings.http_responses_session_bridge_prompt_cache_idle_ttl_seconds,
         http_responses_session_bridge_gateway_safe_mode=settings.http_responses_session_bridge_gateway_safe_mode,
         sticky_reallocation_budget_threshold_pct=settings.sticky_reallocation_budget_threshold_pct,
+        kyc_routing_enforcement_enabled=settings.kyc_routing_enforcement_enabled,
         import_without_overwrite=settings.import_without_overwrite,
         totp_required_on_login=settings.totp_required_on_login,
         totp_configured=settings.totp_configured,
@@ -130,6 +131,11 @@ async def update_settings(
                     if payload.sticky_reallocation_budget_threshold_pct is not None
                     else current.sticky_reallocation_budget_threshold_pct
                 ),
+                kyc_routing_enforcement_enabled=(
+                    payload.kyc_routing_enforcement_enabled
+                    if payload.kyc_routing_enforcement_enabled is not None
+                    else current.kyc_routing_enforcement_enabled
+                ),
                 import_without_overwrite=(
                     payload.import_without_overwrite
                     if payload.import_without_overwrite is not None
@@ -160,6 +166,7 @@ async def update_settings(
             "routing_strategy",
             "openai_cache_affinity_max_age_seconds",
             "http_responses_session_bridge_gateway_safe_mode",
+            "kyc_routing_enforcement_enabled",
             "import_without_overwrite",
             "totp_required_on_login",
             "api_key_auth_enabled",
@@ -180,6 +187,7 @@ async def update_settings(
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=updated.http_responses_session_bridge_prompt_cache_idle_ttl_seconds,
         http_responses_session_bridge_gateway_safe_mode=updated.http_responses_session_bridge_gateway_safe_mode,
         sticky_reallocation_budget_threshold_pct=updated.sticky_reallocation_budget_threshold_pct,
+        kyc_routing_enforcement_enabled=updated.kyc_routing_enforcement_enabled,
         import_without_overwrite=updated.import_without_overwrite,
         totp_required_on_login=updated.totp_required_on_login,
         totp_configured=updated.totp_configured,

@@ -329,7 +329,11 @@ class AccountsService:
         return result
 
     async def update_account(self, account_id: str, payload: AccountUpdateRequest) -> AccountSummary | None:
-        updated = await self._repo.update_priority(account_id, payload.configured_priority)
+        updated = await self._repo.update_routing_settings(
+            account_id,
+            configured_priority=payload.configured_priority,
+            kyc_enabled=payload.kyc_enabled,
+        )
         if updated is None:
             return None
         get_account_selection_cache().invalidate()

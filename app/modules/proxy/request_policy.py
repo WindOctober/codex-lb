@@ -15,15 +15,21 @@ from app.modules.api_keys.service import ApiKeyData
 logger = logging.getLogger(__name__)
 
 
-def validate_model_access(api_key: ApiKeyData | None, model: str | None) -> None:
+def validate_model_access(
+    api_key: ApiKeyData | None,
+    model: str | None,
+) -> None:
+    normalized_model = model.strip() if isinstance(model, str) else None
+
     if api_key is None:
         return
+
     allowed_models = api_key.allowed_models
     if not allowed_models:
         return
-    if model is None or model in allowed_models:
+    if normalized_model is None or normalized_model in allowed_models:
         return
-    raise ProxyModelNotAllowed(f"This API key does not have access to model '{model}'")
+    raise ProxyModelNotAllowed(f"This API key does not have access to model '{normalized_model}'")
 
 
 def apply_api_key_enforcement(

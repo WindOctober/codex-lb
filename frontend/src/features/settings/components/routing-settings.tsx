@@ -118,6 +118,20 @@ export function RoutingSettings({ settings, busy, onSave }: RoutingSettingsProps
             />
           </div>
 
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div>
+              <p className="text-sm font-medium">Enforce KYC routing</p>
+              <p className="text-xs text-muted-foreground">
+                When enabled, KYC-marked accounts can only be used by KYC-only keys; KYC-only keys only use those accounts.
+              </p>
+            </div>
+            <Switch
+              checked={settings.kycRoutingEnforcementEnabled}
+              disabled={busy}
+              onCheckedChange={(checked) => save({ kycRoutingEnforcementEnabled: checked })}
+            />
+          </div>
+
           <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="text-sm font-medium">Prompt-cache affinity TTL</p>

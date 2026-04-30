@@ -69,6 +69,7 @@ export const AccountSummarySchema = z.object({
   routingTier: z.string().optional(),
   routingPriority: z.number().int().optional(),
   configuredPriority: z.number().int().optional(),
+  kycEnabled: z.boolean().optional(),
   status: z.string(),
   usage: AccountUsageSchema.nullable().optional(),
   resetAtPrimary: z.string().datetime({ offset: true }).nullable().optional(),
@@ -114,6 +115,7 @@ export const ApiProviderCreateResponseSchema = AccountImportResponseSchema.exten
 
 export const AccountUpdateRequestSchema = z.object({
   configuredPriority: z.number().int().min(0).max(100000),
+  kycEnabled: z.boolean().optional(),
 });
 
 export const AccountAvailabilityResponseSchema = z.object({

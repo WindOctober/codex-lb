@@ -31,6 +31,7 @@ class SettingsRepository:
             bootstrap_token_encrypted=None,
             bootstrap_token_hash=None,
             api_key_auth_enabled=False,
+            kyc_routing_enforcement_enabled=True,
             totp_secret_encrypted=None,
             totp_last_verified_step=None,
         )
@@ -57,6 +58,7 @@ class SettingsRepository:
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds: int | None = None,
         http_responses_session_bridge_gateway_safe_mode: bool | None = None,
         sticky_reallocation_budget_threshold_pct: float | None = None,
+        kyc_routing_enforcement_enabled: bool | None = None,
         import_without_overwrite: bool | None = None,
         totp_required_on_login: bool | None = None,
         api_key_auth_enabled: bool | None = None,
@@ -80,6 +82,8 @@ class SettingsRepository:
             settings.http_responses_session_bridge_gateway_safe_mode = http_responses_session_bridge_gateway_safe_mode
         if sticky_reallocation_budget_threshold_pct is not None:
             settings.sticky_reallocation_budget_threshold_pct = sticky_reallocation_budget_threshold_pct
+        if kyc_routing_enforcement_enabled is not None:
+            settings.kyc_routing_enforcement_enabled = kyc_routing_enforcement_enabled
         if import_without_overwrite is not None:
             settings.import_without_overwrite = import_without_overwrite
         if totp_required_on_login is not None:

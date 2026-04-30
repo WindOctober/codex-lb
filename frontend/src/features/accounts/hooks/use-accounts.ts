@@ -10,7 +10,7 @@ import {
   pauseAccount,
   reactivateAccount,
   testAccountAvailability,
-  updateAccountPriority,
+  updateAccountRouting,
 } from "@/features/accounts/api";
 import type { ApiProviderCreateRequest } from "@/features/accounts/schemas";
 
@@ -50,10 +50,17 @@ export function useAccountMutations() {
   });
 
   const updatePriorityMutation = useMutation({
-    mutationFn: ({ accountId, configuredPriority }: { accountId: string; configuredPriority: number }) =>
-      updateAccountPriority(accountId, configuredPriority),
+    mutationFn: ({
+      accountId,
+      configuredPriority,
+      kycEnabled,
+    }: {
+      accountId: string;
+      configuredPriority: number;
+      kycEnabled?: boolean;
+    }) => updateAccountRouting(accountId, { configuredPriority, kycEnabled }),
     onSuccess: () => {
-      toast.success("Routing priority updated");
+      toast.success("Routing settings updated");
       invalidateAccountRelatedQueries(queryClient);
     },
     onError: (error: Error) => {

@@ -144,6 +144,30 @@ def test_apply_api_key_enforcement_overrides_service_tier_aliases_to_priority():
     assert payload.service_tier == "priority"
 
 
+def _api_key_data(*, allowed_models: list[str] | None = None) -> proxy_service.ApiKeyData:
+    return proxy_service.ApiKeyData(
+        id="key_1",
+        name="test-key",
+        key_prefix="sk-clb-test",
+        allowed_models=allowed_models,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+        kyc_only=False,
+    )
+
+
+def test_validate_model_access_allows_configured_model() -> None:
+    proxy_request_policy.validate_model_access(
+        _api_key_data(allowed_models=["gpt-5.5"]),
+        "gpt-5.5",
+    )
+
+
 class _RingMembershipStub:
     def __init__(self, members: list[str]) -> None:
         self.members = members
@@ -720,6 +744,7 @@ def _make_proxy_settings(*, log_proxy_service_tier_trace: bool) -> SimpleNamespa
         openai_prompt_cache_key_derivation_enabled=True,
         routing_strategy="usage_weighted",
         proxy_request_budget_seconds=75.0,
+        proxy_reconnect_request_budget_seconds=75.0,
         stream_idle_timeout_seconds=75.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,

@@ -69,6 +69,7 @@ class Account(Base):
     upstream_wire_api: Mapped[str | None] = mapped_column(String, nullable=True)
     upstream_priority: Mapped[int] = mapped_column(Integer, default=100, server_default=text("100"), nullable=False)
     supported_models_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kyc_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
 
     access_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     refresh_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
@@ -293,6 +294,12 @@ class DashboardSettings(Base):
         server_default=text("95.0"),
         nullable=False,
     )
+    kyc_routing_enforcement_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=true(),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -320,6 +327,7 @@ class ApiKey(Base):
     enforced_model: Mapped[str | None] = mapped_column(String, nullable=True)
     enforced_reasoning_effort: Mapped[str | None] = mapped_column(String, nullable=True)
     enforced_service_tier: Mapped[str | None] = mapped_column(String, nullable=True)
+    kyc_only: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
     account_assignment_scope_enabled: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

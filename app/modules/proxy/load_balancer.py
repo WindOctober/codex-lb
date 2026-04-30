@@ -125,6 +125,8 @@ class LoadBalancer:
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
         exclude_account_ids: Collection[str] | None = None,
+        kyc_only: bool | None = None,
+        kyc_routing_enforcement_enabled: bool = False,
         budget_threshold_pct: float = 95.0,
     ) -> AccountSelection:
         excluded_ids = set(exclude_account_ids or ())
@@ -135,6 +137,8 @@ class LoadBalancer:
                 model=model,
                 additional_limit_name=additional_limit_name,
                 account_ids=scoped_account_ids,
+                kyc_only=kyc_only,
+                kyc_routing_enforcement_enabled=kyc_routing_enforcement_enabled,
             )
             if excluded_ids and selection_inputs.accounts:
                 selection_inputs = _SelectionInputs(
@@ -405,11 +409,14 @@ class LoadBalancer:
         model: str | None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
+        kyc_only: bool | None = None,
+        kyc_routing_enforcement_enabled: bool = False,
     ) -> _SelectionInputs:
         cache_key = (
             model,
             additional_limit_name,
             None if account_ids is None else tuple(sorted(set(account_ids))),
+            kyc_only if kyc_routing_enforcement_enabled else None,
         )
         cached = await self._selection_inputs_cache.get(cache_key)
         if cached is not None:
@@ -424,6 +431,11 @@ class LoadBalancer:
             if account_ids is not None:
                 allowed_account_ids = set(account_ids)
                 accounts = [account for account in accounts if account.id in allowed_account_ids]
+            accounts = _filter_accounts_for_kyc_access(
+                accounts,
+                kyc_only=kyc_only,
+                kyc_routing_enforcement_enabled=kyc_routing_enforcement_enabled,
+            )
             pre_model_filter_accounts = accounts
             if model and (
                 effective_limit_name is None
@@ -1233,6 +1245,19 @@ def _usage_entry_recorded_after(entry: UsageHistory | None, epoch_seconds: float
         entry.recorded_at if entry.recorded_at.tzinfo is not None else entry.recorded_at.replace(tzinfo=timezone.utc)
     )
     return recorded_time.timestamp() > epoch_seconds
+
+
+def _filter_accounts_for_kyc_access(
+    accounts: list[Account],
+    *,
+    kyc_only: bool | None,
+    kyc_routing_enforcement_enabled: bool,
+) -> list[Account]:
+    if not kyc_routing_enforcement_enabled or kyc_only is None:
+        return accounts
+    if kyc_only:
+        return [account for account in accounts if bool(getattr(account, "kyc_enabled", False))]
+    return [account for account in accounts if not bool(getattr(account, "kyc_enabled", False))]
 
 
 def _filter_accounts_for_model(accounts: list[Account], model: str) -> list[Account]:

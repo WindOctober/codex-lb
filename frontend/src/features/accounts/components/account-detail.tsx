@@ -1,6 +1,7 @@
 import { User } from "lucide-react";
 
 import { isEmailLabel } from "@/components/blur-email";
+import { KycAccountName } from "@/components/kyc-account-name";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { AccountActions } from "@/features/accounts/components/account-actions";
 import { AccountRoutingPanel } from "@/features/accounts/components/account-routing-panel";
@@ -18,7 +19,7 @@ export type AccountDetailProps = {
   onResume: (accountId: string) => void;
   onDelete: (accountId: string) => void;
   onReauth: () => void;
-  onUpdatePriority: (accountId: string, configuredPriority: number) => Promise<void>;
+  onUpdateRouting: (accountId: string, configuredPriority: number, kycEnabled?: boolean) => Promise<void>;
   onTestAvailability: (accountId: string) => Promise<void>;
 };
 
@@ -30,7 +31,7 @@ export function AccountDetail({
   onResume,
   onDelete,
   onReauth,
-  onUpdatePriority,
+  onUpdateRouting,
   onTestAvailability,
 }: AccountDetailProps) {
   const { data: trends } = useAccountTrends(account?.accountId ?? null);
@@ -61,7 +62,21 @@ export function AccountDetail({
       {/* Account header */}
       <div>
         <h2 className="text-base font-semibold">
-          {titleIsEmail ? <><span className={blurred ? "privacy-blur" : ""}>{title}</span>{idSuffix}</> : <>{title}{!emailSubtitle ? idSuffix : ""}</>}
+          {titleIsEmail ? (
+            <>
+              <KycAccountName kyc={account.kycEnabled} blurred={blurred}>
+                {title}
+              </KycAccountName>
+              {idSuffix}
+            </>
+          ) : (
+            <>
+              <KycAccountName kyc={account.kycEnabled}>
+                {title}
+              </KycAccountName>
+              {!emailSubtitle ? idSuffix : ""}
+            </>
+          )}
         </h2>
         {emailSubtitle ? (
           <p className="mt-0.5 text-xs text-muted-foreground" title={showAccountId ? `Account ID ${account.accountId}` : undefined}>
@@ -74,7 +89,7 @@ export function AccountDetail({
       <AccountRoutingPanel
         account={account}
         busy={busy}
-        onUpdatePriority={onUpdatePriority}
+        onUpdateRouting={onUpdateRouting}
         onTestAvailability={onTestAvailability}
       />
       <AccountTokenInfo account={account} />

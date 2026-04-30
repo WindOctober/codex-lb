@@ -5,20 +5,21 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import type { AccountSummary } from "@/features/accounts/schemas";
 import { formatSlug } from "@/utils/formatters";
 
 export type AccountRoutingPanelProps = {
   account: AccountSummary;
   busy: boolean;
-  onUpdatePriority: (accountId: string, configuredPriority: number) => Promise<void>;
+  onUpdateRouting: (accountId: string, configuredPriority: number, kycEnabled?: boolean) => Promise<void>;
   onTestAvailability: (accountId: string) => Promise<void>;
 };
 
 export function AccountRoutingPanel({
   account,
   busy,
-  onUpdatePriority,
+  onUpdateRouting,
   onTestAvailability,
 }: AccountRoutingPanelProps) {
   const configuredPriority = account.configuredPriority ?? 0;
@@ -34,6 +35,7 @@ export function AccountRoutingPanel({
   const parsedPriority = Number.parseInt(priority, 10);
   const priorityChanged =
     Number.isInteger(parsedPriority) && parsedPriority !== configuredPriority && parsedPriority >= 0;
+  const kycEnabled = account.kycEnabled ?? false;
 
   return (
     <section className="rounded-lg border bg-muted/20 p-3">
@@ -64,7 +66,7 @@ export function AccountRoutingPanel({
           size="sm"
           className="h-9 gap-1.5"
           disabled={busy || !priorityChanged}
-          onClick={() => onUpdatePriority(account.accountId, parsedPriority)}
+          onClick={() => void onUpdateRouting(account.accountId, parsedPriority, kycEnabled)}
         >
           <Save className="h-3.5 w-3.5" />
           Save Priority
@@ -86,6 +88,20 @@ export function AccountRoutingPanel({
       <p className="mt-2 text-xs text-muted-foreground">
         Effective routing rank: {routingPriority}. Lower priority values are selected first.
       </p>
+
+      <div className="mt-3 flex items-center justify-between gap-4 rounded-lg border bg-background/60 px-3 py-2">
+        <div>
+          <p className="text-sm font-medium">KYC account</p>
+          <p className="text-xs text-muted-foreground">
+            When KYC routing enforcement is enabled, only KYC-only API keys can use this account.
+          </p>
+        </div>
+        <Switch
+          checked={kycEnabled}
+          disabled={busy}
+          onCheckedChange={(checked) => void onUpdateRouting(account.accountId, configuredPriority, checked)}
+        />
+      </div>
     </section>
   );
 }

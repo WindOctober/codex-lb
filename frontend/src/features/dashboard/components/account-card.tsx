@@ -2,6 +2,7 @@ import { Clock, ExternalLink, Play, RotateCcw } from "lucide-react";
 
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { Button } from "@/components/ui/button";
+import { KycAccountName } from "@/components/kyc-account-name";
 import { StatusBadge } from "@/components/status-badge";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/features/dashboard/schemas";
@@ -191,9 +192,9 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="truncate text-sm font-semibold leading-tight">
-            {blurred
-              ? <span className="privacy-blur">{title}</span>
-              : title}
+            <KycAccountName kyc={account.kycEnabled} blurred={blurred}>
+              {title}
+            </KycAccountName>
           </p>
           <p className="mt-0.5 truncate text-xs text-muted-foreground">
             {planLabel}

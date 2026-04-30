@@ -636,7 +636,6 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
     )
 
     allowed_models = _allowed_models_for_api_key(api_key)
-
     registry = get_model_registry()
     models = registry.get_models_with_fallback()
 
@@ -646,6 +645,8 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
 
     entries: list[CodexModelEntry] = []
     for slug, model in models.items():
+        if not _is_model_visible_for_api_key(slug, allowed_models):
+            continue
         if not is_public_model(model, allowed_models):
             continue
         entries.append(_to_codex_model_entry(model))
@@ -672,6 +673,8 @@ async def _build_models_response(api_key: ApiKeyData | None) -> Response:
 
     items_by_id: dict[str, ModelListItem] = {}
     for slug, model in models.items():
+        if not _is_model_visible_for_api_key(slug, allowed_models):
+            continue
         if not is_public_model(model, allowed_models):
             continue
         items_by_id[slug] = ModelListItem(
@@ -689,7 +692,7 @@ async def _build_models_response(api_key: ApiKeyData | None) -> Response:
         if account.status in {AccountStatus.PAUSED, AccountStatus.DEACTIVATED}:
             continue
         for model_id in _provider_supported_models(account):
-            if allowed_models is not None and model_id not in allowed_models:
+            if not _is_model_visible_for_api_key(model_id, allowed_models):
                 continue
             items_by_id.setdefault(
                 model_id,
@@ -711,6 +714,17 @@ def _allowed_models_for_api_key(api_key: ApiKeyData | None) -> set[str] | None:
         forced = {api_key.enforced_model}
         return forced if allowed_models is None else (allowed_models & forced)
     return allowed_models
+
+
+async def _validate_model_access_for_request(api_key: ApiKeyData | None, model: str | None) -> None:
+    validate_model_access(api_key, model)
+
+
+def _is_model_visible_for_api_key(
+    model_id: str,
+    allowed_models: set[str] | None,
+) -> bool:
+    return allowed_models is None or model_id in allowed_models
 
 
 def _to_codex_model_entry(model: UpstreamModel) -> CodexModelEntry:
@@ -852,7 +866,7 @@ async def v1_chat_completions(
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
     effective_model = _effective_model_for_api_key(api_key, payload.model)
-    validate_model_access(api_key, effective_model)
+    await _validate_model_access_for_request(api_key, effective_model)
 
     rate_limit_headers = await context.service.rate_limit_headers()
     try:
@@ -935,7 +949,7 @@ async def _stream_responses(
     forwarded_affinity_key: str | None = None,
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
-    validate_model_access(api_key, payload.model)
+    await _validate_model_access_for_request(api_key, payload.model)
     owns_reservation = api_key_reservation_override is None
     reservation = (
         api_key_reservation_override
@@ -1030,7 +1044,7 @@ async def _collect_responses(
     prefer_http_bridge: bool = False,
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
-    validate_model_access(api_key, payload.model)
+    await _validate_model_access_for_request(api_key, payload.model)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -1151,7 +1165,7 @@ async def _compact_responses(
     openai_cache_affinity: bool = False,
 ) -> JSONResponse:
     apply_api_key_enforcement(payload, api_key)
-    validate_model_access(api_key, payload.model)
+    await _validate_model_access_for_request(api_key, payload.model)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -1206,7 +1220,7 @@ async def _transcribe_request(
     context: ProxyContext,
     api_key: ApiKeyData | None,
 ) -> JSONResponse:
-    validate_model_access(api_key, _TRANSCRIPTION_MODEL)
+    await _validate_model_access_for_request(api_key, _TRANSCRIPTION_MODEL)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=_TRANSCRIPTION_MODEL,

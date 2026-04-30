@@ -131,9 +131,12 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
               <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getLimitValue(apiKey)}</TableCell>
               <TableCell className="truncate text-xs text-muted-foreground">{formatExpiry(apiKey.expiresAt)}</TableCell>
               <TableCell>
-                <Badge className={apiKey.isActive ? "bg-emerald-500 text-white" : "bg-zinc-500 text-white"}>
-                  {apiKey.isActive ? "Active" : "Disabled"}
-                </Badge>
+                <div className="flex flex-wrap gap-1">
+                  <Badge className={apiKey.isActive ? "bg-emerald-500 text-white" : "bg-zinc-500 text-white"}>
+                    {apiKey.isActive ? "Active" : "Disabled"}
+                  </Badge>
+                  {apiKey.kycOnly ? <Badge variant="secondary">KYC</Badge> : null}
+                </div>
               </TableCell>
               <TableCell className="pr-4 text-right">
                 <DropdownMenu>
