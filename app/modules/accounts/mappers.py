@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.core import usage as usage_core
+from app.core.account_groups import account_builtin_group_names
 from app.core.account_priorities import account_configured_priority, account_routing_priority, account_routing_tier
 from app.core.auth import DEFAULT_PLAN, extract_id_token_claims
 from app.core.crypto import TokenEncryptor
@@ -101,10 +102,12 @@ def _account_to_summary(
         display_name=account.email,
         plan_type=plan_type,
         provider_kind=account.provider_kind,
+        stored_api_key=_stored_provider_api_key(account, encryptor),
         routing_tier=account_routing_tier(account),
         routing_priority=account_routing_priority(account),
         configured_priority=account_configured_priority(account),
         kyc_enabled=bool(getattr(account, "kyc_enabled", False)),
+        groups=_account_group_names(account),
         status=account.status.value,
         usage=AccountUsage(
             primary_remaining_percent=primary_remaining_percent,
@@ -176,6 +179,22 @@ def _build_auth_status(account: Account, encryptor: TokenEncryptor) -> AccountAu
         refresh=AccountTokenStatus(state=refresh_state),
         id_token=AccountTokenStatus(state=id_state),
     )
+
+
+def _stored_provider_api_key(account: Account, encryptor: TokenEncryptor) -> str | None:
+    if account.provider_kind != ACCOUNT_PROVIDER_API_KEY:
+        return None
+    return _decrypt_token(encryptor, account.access_token_encrypted)
+
+
+def _account_group_names(account: Account) -> list[str]:
+    groups = {
+        membership.group_name
+        for membership in getattr(account, "group_memberships", [])
+        if getattr(membership, "group_name", None)
+    }
+    groups.update(account_builtin_group_names(account))
+    return sorted(groups)
 
 
 def _decrypt_token(encryptor: TokenEncryptor, encrypted: bytes | None) -> str | None:

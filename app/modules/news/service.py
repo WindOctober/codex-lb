@@ -10,7 +10,6 @@ import re
 import signal
 import tempfile
 import textwrap
-import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.session import SessionLocal
 from app.modules.news.repository import NewsHistoryRecord, NewsRepository
+from app.modules.refresh_api_key import load_codex_lb_refresh_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,101 @@ RUMORS_OUTPUT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+X_AI_DYNAMIC_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "headline": {"type": "string"},
+        "summary": {"type": "string"},
+        "display_name": {"type": "string"},
+        "handle": {"type": "string"},
+        "url": {"type": "string"},
+        "posted_at": {"type": "string"},
+        "engagement_hint": {"type": "string"},
+        "category": {"type": "string"},
+        "why_it_matters": {"type": "string"},
+        "verification_status": {"type": "string"},
+    },
+    "required": [
+        "headline",
+        "summary",
+        "display_name",
+        "handle",
+        "url",
+        "posted_at",
+        "engagement_hint",
+        "category",
+        "why_it_matters",
+        "verification_status",
+    ],
+    "additionalProperties": False,
+}
+
+X_AI_DYNAMICS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "generated_at": {"type": "string"},
+        "headline": {"type": "string"},
+        "summary": {"type": "string"},
+        "items": {
+            "type": "array",
+            "items": X_AI_DYNAMIC_ITEM_SCHEMA,
+            "minItems": 4,
+            "maxItems": 8,
+        },
+    },
+    "required": ["generated_at", "headline", "summary", "items"],
+    "additionalProperties": False,
+}
+
+HOTSPOT_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "platform": {"type": "string"},
+        "rank": {"type": "integer"},
+        "url": {"type": "string"},
+        "why": {"type": "string"},
+    },
+    "required": ["title", "platform", "rank", "url", "why"],
+    "additionalProperties": False,
+}
+
+HOTSPOT_CLUSTER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "mood": {"type": "string"},
+        "items": {"type": "array", "items": HOTSPOT_ITEM_SCHEMA},
+    },
+    "required": ["title", "summary", "mood", "items"],
+    "additionalProperties": False,
+}
+
+HOTSPOT_DIGEST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "generated_at": {"type": "string"},
+        "headline": {"type": "string"},
+        "summary": {"type": "string"},
+        "clusters": {
+            "type": "array",
+            "items": HOTSPOT_CLUSTER_SCHEMA,
+            "minItems": 1,
+            "maxItems": 5,
+        },
+        "top_items": {
+            "type": "array",
+            "items": HOTSPOT_ITEM_SCHEMA,
+            "minItems": 1,
+            "maxItems": 20,
+        },
+        "source_note": {"type": "string"},
+    },
+    "required": ["generated_at", "headline", "summary", "clusters", "top_items", "source_note"],
+    "additionalProperties": False,
+}
+
 NEWS_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -120,6 +215,8 @@ NEWS_OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": RUMOR_ITEM_SCHEMA,
         },
+        "x_ai_dynamics": X_AI_DYNAMICS_SCHEMA,
+        "hotspot_digest": HOTSPOT_DIGEST_SCHEMA,
         "disclaimers": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["generated_at", "summary", "companies", "rumors", "disclaimers"],
@@ -158,13 +255,19 @@ class NewsService:
         project_root: Path,
         cache_file: Path,
         refresh_interval_seconds: int = 6 * 60 * 60,
+        trendradar_refresh_interval_seconds: int = 60 * 60,
         initial_delay_seconds: int = 3,
     ) -> None:
         self._project_root = project_root
         self._cache_file = cache_file
         self._refresh_interval = refresh_interval_seconds
+        self._trendradar_refresh_interval = trendradar_refresh_interval_seconds
         self._initial_delay_seconds = initial_delay_seconds
         self._job_timeout_seconds = int(os.getenv("CODEX_LB_NEWS_JOB_TIMEOUT_SECONDS", "3600"))
+        self._trendradar_timeout_seconds = int(os.getenv("CODEX_LB_TRENDRADAR_TIMEOUT_SECONDS", "240"))
+        self._trendradar_root = Path(
+            os.getenv("CODEX_LB_TRENDRADAR_ROOT", str(self._project_root.parent / "TrendRadar"))
+        ).expanduser()
         self._max_refresh_seconds = int(
             os.getenv("CODEX_LB_NEWS_MAX_REFRESH_SECONDS", str(self._job_timeout_seconds + 120))
         )
@@ -173,6 +276,13 @@ class NewsService:
             min(
                 self._refresh_interval,
                 int(os.getenv("CODEX_LB_NEWS_AUTO_CHECK_SECONDS", str(10 * 60))),
+            ),
+        )
+        self._trendradar_auto_check_seconds = max(
+            60,
+            min(
+                self._trendradar_refresh_interval,
+                int(os.getenv("CODEX_LB_TRENDRADAR_AUTO_CHECK_SECONDS", str(10 * 60))),
             ),
         )
         self._max_parallel_jobs = max(1, min(8, int(os.getenv("CODEX_LB_NEWS_MAX_PARALLEL", "8"))))
@@ -184,7 +294,9 @@ class NewsService:
         )
         self._refresh_lock = asyncio.Lock()
         self._loop_task: asyncio.Task[None] | None = None
+        self._trendradar_loop_task: asyncio.Task[None] | None = None
         self._refresh_task: asyncio.Task[None] | None = None
+        self._trendradar_refresh_task: asyncio.Task[None] | None = None
         self._refresh_processes: set[asyncio.subprocess.Process] = set()
         self._snapshot = self._empty_snapshot()
 
@@ -195,9 +307,21 @@ class NewsService:
         self._ensure_item_state(seed_existing_items=True)
         await self._seed_history_from_snapshot()
         self._loop_task = asyncio.create_task(self._run_loop(), name="codex-lb-news-loop")
+        self._trendradar_loop_task = asyncio.create_task(
+            self._run_trendradar_loop(), name="codex-lb-news-trendradar-loop"
+        )
 
     async def stop(self) -> None:
-        tasks = [task for task in (self._loop_task, self._refresh_task) if task is not None]
+        tasks = [
+            task
+            for task in (
+                self._loop_task,
+                self._trendradar_loop_task,
+                self._refresh_task,
+                self._trendradar_refresh_task,
+            )
+            if task is not None
+        ]
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -215,8 +339,17 @@ class NewsService:
             payload["background_note"] = "后台长刷新超过时长阈值，当前先展示上一版可用内容。"
         payload["is_stale"] = self._is_stale(payload.get("last_completed_at"))
         payload["next_refresh_due_at"] = self._next_refresh_due_at(payload.get("last_completed_at"))
+        payload["trend_refresh_in_progress"] = (
+            self._trendradar_refresh_task is not None and not self._trendradar_refresh_task.done()
+        )
+        payload["next_trend_refresh_due_at"] = self._next_trend_refresh_due_at(
+            payload.get("last_trend_completed_at"),
+            payload.get("hotspot_digest"),
+        )
         payload["companies"] = self._sort_companies(payload.get("companies", []))
         payload["rumors"] = self._sort_rumors(payload.get("rumors", []))
+        payload["x_ai_dynamics"] = self._normalize_x_ai_dynamics(payload.get("x_ai_dynamics"))
+        payload["hotspot_digest"] = self._normalize_hotspot_digest(payload.get("hotspot_digest"))
         payload.pop("item_state", None)
         return payload
 
@@ -236,10 +369,31 @@ class NewsService:
             await self.request_refresh(force=False)
             await asyncio.sleep(self._auto_check_seconds)
 
+    async def request_trendradar_refresh(self, *, force: bool = False) -> bool:
+        if not force and not self._should_auto_refresh_trendradar():
+            return False
+        if self._trendradar_refresh_task is not None and not self._trendradar_refresh_task.done():
+            return False
+        self._trendradar_refresh_task = asyncio.create_task(
+            self._refresh_trendradar_panel(force=force), name="codex-lb-news-trendradar-refresh"
+        )
+        return True
+
+    async def _run_trendradar_loop(self) -> None:
+        await asyncio.sleep(self._initial_delay_seconds)
+        while True:
+            await self.request_trendradar_refresh(force=False)
+            await asyncio.sleep(self._trendradar_auto_check_seconds)
+
     async def _refresh(self, *, force: bool) -> None:
         async with self._refresh_lock:
             started_at = utcnow().isoformat()
-            existing_data = bool(self._snapshot["companies"] or self._snapshot["rumors"])
+            existing_data = bool(
+                self._snapshot["companies"]
+                or self._snapshot["rumors"]
+                or self._normalize_x_ai_dynamics(self._snapshot.get("x_ai_dynamics")).get("items")
+                or self._normalize_hotspot_digest(self._snapshot.get("hotspot_digest")).get("top_items")
+            )
             previous_snapshot = json.loads(json.dumps(self._snapshot))
             self._snapshot["status"] = "refreshing"
             self._snapshot["refresh_in_progress"] = True
@@ -295,6 +449,8 @@ class NewsService:
             )
             companies = self._mark_company_novelty(current_companies, completed_at, company_new_flags)
             rumors = self._mark_rumor_novelty(current_rumors, completed_at, rumor_new_flags)
+            x_ai_dynamics = self._mark_x_ai_dynamics_novelty(payload.get("x_ai_dynamics"), completed_at)
+            hotspot_digest = self._mark_hotspot_digest_novelty(payload.get("hotspot_digest"), completed_at)
             await self._record_history_items(
                 companies=companies,
                 rumors=rumors,
@@ -307,9 +463,13 @@ class NewsService:
                     "last_completed_at": completed_at,
                     "last_error": None,
                     "generated_at": payload.get("generated_at", completed_at),
-                    "summary": self._build_summary(companies, rumors),
+                    "summary": self._build_summary(companies, rumors, x_ai_dynamics, hotspot_digest),
                     "companies": companies,
                     "rumors": rumors,
+                    "x_ai_dynamics": x_ai_dynamics,
+                    "hotspot_digest": hotspot_digest,
+                    "last_trend_completed_at": completed_at,
+                    "last_trend_error": None,
                     "disclaimers": payload.get("disclaimers", []),
                 }
             )
@@ -317,7 +477,7 @@ class NewsService:
             self._write_cache()
 
     async def _run_codex_refresh(self) -> dict[str, Any]:
-        api_key = self._load_codex_lb_api_key()
+        api_key = await self._load_codex_lb_api_key()
         if not api_key:
             raise RuntimeError("News refresh is not configured with a usable codex-lb API key.")
 
@@ -347,6 +507,14 @@ class NewsService:
             run_job("rumors-general", RUMORS_OUTPUT_SCHEMA, self._build_rumors_prompt("Broader AI rumor line")),
             name="codex-lb-news-rumors-general",
         )
+        x_ai_dynamics_task = asyncio.create_task(
+            run_job("x-ai-dynamics", X_AI_DYNAMICS_SCHEMA, self._build_x_ai_dynamics_prompt()),
+            name="codex-lb-news-x-ai-dynamics",
+        )
+        trendradar_export_task = asyncio.create_task(
+            self._collect_trendradar_export(),
+            name="codex-lb-news-trendradar-export",
+        )
 
         try:
             (
@@ -355,12 +523,16 @@ class NewsService:
                 rumors_openai_payload,
                 rumors_anthropic_payload,
                 rumors_general_payload,
+                x_ai_dynamics_payload,
+                trendradar_payload,
             ) = await asyncio.gather(
                 openai_task,
                 anthropic_task,
                 rumors_openai_task,
                 rumors_anthropic_task,
                 rumors_general_task,
+                x_ai_dynamics_task,
+                trendradar_export_task,
             )
         except Exception as exc:
             for task in (
@@ -369,6 +541,8 @@ class NewsService:
                 rumors_openai_task,
                 rumors_anthropic_task,
                 rumors_general_task,
+                x_ai_dynamics_task,
+                trendradar_export_task,
             ):
                 if not task.done():
                     task.cancel()
@@ -378,6 +552,8 @@ class NewsService:
                 rumors_openai_task,
                 rumors_anthropic_task,
                 rumors_general_task,
+                x_ai_dynamics_task,
+                trendradar_export_task,
                 return_exceptions=True,
             )
             raise RuntimeError(f"News refresh timed out or failed in parallel workers: {exc}") from exc
@@ -401,17 +577,68 @@ class NewsService:
                 ),
             )
             rumors = self._merge_rumors(rumors, backfill_payload.get("rumors", []))
+        hotspot_digest_payload = await run_job(
+            "trendradar-hotspots",
+            HOTSPOT_DIGEST_SCHEMA,
+            self._build_hotspot_digest_prompt(trendradar_payload),
+        )
         generated_at = utcnow().isoformat()
         return {
             "generated_at": generated_at,
             "summary": self._build_summary(companies, rumors),
             "companies": companies,
             "rumors": rumors,
+            "x_ai_dynamics": x_ai_dynamics_payload,
+            "hotspot_digest": hotspot_digest_payload,
             "disclaimers": [
                 "未证实板块故意保留为高热度 X 信源，不代表事实已确认。",
-                "当前这版内容由 5 条并发的 Codex + MCP 刷新任务汇总生成，默认并发上限为 8。",
+                "跨平台热点来自本地 TrendRadar 导出，不依赖 TrendRadar MCP。",
+                "当前这版内容由并发的 Codex + TrendRadar 刷新任务汇总生成，默认并发上限为 8。",
             ],
         }
+
+    async def _refresh_trendradar_panel(self, *, force: bool) -> None:
+        async with self._refresh_lock:
+            if not force and not self._is_trendradar_due():
+                return
+            existing_panel = self._normalize_hotspot_digest(self._snapshot.get("hotspot_digest"))
+            self._snapshot["last_trend_started_at"] = utcnow().isoformat()
+            self._snapshot["last_trend_error"] = None
+            self._write_cache()
+            try:
+                api_key = await self._load_codex_lb_api_key()
+                if not api_key:
+                    raise RuntimeError("TrendRadar refresh is not configured with a usable codex-lb API key.")
+                trendradar_payload = await self._collect_trendradar_export()
+                hotspot_digest = await self._run_codex_job(
+                    api_key=api_key,
+                    job_name="trendradar-hotspots-hourly",
+                    schema=HOTSPOT_DIGEST_SCHEMA,
+                    prompt=self._build_hotspot_digest_prompt(trendradar_payload),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._snapshot["hotspot_digest"] = existing_panel
+                self._snapshot["last_trend_error"] = str(exc)
+                self._write_cache()
+                return
+
+            completed_at = utcnow().isoformat()
+            marked_hotspot = self._mark_hotspot_digest_novelty(hotspot_digest, completed_at)
+            companies = self._sort_companies(self._snapshot.get("companies", []))
+            rumors = self._sort_rumors(self._snapshot.get("rumors", []))
+            x_ai_dynamics = self._normalize_x_ai_dynamics(self._snapshot.get("x_ai_dynamics"))
+            self._snapshot.update(
+                {
+                    "hotspot_digest": marked_hotspot,
+                    "last_trend_completed_at": completed_at,
+                    "last_trend_error": None,
+                    "summary": self._build_summary(companies, rumors, x_ai_dynamics, marked_hotspot),
+                }
+            )
+            self._prune_item_state(reference_time=completed_at)
+            self._write_cache()
 
     async def _run_codex_job(
         self,
@@ -485,6 +712,76 @@ class NewsService:
             except Exception as exc:
                 detail = stdout.decode("utf-8", errors="ignore").strip()[-600:]
                 raise RuntimeError(f"{job_name} worker returned invalid JSON. {detail}") from exc
+
+    async def _collect_trendradar_export(self) -> dict[str, Any]:
+        if not self._trendradar_root.is_dir():
+            raise RuntimeError(f"TrendRadar root not found: {self._trendradar_root}")
+        if not (self._trendradar_root / "pyproject.toml").is_file():
+            raise RuntimeError(f"TrendRadar root is missing pyproject.toml: {self._trendradar_root}")
+
+        env = os.environ.copy()
+        env["AI_ANALYSIS_ENABLED"] = "false"
+        env["AI_TRANSLATION_ENABLED"] = "false"
+        env["AI_FILTER_ENABLED"] = "false"
+
+        if os.getenv("CODEX_LB_TRENDRADAR_RUN_ON_REFRESH", "true").strip().lower() not in {"0", "false", "no"}:
+            await self._run_trendradar_command(
+                "trendradar-crawl",
+                ["uv", "run", "trendradar"],
+                env=env,
+                timeout=self._trendradar_timeout_seconds,
+            )
+
+        stdout = await self._run_trendradar_command(
+            "trendradar-export",
+            ["uv", "run", "python", "-m", "trendradar.codex_lb_export", "--limit", "20", "--output", "-"],
+            env=env,
+            timeout=60,
+        )
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"TrendRadar export returned invalid JSON: {stdout[-600:]}") from exc
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            raise RuntimeError("TrendRadar export returned no hotspot items.")
+        return payload
+
+    async def _run_trendradar_command(
+        self,
+        job_name: str,
+        args: list[str],
+        *,
+        env: dict[str, str],
+        timeout: int,
+    ) -> str:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=str(self._trendradar_root),
+            env=env,
+            start_new_session=True,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._refresh_processes.add(process)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                await self._kill_process_group(process)
+            raise
+        except asyncio.TimeoutError:
+            await self._kill_process_group(process)
+            raise RuntimeError(f"{job_name} timed out while waiting for TrendRadar.") from None
+        finally:
+            self._refresh_processes.discard(process)
+
+        stdout_text = stdout.decode("utf-8", errors="ignore").strip()
+        if process.returncode != 0:
+            detail = (stderr or stdout).decode("utf-8", errors="ignore").strip()
+            detail = detail[-1200:] if detail else "TrendRadar exited without details."
+            raise RuntimeError(f"{job_name} failed: {detail}")
+        return stdout_text
 
     def _build_company_prompt(self, company: str) -> str:
         now = utcnow()
@@ -602,6 +899,59 @@ class NewsService:
             """
         ).strip()
 
+    def _build_x_ai_dynamics_prompt(self) -> str:
+        now = utcnow()
+        return textwrap.dedent(
+            f"""
+            Build the latest X AI dynamics panel as strict JSON.
+
+            Current UTC date: {now.date().isoformat()}.
+            Current UTC timestamp: {now.isoformat()}.
+
+            You must use the configured playwright MCP against x.com during this task.
+            Keep this task fast and selective.
+            All editorial writing must be in Simplified Chinese.
+            Keep source titles, product names, company handles, and URLs in their original language when needed.
+
+            Requirements:
+            - focus on latest AI dynamics visible on X, ideally within the last 24-72 hours
+            - produce 4 to 8 items with diverse lanes: model releases, product launches, coding agents, AI infra, research, market/competition
+            - include official announcements and credible high-signal second-hand posts, but label verification_status clearly
+            - prefer posts with visible engagement or obvious traction
+            - do not repeat the same screenshot cluster or claim
+            - headline should be short, sharp, and suitable for a dashboard panel
+            - summary should explain the overall direction of X AI discussion in one compact paragraph
+            - engagement_hint should be short text, not invented exact numbers unless visible
+
+            General rules:
+            - do not invent dates, URLs, publishers, or engagement
+            - use concise product-news language in Chinese
+            - if a field is unknown, use an empty string instead of guessing
+            - return JSON only, matching the provided schema
+            """
+        ).strip()
+
+    def _build_hotspot_digest_prompt(self, trendradar_payload: dict[str, Any]) -> str:
+        prompt_path = self._trendradar_root / "config" / "codex_lb_hotspots_prompt.txt"
+        trendradar_json = json.dumps(trendradar_payload, ensure_ascii=False, indent=2)
+        if prompt_path.is_file():
+            template = prompt_path.read_text(encoding="utf-8")
+            return template.replace("{trendradar_json}", trendradar_json).strip()
+        return textwrap.dedent(
+            f"""
+            Summarize this TrendRadar top-20 multi-platform hotspot export as strict JSON for Codex-LB.
+
+            Use only the provided JSON. Do not invent facts, dates, or source details.
+            Write in concise Simplified Chinese.
+            Cluster the items into 3-5 themes and keep top_items clickable.
+
+            TrendRadar JSON:
+            {trendradar_json}
+
+            Return JSON only, matching the provided schema.
+            """
+        ).strip()
+
     async def _classify_semantic_novelty(
         self,
         *,
@@ -613,7 +963,7 @@ class NewsService:
         if not current:
             return []
 
-        api_key = self._load_codex_lb_api_key()
+        api_key = await self._load_codex_lb_api_key()
         if not api_key:
             return self._fallback_novelty_flags(section=section, previous=previous, current=current)
 
@@ -989,21 +1339,11 @@ class NewsService:
         temp_path.write_text(json.dumps(self._snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         temp_path.replace(self._cache_file)
 
-    def _load_codex_lb_api_key(self) -> str | None:
-        for env_key in ("CODEX_LB_NEWS_API_KEY", "CODEX_LB_API_KEY", "OPENAI_API_KEY"):
-            value = os.getenv(env_key)
-            if value:
-                return value
-
-        auth_toml = Path.home() / ".codex" / "auth.toml"
-        if not auth_toml.is_file():
-            return None
-        try:
-            auth = tomllib.loads(auth_toml.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        value = auth.get("OPENAI_API_KEY")
-        return value if isinstance(value, str) and value else None
+    async def _load_codex_lb_api_key(self) -> str | None:
+        return await load_codex_lb_refresh_api_key(
+            value_env_keys=("CODEX_LB_NEWS_API_KEY",),
+            name_env_keys=("CODEX_LB_NEWS_API_KEY_NAME",),
+        )
 
     async def _cancel_refresh(self, reason: str) -> None:
         for process in list(self._refresh_processes):
@@ -1030,10 +1370,22 @@ class NewsService:
             "last_started_at": None,
             "last_completed_at": None,
             "last_error": None,
+            "last_trend_started_at": None,
+            "last_trend_completed_at": None,
+            "last_trend_error": None,
             "generated_at": None,
             "summary": "",
             "companies": [],
             "rumors": [],
+            "x_ai_dynamics": {"generated_at": None, "headline": "", "summary": "", "items": []},
+            "hotspot_digest": {
+                "generated_at": None,
+                "headline": "",
+                "summary": "",
+                "clusters": [],
+                "top_items": [],
+                "source_note": "",
+            },
             "disclaimers": [],
             "item_state": {
                 "seen_at": {},
@@ -1048,6 +1400,9 @@ class NewsService:
             "last_started_at": None,
             "last_completed_at": "2026-04-22T11:05:00+00:00",
             "last_error": None,
+            "last_trend_started_at": None,
+            "last_trend_completed_at": None,
+            "last_trend_error": None,
             "generated_at": "2026-04-22T11:05:00+00:00",
             "summary": (
                 "当前最明确的两条主线是：OpenAI 正在集中推进 ChatGPT Images 2.0，Anthropic 则把重心放在算力扩张和 Claude 新功能上；与此同时，X 上最热的未证实讨论集中在 Codex 模型名泄露、Claude Mythos 传闻，以及 OpenAI 新网络安全产品的消息。"
@@ -1149,9 +1504,23 @@ class NewsService:
                     "verification_status": "二手信源，未在此处独立证实",
                 },
             ],
+            "x_ai_dynamics": {
+                "generated_at": "2026-04-22T11:05:00+00:00",
+                "headline": "X AI 快讯待刷新",
+                "summary": "首版启动内容会先展示旧的 X 高热讨论；后台刷新成功后，这里会切换成最新 AI 动态。",
+                "items": [],
+            },
+            "hotspot_digest": {
+                "generated_at": "2026-04-22T11:05:00+00:00",
+                "headline": "全网热点待刷新",
+                "summary": "TrendRadar 接入后会在这里展示多平台前 20 条时事热点总结。",
+                "clusters": [],
+                "top_items": [],
+                "source_note": "等待本地 TrendRadar 导出。",
+            },
             "disclaimers": [
                 "未证实板块故意保留为高热度 X 信源，不代表事实已确认。",
-                "当前这版内容会先立即展示，后台仍会继续运行更完整的 Codex + MCP 刷新任务。",
+                "当前这版内容会先立即展示，后台仍会继续运行更完整的 Codex + TrendRadar 刷新任务。",
             ],
         }
 
@@ -1184,6 +1553,16 @@ class NewsService:
             return None
         return (completed + timedelta(seconds=self._refresh_interval)).isoformat()
 
+    def _next_trend_refresh_due_at(self, completed_at: str | None, hotspot_digest: Any = None) -> str | None:
+        candidate = completed_at
+        panel = self._normalize_hotspot_digest(hotspot_digest)
+        if not candidate and panel.get("top_items"):
+            candidate = panel.get("generated_at")
+        completed = self._parse_datetime(str(candidate)) if candidate else None
+        if completed is None:
+            return None
+        return (completed + timedelta(seconds=self._trendradar_refresh_interval)).isoformat()
+
     def _is_refresh_overdue(self, started_at: str | None) -> bool:
         if not started_at:
             return False
@@ -1200,6 +1579,22 @@ class NewsService:
         if completed_at:
             return self._is_stale(completed_at)
         return not self._snapshot.get("last_started_at") and not self._snapshot.get("generated_at")
+
+    def _should_auto_refresh_trendradar(self) -> bool:
+        if self._trendradar_refresh_task is not None and not self._trendradar_refresh_task.done():
+            return False
+        return self._is_trendradar_due()
+
+    def _is_trendradar_due(self) -> bool:
+        completed_at = self._snapshot.get("last_trend_completed_at")
+        if not completed_at:
+            completed_at = self._normalize_hotspot_digest(self._snapshot.get("hotspot_digest")).get("generated_at")
+        if not completed_at:
+            return True
+        completed = self._parse_datetime(str(completed_at))
+        if completed is None:
+            return True
+        return utcnow() - completed > timedelta(seconds=self._trendradar_refresh_interval)
 
     async def _kill_process_group(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
@@ -1232,6 +1627,34 @@ class NewsService:
                 seen_at.setdefault(identity, timestamp)
                 read_at[identity] = timestamp
                 item["is_new"] = False
+
+        x_ai_panel = self._snapshot.get("x_ai_dynamics")
+        x_ai_items = x_ai_panel.get("items", []) if isinstance(x_ai_panel, dict) else []
+        for item in x_ai_items:
+            if not isinstance(item, dict):
+                continue
+            identity = self._x_ai_dynamic_identity(item)
+            if not identity:
+                continue
+            if identity not in read_at:
+                marked += 1
+            seen_at.setdefault(identity, timestamp)
+            read_at[identity] = timestamp
+            item["is_new"] = False
+
+        hotspot_panel = self._snapshot.get("hotspot_digest")
+        hotspot_items = hotspot_panel.get("top_items", []) if isinstance(hotspot_panel, dict) else []
+        for item in hotspot_items:
+            if not isinstance(item, dict):
+                continue
+            identity = self._hotspot_identity(item)
+            if not identity:
+                continue
+            if identity not in read_at:
+                marked += 1
+            seen_at.setdefault(identity, timestamp)
+            read_at[identity] = timestamp
+            item["is_new"] = False
 
         self._write_cache()
         return marked
@@ -1275,6 +1698,38 @@ class NewsService:
             payload["is_new"] = bool(identity) and bool(ai_is_new) and identity not in read_at
             marked.append(payload)
         return marked
+
+    def _mark_x_ai_dynamics_novelty(self, panel: Any, seen_at_time: str) -> dict[str, Any]:
+        payload = self._normalize_x_ai_dynamics(panel)
+        self._normalize_item_state()
+        seen_at = self._snapshot["item_state"]["seen_at"]
+        read_at = self._snapshot["item_state"]["read_at"]
+        marked_items: list[dict[str, Any]] = []
+        for item in payload.get("items", []):
+            current = dict(item)
+            identity = self._x_ai_dynamic_identity(current)
+            if identity:
+                seen_at.setdefault(identity, seen_at_time)
+            current["is_new"] = bool(identity) and identity not in read_at
+            marked_items.append(current)
+        payload["items"] = marked_items
+        return payload
+
+    def _mark_hotspot_digest_novelty(self, panel: Any, seen_at_time: str) -> dict[str, Any]:
+        payload = self._normalize_hotspot_digest(panel)
+        self._normalize_item_state()
+        seen_at = self._snapshot["item_state"]["seen_at"]
+        read_at = self._snapshot["item_state"]["read_at"]
+        marked_items: list[dict[str, Any]] = []
+        for item in payload.get("top_items", []):
+            current = dict(item)
+            identity = self._hotspot_identity(current)
+            if identity:
+                seen_at.setdefault(identity, seen_at_time)
+            current["is_new"] = bool(identity) and identity not in read_at
+            marked_items.append(current)
+        payload["top_items"] = marked_items
+        return payload
 
     def _fallback_novelty_flags(
         self,
@@ -1417,12 +1872,47 @@ class NewsService:
             ]
         )
 
-    def _build_summary(self, companies: list[dict[str, Any]], rumors: list[dict[str, Any]]) -> str:
+    def _x_ai_dynamic_identity(self, item: dict[str, Any]) -> str:
+        url = self._normalize_url(str(item.get("url", "")).strip())
+        if url:
+            return f"x-ai::{url}"
+        return "x-ai::" + "::".join(
+            [
+                self._normalize_text(str(item.get("headline", ""))),
+                self._normalize_text(str(item.get("handle", ""))),
+                str(item.get("posted_at", "")).strip().lower(),
+            ]
+        )
+
+    def _hotspot_identity(self, item: dict[str, Any]) -> str:
+        url = self._normalize_url(str(item.get("url", "")).strip())
+        platform = self._normalize_text(str(item.get("platform", "")))
+        title = self._normalize_text(str(item.get("title", "")))
+        if url:
+            return f"hotspot::{platform}::{url}"
+        return f"hotspot::{platform}::{title}"
+
+    def _build_summary(
+        self,
+        companies: list[dict[str, Any]],
+        rumors: list[dict[str, Any]],
+        x_ai_dynamics: dict[str, Any] | None = None,
+        hotspot_digest: dict[str, Any] | None = None,
+    ) -> str:
         company_lines = [item.get("headline", "").strip() for item in companies if item.get("headline")]
         rumor_lines = [item.get("headline", "").strip() for item in rumors if item.get("headline")]
+        x_summary = (x_ai_dynamics or {}).get("headline") or (x_ai_dynamics or {}).get("summary")
+        hotspot_summary = (hotspot_digest or {}).get("headline") or (hotspot_digest or {}).get("summary")
         company_text = "，".join(company_lines[:2]) if company_lines else "官方主线仍在整理中"
         rumor_text = "、".join(rumor_lines[:4]) if rumor_lines else "暂无进入展示区的高热未证实讨论"
-        return f"当前最明确的已确认主线是：{company_text}；未证实高热讨论主要集中在 {rumor_text}。"
+        extra_parts = []
+        if x_summary:
+            extra_parts.append(f"X AI 快讯聚焦 {str(x_summary).strip()}")
+        if hotspot_summary:
+            extra_parts.append(f"全网热点显示 {str(hotspot_summary).strip()}")
+        extra_text = "；".join(extra_parts)
+        suffix = f"；{extra_text}" if extra_text else ""
+        return f"当前最明确的已确认主线是：{company_text}；未证实高热讨论主要集中在 {rumor_text}{suffix}。"
 
     def _merge_rumors(self, *groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged: list[dict[str, Any]] = []
@@ -1467,6 +1957,38 @@ class NewsService:
     def _sort_sources(self, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized = [dict(source) for source in sources if isinstance(source, dict)]
         return sorted(normalized, key=lambda source: self._sort_timestamp(source.get("published_at")), reverse=True)
+
+    def _normalize_x_ai_dynamics(self, panel: Any) -> dict[str, Any]:
+        if not isinstance(panel, dict):
+            return {"generated_at": None, "headline": "", "summary": "", "items": []}
+        items = [dict(item) for item in panel.get("items", []) if isinstance(item, dict)]
+        return {
+            "generated_at": panel.get("generated_at"),
+            "headline": str(panel.get("headline", "")).strip(),
+            "summary": str(panel.get("summary", "")).strip(),
+            "items": sorted(items, key=lambda item: self._sort_timestamp(item.get("posted_at")), reverse=True),
+        }
+
+    def _normalize_hotspot_digest(self, panel: Any) -> dict[str, Any]:
+        if not isinstance(panel, dict):
+            return {
+                "generated_at": None,
+                "headline": "",
+                "summary": "",
+                "clusters": [],
+                "top_items": [],
+                "source_note": "",
+            }
+        clusters = [dict(cluster) for cluster in panel.get("clusters", []) if isinstance(cluster, dict)]
+        top_items = [dict(item) for item in panel.get("top_items", []) if isinstance(item, dict)]
+        return {
+            "generated_at": panel.get("generated_at"),
+            "headline": str(panel.get("headline", "")).strip(),
+            "summary": str(panel.get("summary", "")).strip(),
+            "clusters": clusters,
+            "top_items": top_items[:20],
+            "source_note": str(panel.get("source_note", "")).strip(),
+        }
 
     def _company_sort_key(self, item: dict[str, Any]) -> datetime:
         sources = item.get("sources", [])
@@ -1559,6 +2081,12 @@ class NewsService:
             for item in self._snapshot.get("rumors", []):
                 if isinstance(item, dict):
                     item["is_new"] = False
+            for item in self._normalize_x_ai_dynamics(self._snapshot.get("x_ai_dynamics")).get("items", []):
+                if isinstance(item, dict):
+                    item["is_new"] = False
+            for item in self._normalize_hotspot_digest(self._snapshot.get("hotspot_digest")).get("top_items", []):
+                if isinstance(item, dict):
+                    item["is_new"] = False
             self._write_cache()
             return
 
@@ -1579,6 +2107,16 @@ class NewsService:
         for item in self._snapshot.get("rumors", []):
             if isinstance(item, dict):
                 identity = self._rumor_identity(item)
+                if identity:
+                    identities.add(identity)
+        for item in self._normalize_x_ai_dynamics(self._snapshot.get("x_ai_dynamics")).get("items", []):
+            if isinstance(item, dict):
+                identity = self._x_ai_dynamic_identity(item)
+                if identity:
+                    identities.add(identity)
+        for item in self._normalize_hotspot_digest(self._snapshot.get("hotspot_digest")).get("top_items", []):
+            if isinstance(item, dict):
+                identity = self._hotspot_identity(item)
                 if identity:
                     identities.add(identity)
         return identities
@@ -1606,10 +2144,12 @@ def build_news_service() -> NewsService:
         project_root = Path.cwd().resolve()
     cache_file = Path(os.getenv("CODEX_LB_NEWS_CACHE_FILE", project_root / "var" / "news-cache.json")).expanduser()
     refresh_seconds = int(os.getenv("CODEX_LB_NEWS_REFRESH_SECONDS", str(6 * 60 * 60)))
+    trendradar_refresh_seconds = int(os.getenv("CODEX_LB_TRENDRADAR_REFRESH_SECONDS", str(60 * 60)))
     initial_delay_seconds = int(os.getenv("CODEX_LB_NEWS_INITIAL_DELAY_SECONDS", "3"))
     return NewsService(
         project_root=project_root,
         cache_file=cache_file,
         refresh_interval_seconds=refresh_seconds,
+        trendradar_refresh_interval_seconds=trendradar_refresh_seconds,
         initial_delay_seconds=initial_delay_seconds,
     )

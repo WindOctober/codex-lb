@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
 
 from app.core import usage as usage_core
+from app.core.account_groups import account_builtin_group_names
 from app.core.account_priorities import account_configured_priority, account_routing_priority
 from app.core.balancer import (
     HEALTH_TIER_DRAINING,
@@ -37,6 +38,7 @@ from app.core.utils.time import utcnow
 from app.db.models import (
     ACCOUNT_PROVIDER_API_KEY,
     Account,
+    AccountGroupMembership,
     AccountStatus,
     AdditionalUsageHistory,
     StickySessionKind,
@@ -127,18 +129,22 @@ class LoadBalancer:
         exclude_account_ids: Collection[str] | None = None,
         kyc_only: bool | None = None,
         kyc_routing_enforcement_enabled: bool = False,
+        allowed_groups: Collection[str] | None = None,
+        preferred_group_priorities: dict[str, int] | None = None,
         budget_threshold_pct: float = 95.0,
     ) -> AccountSelection:
         excluded_ids = set(exclude_account_ids or ())
         scoped_account_ids = None if account_ids is None else set(account_ids)
+        normalized_allowed_groups = _normalize_group_filter(allowed_groups)
+        normalized_preferred_group_priorities = _normalize_group_priorities(preferred_group_priorities)
 
         async def load_selection_inputs() -> _SelectionInputs:
             selection_inputs = await self._load_selection_inputs(
                 model=model,
                 additional_limit_name=additional_limit_name,
                 account_ids=scoped_account_ids,
-                kyc_only=kyc_only,
-                kyc_routing_enforcement_enabled=kyc_routing_enforcement_enabled,
+                allowed_groups=normalized_allowed_groups,
+                preferred_group_priorities=normalized_preferred_group_priorities,
             )
             if excluded_ids and selection_inputs.accounts:
                 selection_inputs = _SelectionInputs(
@@ -181,6 +187,7 @@ class LoadBalancer:
                     latest_primary=selection_inputs.latest_primary,
                     latest_secondary=selection_inputs.latest_secondary,
                     runtime=self._runtime,
+                    preferred_group_priorities=normalized_preferred_group_priorities,
                 )
 
                 result = _select_account_preferring_budget_safe(
@@ -311,6 +318,7 @@ class LoadBalancer:
                     latest_primary=selection_inputs.latest_primary,
                     latest_secondary=selection_inputs.latest_secondary,
                     runtime=self._runtime,
+                    preferred_group_priorities=normalized_preferred_group_priorities,
                 )
                 async with self._repo_factory() as repos:
                     result = await self._select_with_stickiness(
@@ -409,14 +417,17 @@ class LoadBalancer:
         model: str | None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
-        kyc_only: bool | None = None,
-        kyc_routing_enforcement_enabled: bool = False,
+        allowed_groups: frozenset[str] | None = None,
+        preferred_group_priorities: dict[str, int] | None = None,
     ) -> _SelectionInputs:
         cache_key = (
             model,
             additional_limit_name,
             None if account_ids is None else tuple(sorted(set(account_ids))),
-            kyc_only if kyc_routing_enforcement_enabled else None,
+            None if not allowed_groups else tuple(sorted(allowed_groups)),
+            None
+            if not preferred_group_priorities
+            else tuple(sorted(preferred_group_priorities.items(), key=lambda item: (item[1], item[0]))),
         )
         cached = await self._selection_inputs_cache.get(cache_key)
         if cached is not None:
@@ -431,11 +442,7 @@ class LoadBalancer:
             if account_ids is not None:
                 allowed_account_ids = set(account_ids)
                 accounts = [account for account in accounts if account.id in allowed_account_ids]
-            accounts = _filter_accounts_for_kyc_access(
-                accounts,
-                kyc_only=kyc_only,
-                kyc_routing_enforcement_enabled=kyc_routing_enforcement_enabled,
-            )
+            accounts = _filter_accounts_for_allowed_groups(accounts, allowed_groups)
             pre_model_filter_accounts = accounts
             if model and (
                 effective_limit_name is None
@@ -1053,6 +1060,7 @@ def _build_states(
     latest_primary: dict[str, UsageHistory],
     latest_secondary: dict[str, UsageHistory],
     runtime: dict[str, RuntimeState],
+    preferred_group_priorities: dict[str, int] | None = None,
 ) -> tuple[list[AccountState], dict[str, Account]]:
     states: list[AccountState] = []
     account_map: dict[str, Account] = {}
@@ -1063,6 +1071,7 @@ def _build_states(
             primary_entry=latest_primary.get(account.id),
             secondary_entry=latest_secondary.get(account.id),
             runtime=runtime.setdefault(account.id, RuntimeState()),
+            group_priority_rank=_account_group_priority_rank(account, preferred_group_priorities),
         )
         states.append(state)
         account_map[account.id] = account
@@ -1075,6 +1084,7 @@ def _state_from_account(
     primary_entry: UsageHistory | None,
     secondary_entry: UsageHistory | None,
     runtime: RuntimeState,
+    group_priority_rank: int = 1000000,
 ) -> AccountState:
     primary_used = primary_entry.used_percent if primary_entry else None
     primary_reset = primary_entry.reset_at if primary_entry else None
@@ -1221,6 +1231,7 @@ def _state_from_account(
         deactivation_reason=account.deactivation_reason,
         plan_type=account.plan_type,
         capacity_credits=usage_core.capacity_for_plan(account.plan_type, "secondary"),
+        group_priority_rank=group_priority_rank,
         source_rank=account_routing_priority(account),
         configured_priority=account_configured_priority(account),
         health_tier=new_tier,
@@ -1247,17 +1258,57 @@ def _usage_entry_recorded_after(entry: UsageHistory | None, epoch_seconds: float
     return recorded_time.timestamp() > epoch_seconds
 
 
-def _filter_accounts_for_kyc_access(
+def _normalize_group_filter(groups: Collection[str] | None) -> frozenset[str] | None:
+    if not groups:
+        return None
+    normalized = frozenset(group.strip().lower() for group in groups if group and group.strip())
+    return normalized or None
+
+
+def _normalize_group_priorities(group_priorities: dict[str, int] | None) -> dict[str, int]:
+    if not group_priorities:
+        return {}
+    normalized: dict[str, int] = {}
+    for group, priority in group_priorities.items():
+        name = group.strip().lower()
+        if not name:
+            continue
+        priority_value = int(priority)
+        existing = normalized.get(name)
+        if existing is None or priority_value < existing:
+            normalized[name] = priority_value
+    return normalized
+
+
+def _account_group_names(account: Account) -> set[str]:
+    memberships = account.__dict__.get("group_memberships", [])
+    groups = {
+        membership.group_name.strip().lower()
+        for membership in memberships
+        if getattr(membership, "group_name", None) and membership.group_name.strip()
+    }
+    groups.update(account_builtin_group_names(account))
+    return groups
+
+
+def _filter_accounts_for_allowed_groups(
     accounts: list[Account],
-    *,
-    kyc_only: bool | None,
-    kyc_routing_enforcement_enabled: bool,
+    allowed_groups: frozenset[str] | None,
 ) -> list[Account]:
-    if not kyc_routing_enforcement_enabled or kyc_only is None:
+    if not allowed_groups:
         return accounts
-    if kyc_only:
-        return [account for account in accounts if bool(getattr(account, "kyc_enabled", False))]
-    return [account for account in accounts if not bool(getattr(account, "kyc_enabled", False))]
+    return [account for account in accounts if _account_group_names(account) & allowed_groups]
+
+
+def _account_group_priority_rank(account: Account, preferred_group_priorities: dict[str, int] | None) -> int:
+    if not preferred_group_priorities:
+        return 1000000
+    matches = [
+        preferred_group_priorities[group]
+        for group in _account_group_names(account)
+        if group in preferred_group_priorities
+    ]
+    return min(matches) if matches else 1000000
 
 
 def _filter_accounts_for_model(accounts: list[Account], model: str) -> list[Account]:
@@ -1348,7 +1399,12 @@ def _usage_entry_to_window_row(entry: UsageHistory) -> UsageWindowRow:
 
 def _clone_account(account: Account) -> Account:
     data = {column.name: getattr(account, column.name) for column in Account.__table__.columns}
-    return Account(**data)
+    clone = Account(**data)
+    clone.group_memberships = [
+        AccountGroupMembership(account_id=membership.account_id, group_name=membership.group_name)
+        for membership in account.__dict__.get("group_memberships", [])
+    ]
+    return clone
 
 
 def _clone_usage_history(entry: UsageHistory) -> UsageHistory:

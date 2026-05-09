@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.db.models import Base
 from app.modules.news.repository import NewsHistoryRecord, NewsRepository
-from app.modules.news.service import NewsService
+from app.modules.news.service import NewsService, build_news_service
 
 pytestmark = pytest.mark.unit
 
@@ -210,3 +210,53 @@ def test_merge_rumors_dedupes_same_current_claim_across_sources(tmp_path: Path) 
         "https://x.com/example/status/3",
         "https://x.com/insiderwire/status/1",
     ]
+
+
+def test_mark_all_read_includes_x_ai_and_hotspot_panels(tmp_path: Path) -> None:
+    service = NewsService(project_root=tmp_path, cache_file=tmp_path / "news.json")
+    service._snapshot = service._empty_snapshot()
+    service._snapshot["x_ai_dynamics"] = {
+        "generated_at": "2026-05-02T00:00:00+00:00",
+        "headline": "X AI 快讯",
+        "summary": "摘要",
+        "items": [
+            {
+                "headline": "OpenAI 动态",
+                "url": "https://x.com/openai/status/1",
+                "posted_at": "2026-05-02T00:00:00+00:00",
+            }
+        ],
+    }
+    service._snapshot["hotspot_digest"] = {
+        "generated_at": "2026-05-02T00:00:00+00:00",
+        "headline": "全网热点",
+        "summary": "摘要",
+        "clusters": [],
+        "top_items": [
+            {
+                "title": "堵山堵海堵桥堵路",
+                "platform": "百度热搜",
+                "rank": 1,
+                "url": "https://www.baidu.com/s?wd=test",
+            }
+        ],
+        "source_note": "TrendRadar",
+    }
+
+    assert service.mark_all_read() == 2
+    snapshot = service.get_snapshot()
+    assert snapshot["x_ai_dynamics"]["items"][0]["is_new"] is False
+    assert snapshot["hotspot_digest"]["top_items"][0]["is_new"] is False
+
+
+def test_build_news_service_keeps_news_six_hourly_and_trendradar_hourly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("CODEX_LB_NEWS_REFRESH_SECONDS", raising=False)
+    monkeypatch.delenv("CODEX_LB_TRENDRADAR_REFRESH_SECONDS", raising=False)
+    monkeypatch.setenv("CODEX_LB_ENCRYPTION_KEY_FILE", str(tmp_path / "var" / "encryption.key"))
+
+    service = build_news_service()
+
+    assert service._refresh_interval == 6 * 60 * 60
+    assert service._trendradar_refresh_interval == 60 * 60

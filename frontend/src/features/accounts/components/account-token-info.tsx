@@ -1,3 +1,4 @@
+import { CopyButton } from "@/components/copy-button";
 import type { AccountSummary } from "@/features/accounts/schemas";
 import {
   formatAccessTokenLabel,
@@ -10,6 +11,20 @@ export type AccountTokenInfoProps = {
 };
 
 export function AccountTokenInfo({ account }: AccountTokenInfoProps) {
+  if ((account.providerKind ?? "openai_oauth") === "api_key") {
+    return (
+      <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">API Key</h3>
+        <div className="flex items-center justify-between gap-3 text-xs">
+          <span className="truncate font-mono text-muted-foreground">
+            {account.storedApiKey ? `${account.storedApiKey.slice(0, 15)}...` : "Stored"}
+          </span>
+          {account.storedApiKey ? <CopyButton value={account.storedApiKey} label="Copy provider API key" /> : null}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
       <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Token Status</h3>

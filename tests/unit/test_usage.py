@@ -40,6 +40,8 @@ def test_capacity_for_plan():
     assert capacity_for_plan("plus", "7d") is not None
     assert capacity_for_plan("plus", "7d") == pytest.approx(capacity_for_plan("free", "7d") * 10)
     assert capacity_for_plan("plus", "5h") == pytest.approx(capacity_for_plan("plus", "7d") / 33.6)
+    assert capacity_for_plan("pro", "5h") == pytest.approx(capacity_for_plan("plus", "5h") * 20)
+    assert capacity_for_plan("pro", "7d") == pytest.approx(capacity_for_plan("plus", "7d") * 20)
     assert capacity_for_plan("unknown", "5h") is None
 
 

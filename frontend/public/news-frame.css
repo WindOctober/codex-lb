@@ -102,6 +102,14 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
+.masthead-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
 .masthead-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.9fr);
@@ -536,5 +544,411 @@ body {
   .masthead-meta {
     padding-left: 16px;
     padding-right: 16px;
+  }
+}
+
+/* 2026 refresh: brighter editorial board style for the expanded intelligence panels. */
+:root {
+  color-scheme: light;
+  --bg: #f6f1e7;
+  --bg-elevated: rgba(255, 252, 243, 0.86);
+  --ink: #17201a;
+  --muted: rgba(23, 32, 26, 0.62);
+  --line: rgba(23, 32, 26, 0.12);
+  --accent: #0f8f72;
+  --accent-2: #ff6b35;
+  --danger: #b42318;
+  --shadow: 0 24px 70px rgba(49, 35, 18, 0.16);
+}
+
+html,
+body {
+  background:
+    radial-gradient(circle at 8% 10%, rgba(15, 143, 114, 0.16), transparent 30%),
+    radial-gradient(circle at 92% 12%, rgba(255, 107, 53, 0.18), transparent 28%),
+    linear-gradient(135deg, #fbf6ea 0%, #edf6ef 52%, #f8ede0 100%);
+  color: var(--ink);
+}
+
+.news-backdrop-a {
+  background: rgba(15, 143, 114, 0.18);
+}
+
+.news-backdrop-b {
+  background: rgba(255, 107, 53, 0.2);
+}
+
+.masthead h1 {
+  max-width: 9ch;
+  color: #111814;
+  font-weight: 820;
+}
+
+.masthead-meta,
+.summary-panel,
+.briefing-stage,
+.rumor-stage,
+.x-ai-panel,
+.hotspot-panel {
+  border: 1px solid rgba(23, 32, 26, 0.12);
+  background:
+    linear-gradient(135deg, rgba(255, 252, 243, 0.88), rgba(255, 252, 243, 0.68)),
+    radial-gradient(circle at top right, rgba(15, 143, 114, 0.09), transparent 38%);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+}
+
+.meta-line strong,
+.source-time,
+.rumor-time,
+#last-refresh,
+#next-refresh,
+#x-ai-time,
+#hotspot-time {
+  background: rgba(255, 107, 53, 0.1);
+  border-color: rgba(255, 107, 53, 0.2);
+  color: #7a2f16;
+}
+
+.refresh-button,
+.secondary-button {
+  background: #17201a;
+  border-color: #17201a;
+  color: #fffaf0;
+}
+
+.secondary-button {
+  background: rgba(255, 252, 243, 0.72);
+  color: #17201a;
+}
+
+.company-story.is-new,
+.rumor-item.is-new,
+.x-ai-item.is-new,
+.hotspot-list li.is-new {
+  background:
+    linear-gradient(180deg, rgba(15, 143, 114, 0.09), rgba(255, 252, 243, 0.38)) padding-box,
+    linear-gradient(135deg, rgba(15, 143, 114, 0.42), rgba(255, 107, 53, 0.28)) border-box;
+}
+
+.signal-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: 24px;
+}
+
+.x-ai-panel,
+.hotspot-panel {
+  position: relative;
+  overflow: hidden;
+  border-radius: 32px;
+  padding: 24px;
+}
+
+.x-ai-panel::before,
+.hotspot-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(120deg, rgba(255, 255, 255, 0.42), transparent 35%);
+}
+
+.panel-heading {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: start;
+}
+
+.panel-heading h2 {
+  margin: 8px 0 0;
+  font-size: clamp(1.9rem, 3vw, 3.4rem);
+  line-height: 0.98;
+  letter-spacing: -0.055em;
+}
+
+.panel-heading time {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.42rem 0.72rem;
+  font-size: 0.78rem;
+  font-weight: 720;
+}
+
+.panel-summary {
+  position: relative;
+  z-index: 1;
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1.65;
+}
+
+.x-ai-list {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.x-ai-item,
+.hotspot-cluster,
+.hotspot-list li {
+  border: 1px solid rgba(23, 32, 26, 0.1);
+  border-radius: 20px;
+  background: rgba(255, 252, 243, 0.72);
+}
+
+.x-ai-item {
+  padding: 16px;
+}
+
+.item-row,
+.compact-meta,
+.cluster-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.topic-chip,
+.new-dot,
+.cluster-top span {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.28rem 0.58rem;
+  background: rgba(15, 143, 114, 0.1);
+  color: #075f4b;
+  font-size: 0.72rem;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.new-dot {
+  background: rgba(255, 107, 53, 0.14);
+  color: #9b3718;
+}
+
+.x-ai-item h3 {
+  margin: 12px 0 8px;
+  font-size: 1.16rem;
+  line-height: 1.18;
+  letter-spacing: -0.025em;
+}
+
+.x-ai-item h3 a,
+.hotspot-list a {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.x-ai-item h3 a:hover,
+.hotspot-list a:hover {
+  color: var(--accent);
+}
+
+.x-ai-item p,
+.hotspot-cluster p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.compact-meta {
+  margin-top: 10px;
+  color: rgba(23, 32, 26, 0.66);
+  font-size: 0.78rem;
+}
+
+.muted-meta {
+  color: rgba(23, 32, 26, 0.48);
+}
+
+.hotspot-clusters {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.hotspot-cluster {
+  padding: 15px;
+}
+
+.cluster-top strong {
+  font-size: 1rem;
+}
+
+.hotspot-list {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 8px;
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: hotspot;
+}
+
+.hotspot-list li {
+  counter-increment: hotspot;
+  display: grid;
+  grid-template-columns: 2.2rem minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+}
+
+.hotspot-list li::before {
+  content: counter(hotspot, decimal-leading-zero);
+  color: var(--accent);
+  font-weight: 820;
+  font-variant-numeric: tabular-nums;
+}
+
+.hotspot-list span {
+  color: var(--muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.view-switch {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(160px, 1fr));
+  gap: 8px;
+  padding: 7px;
+  border: 1px solid rgba(23, 32, 26, 0.12);
+  border-radius: 999px;
+  background: rgba(255, 252, 243, 0.62);
+  box-shadow: 0 14px 42px rgba(49, 35, 18, 0.12);
+}
+
+.view-tab {
+  border: 0;
+  border-radius: 999px;
+  padding: 12px 18px;
+  background: transparent;
+  color: rgba(23, 32, 26, 0.62);
+  font: inherit;
+  font-weight: 760;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background 180ms ease, color 180ms ease, transform 180ms ease;
+}
+
+.view-tab:hover {
+  transform: translateY(-1px);
+}
+
+.view-tab.is-active {
+  background: #17201a;
+  color: #fffaf0;
+  box-shadow: 0 10px 28px rgba(23, 32, 26, 0.18);
+}
+
+.view-panel {
+  display: grid;
+  gap: 28px;
+}
+
+.view-panel[hidden] {
+  display: none;
+}
+
+.trend-hero,
+.trend-modules {
+  border: 1px solid rgba(23, 32, 26, 0.12);
+  background:
+    linear-gradient(135deg, rgba(255, 252, 243, 0.9), rgba(255, 252, 243, 0.68)),
+    radial-gradient(circle at top right, rgba(255, 107, 53, 0.1), transparent 38%);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+}
+
+.trend-hero {
+  border-radius: 34px;
+  padding: 28px;
+}
+
+.trend-modules {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 24px;
+  border-radius: 30px;
+  padding: 24px;
+}
+
+.empty-note,
+.mini-skeleton {
+  border-radius: 18px;
+  padding: 14px;
+  background: rgba(23, 32, 26, 0.05);
+  color: var(--muted);
+}
+
+.mini-skeleton {
+  min-height: 82px;
+  position: relative;
+  overflow: hidden;
+}
+
+.mini-skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.72), transparent);
+  transform: translateX(-100%);
+  animation: shimmer 1.4s infinite;
+}
+
+@media (max-width: 1024px) {
+  .signal-grid,
+  .trend-modules,
+  .hotspot-clusters {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .x-ai-panel,
+  .hotspot-panel {
+    border-radius: 22px;
+    padding: 18px 16px;
+  }
+
+  .panel-heading,
+  .item-row,
+  .compact-meta,
+  .cluster-top {
+    align-items: flex-start;
+  }
+
+  .masthead-top,
+  .view-switch {
+    grid-template-columns: 1fr;
+  }
+
+  .masthead-top {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .hotspot-list li {
+    grid-template-columns: 2rem minmax(0, 1fr);
+  }
+
+  .hotspot-list span {
+    grid-column: 2;
   }
 }

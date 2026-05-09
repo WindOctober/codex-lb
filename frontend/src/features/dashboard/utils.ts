@@ -91,7 +91,7 @@ function accountRemainingPercent(account: AccountSummary, windowKey: "primary" |
  * than the 5h remaining credits, the account can only use up to the 7d amount
  * regardless of 5h headroom.  Comparing absolute credits (not percentages) is
  * essential because the two windows have vastly different capacities
- * (e.g. 225 vs 7 560 for Plus plans).
+ * (e.g. 337.5 vs 11 340 for Plus plans).
  */
 export function applySecondaryConstraint(
   primaryItems: RemainingItem[],

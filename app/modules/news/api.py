@@ -43,6 +43,22 @@ async def refresh_news(request: Request) -> dict[str, object]:
 
 
 @router.post(
+    "/api/news/trend-refresh",
+    dependencies=[Depends(validate_dashboard_session), Depends(set_dashboard_error_format)],
+)
+async def refresh_trend_news(request: Request) -> dict[str, object]:
+    service = _get_news_service(request)
+    queued = await service.request_trendradar_refresh(force=True)
+    snapshot = service.get_snapshot()
+    return {
+        "queued": queued,
+        "status": snapshot["status"],
+        "trend_refresh_in_progress": snapshot["trend_refresh_in_progress"],
+        "last_trend_completed_at": snapshot.get("last_trend_completed_at"),
+    }
+
+
+@router.post(
     "/api/news/mark-read",
     dependencies=[Depends(validate_dashboard_session), Depends(set_dashboard_error_format)],
 )

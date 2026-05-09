@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
@@ -9,6 +10,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from app.core.account_groups import is_reserved_account_group
 from app.core.auth import (
     DEFAULT_EMAIL,
     DEFAULT_PLAN,
@@ -20,6 +22,7 @@ from app.core.auth.api_key_cache import get_api_key_cache
 from app.core.auth.refresh import RefreshError
 from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
 from app.core.clients.upstream import UpstreamProbeError, probe_upstream_provider
+from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
@@ -54,6 +57,8 @@ from app.modules.usage.updater import AdditionalUsageRepositoryPort, UsageUpdate
 
 _SPARKLINE_DAYS = 7
 _DETAIL_BUCKET_SECONDS = 3600  # 1h → 168 points
+
+logger = logging.getLogger(__name__)
 
 
 class InvalidAuthJsonError(Exception):
@@ -333,6 +338,7 @@ class AccountsService:
             account_id,
             configured_priority=payload.configured_priority,
             kyc_enabled=payload.kyc_enabled,
+            groups=_normalize_group_names(payload.groups) if payload.groups is not None else None,
         )
         if updated is None:
             return None
@@ -369,7 +375,8 @@ class AccountsService:
                     reason=_availability_failure_reason(str(exc) or "Provider probe failed"),
                 )
         try:
-            await self._auth_manager.ensure_fresh(account, force=True)
+            refreshed = await self._auth_manager.ensure_fresh(account, force=True)
+            await self._sync_plan_type_from_usage(refreshed)
             return _AvailabilityOutcome(ok=True, status=AccountStatus.ACTIVE)
         except RefreshError as exc:
             return _AvailabilityOutcome(
@@ -384,12 +391,68 @@ class AccountsService:
                 reason=_availability_failure_reason(str(exc) or "Token refresh failed"),
             )
 
+    async def _sync_plan_type_from_usage(self, account: Account) -> None:
+        try:
+            access_token = self._encryptor.decrypt(account.access_token_encrypted)
+            payload = await fetch_usage(
+                access_token=access_token,
+                account_id=account.chatgpt_account_id,
+                account_label=account.email,
+            )
+        except UsageFetchError as exc:
+            logger.info(
+                "Availability probe could not sync plan from usage account_id=%s status=%s message=%s",
+                account.id,
+                exc.status_code,
+                exc.message,
+            )
+            return
+        except Exception as exc:
+            logger.info(
+                "Availability probe could not sync plan from usage account_id=%s error=%s",
+                account.id,
+                exc,
+            )
+            return
+
+        next_plan_type = coerce_account_plan_type(payload.plan_type, account.plan_type or DEFAULT_PLAN)
+        if next_plan_type == account.plan_type:
+            return
+
+        account.plan_type = next_plan_type
+        await self._repo.update_tokens(
+            account.id,
+            access_token_encrypted=account.access_token_encrypted,
+            refresh_token_encrypted=account.refresh_token_encrypted,
+            id_token_encrypted=account.id_token_encrypted,
+            last_refresh=account.last_refresh,
+            plan_type=next_plan_type,
+            email=account.email,
+            chatgpt_account_id=account.chatgpt_account_id,
+        )
+
 
 def _provider_account_label(name: str, base_url: str) -> str:
     host = urlparse(base_url).netloc
     if not host:
         return name
     return f"{name} ({host})"
+
+
+def _normalize_group_names(group_names: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for group_name in group_names:
+        value = group_name.strip().lower()
+        if not value:
+            continue
+        if len(value) > 128:
+            raise ValueError("Group names must be at most 128 characters")
+        if value in seen or is_reserved_account_group(value):
+            continue
+        normalized.append(value)
+        seen.add(value)
+    return normalized
 
 
 def _availability_failure_reason(message: str) -> str:

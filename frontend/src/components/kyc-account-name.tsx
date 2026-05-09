@@ -34,7 +34,7 @@ export function KycAccountName({
       </span>
       <span
         className={cn(
-          "min-w-0 truncate bg-[linear-gradient(110deg,#8a4b00_0%,#d9951e_34%,#fff2a8_50%,#c47a10_68%,#7a4300_100%)] bg-clip-text font-semibold text-transparent drop-shadow-[0_0_8px_rgba(245,158,11,0.38)] dark:bg-[linear-gradient(110deg,#ffe58a_0%,#f6c945_38%,#fff8c9_50%,#d99a24_72%,#facc15_100%)]",
+          "min-w-0 truncate rounded-md bg-[linear-gradient(90deg,rgba(245,158,11,0.16),rgba(245,158,11,0.04)_62%,transparent)] py-0.5 pr-1 pl-1.5 font-semibold text-amber-800 shadow-[inset_0_-1px_0_rgba(245,158,11,0.24)] [text-shadow:0_1px_0_rgba(255,255,255,0.35)] dark:bg-[linear-gradient(90deg,rgba(245,158,11,0.18),rgba(245,158,11,0.06)_62%,transparent)] dark:text-amber-300 dark:shadow-[inset_0_-1px_0_rgba(251,191,36,0.24)] dark:[text-shadow:0_0_10px_rgba(245,158,11,0.28)]",
           blurred ? "privacy-blur" : undefined,
         )}
       >

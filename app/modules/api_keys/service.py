@@ -10,6 +10,7 @@ from typing import Protocol
 
 from app.core.auth.api_key_cache import get_api_key_cache
 from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
+from app.core.crypto import TokenEncryptor
 from app.core.usage.pricing import (
     UsageTokens,
     calculate_cost_from_usage,
@@ -59,6 +60,7 @@ class ApiKeysRepositoryProtocol(Protocol):
         is_active: bool | _Unset = ...,
         key_hash: str | _Unset = ...,
         key_prefix: str | _Unset = ...,
+        key_encrypted: bytes | None | _Unset = ...,
         commit: bool = True,
     ) -> ApiKey | None: ...
 
@@ -79,6 +81,10 @@ class ApiKeysRepositoryProtocol(Protocol):
     ) -> list[ApiKeyLimit]: ...
     async def replace_account_assignments(
         self, key_id: str, account_ids: list[str], *, commit: bool = True
+    ) -> None: ...
+    async def replace_allowed_groups(self, key_id: str, group_names: list[str], *, commit: bool = True) -> None: ...
+    async def replace_preferred_groups(
+        self, key_id: str, preferences: list[GroupPreferenceData], *, commit: bool = True
     ) -> None: ...
 
     async def increment_limit_usage(
@@ -197,6 +203,12 @@ class LimitRuleInput:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupPreferenceData:
+    group: str
+    priority: int = 100
+
+
+@dataclass(frozen=True, slots=True)
 class ApiKeyCreateData:
     name: str
     allowed_models: list[str] | None
@@ -204,6 +216,8 @@ class ApiKeyCreateData:
     enforced_reasoning_effort: str | None = None
     enforced_service_tier: str | None = None
     kyc_only: bool = False
+    allowed_groups: list[str] | None = None
+    preferred_groups: list[GroupPreferenceData] = field(default_factory=list)
     expires_at: datetime | None = None
     limits: list[LimitRuleInput] = field(default_factory=list)
 
@@ -222,6 +236,10 @@ class ApiKeyUpdateData:
     enforced_service_tier_set: bool = False
     kyc_only: bool | None = None
     kyc_only_set: bool = False
+    allowed_groups: list[str] | None = None
+    allowed_groups_set: bool = False
+    preferred_groups: list[GroupPreferenceData] | None = None
+    preferred_groups_set: bool = False
     expires_at: datetime | None = None
     expires_at_set: bool = False
     is_active: bool | None = None
@@ -249,6 +267,9 @@ class ApiKeyData:
     limits: list[LimitRuleData] = field(default_factory=list)
     usage_summary: "ApiKeyUsageSummaryData | None" = None
     kyc_only: bool = False
+    key: str | None = None
+    allowed_groups: list[str] = field(default_factory=list)
+    preferred_groups: list[GroupPreferenceData] = field(default_factory=list)
     account_assignment_scope_enabled: bool = False
     assigned_account_ids: list[str] = field(default_factory=list)
 
@@ -276,6 +297,7 @@ class ApiKeyUsageReservationData:
 class ApiKeysService:
     def __init__(self, repository: ApiKeysRepositoryProtocol) -> None:
         self._repository = repository
+        self._encryptor = TokenEncryptor()
 
     async def create_key(self, payload: ApiKeyCreateData) -> ApiKeyCreatedData:
         now = utcnow()
@@ -285,23 +307,35 @@ class ApiKeysService:
         enforced_model = _normalize_model_slug(payload.enforced_model)
         enforced_reasoning_effort = _normalize_reasoning_effort(payload.enforced_reasoning_effort)
         enforced_service_tier = _normalize_service_tier(payload.enforced_service_tier)
+        allowed_groups = _normalize_group_names(payload.allowed_groups)
+        preferred_groups = _normalize_group_preferences(payload.preferred_groups)
         _validate_model_enforcement(enforced_model=enforced_model, allowed_models=normalized_allowed_models)
         row = ApiKey(
             id=str(__import__("uuid").uuid4()),
             name=_normalize_name(payload.name),
             key_hash=_hash_key(plain_key),
             key_prefix=plain_key[:15],
+            key_encrypted=self._encryptor.encrypt(plain_key),
             allowed_models=_serialize_allowed_models(normalized_allowed_models),
             enforced_model=enforced_model,
             enforced_reasoning_effort=enforced_reasoning_effort,
             enforced_service_tier=enforced_service_tier,
-            kyc_only=payload.kyc_only,
+            kyc_only=False,
             expires_at=expires_at,
             is_active=True,
             created_at=now,
             last_used_at=None,
         )
         created = await self._repository.create(row)
+
+        if allowed_groups:
+            await self._repository.replace_allowed_groups(created.id, allowed_groups)
+        if preferred_groups:
+            await self._repository.replace_preferred_groups(created.id, preferred_groups)
+        if allowed_groups or preferred_groups:
+            created = await self._repository.get_by_id(created.id)
+            if created is None:
+                raise ValueError("Failed to create API key")
 
         if payload.limits:
             limit_rows = [_limit_input_to_row(li, created.id, now) for li in payload.limits]
@@ -345,6 +379,18 @@ class ApiKeysService:
         else:
             assigned_account_ids = None
             account_assignment_scope_enabled = _UNSET
+
+        allowed_groups: list[str] | None
+        if payload.allowed_groups_set:
+            allowed_groups = _normalize_group_names(payload.allowed_groups)
+        else:
+            allowed_groups = None
+
+        preferred_groups: list[GroupPreferenceData] | None
+        if payload.preferred_groups_set:
+            preferred_groups = _normalize_group_preferences(payload.preferred_groups or [])
+        else:
+            preferred_groups = None
 
         if payload.enforced_model_set:
             enforced_model = _normalize_model_slug(payload.enforced_model)
@@ -400,7 +446,7 @@ class ApiKeysService:
                     enforced_reasoning_effort if payload.enforced_reasoning_effort_set else _UNSET
                 ),
                 enforced_service_tier=(enforced_service_tier if payload.enforced_service_tier_set else _UNSET),
-                kyc_only=payload.kyc_only if payload.kyc_only_set and payload.kyc_only is not None else _UNSET,
+                kyc_only=False if payload.kyc_only_set else _UNSET,
                 account_assignment_scope_enabled=account_assignment_scope_enabled,
                 expires_at=expires_at if payload.expires_at_set else _UNSET,
                 is_active=(payload.is_active if payload.is_active_set and payload.is_active is not None else _UNSET),
@@ -412,6 +458,12 @@ class ApiKeysService:
             if payload.assigned_account_ids_set:
                 assert assigned_account_ids is not None
                 await self._repository.replace_account_assignments(key_id, assigned_account_ids, commit=False)
+            if payload.allowed_groups_set:
+                assert allowed_groups is not None
+                await self._repository.replace_allowed_groups(key_id, allowed_groups, commit=False)
+            if payload.preferred_groups_set:
+                assert preferred_groups is not None
+                await self._repository.replace_preferred_groups(key_id, preferred_groups, commit=False)
 
             if limit_rows is not None:
                 await self._repository.upsert_limits(key_id, limit_rows, commit=False)
@@ -423,6 +475,8 @@ class ApiKeysService:
 
         if (
             payload.assigned_account_ids_set
+            or payload.allowed_groups_set
+            or payload.preferred_groups_set
             or limit_rows is not None
             or payload.name_set
             or payload.allowed_models_set
@@ -465,6 +519,7 @@ class ApiKeysService:
             key_id,
             key_hash=_hash_key(plain_key),
             key_prefix=plain_key[:15],
+            key_encrypted=self._encryptor.encrypt(plain_key),
         )
         if updated is None:
             raise ApiKeyNotFoundError(f"API key not found: {key_id}")
@@ -894,6 +949,44 @@ def _normalize_assigned_account_ids(account_ids: list[str] | None) -> list[str]:
     return normalized
 
 
+def _normalize_group_name(group_name: str) -> str:
+    normalized = group_name.strip().lower()
+    if not normalized:
+        raise ValueError("Group name is required")
+    if len(normalized) > 128:
+        raise ValueError("Group name must be at most 128 characters")
+    return normalized
+
+
+def _normalize_group_names(group_names: list[str] | None) -> list[str]:
+    if not group_names:
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for group_name in group_names:
+        value = _normalize_group_name(group_name)
+        if value in seen:
+            continue
+        normalized.append(value)
+        seen.add(value)
+    return normalized
+
+
+def _normalize_group_preferences(preferences: list[GroupPreferenceData] | None) -> list[GroupPreferenceData]:
+    if not preferences:
+        return []
+    normalized_by_group: dict[str, GroupPreferenceData] = {}
+    for preference in preferences:
+        group = _normalize_group_name(preference.group)
+        priority = int(preference.priority)
+        if priority < 0 or priority > 100000:
+            raise ValueError("Group priority must be between 0 and 100000")
+        existing = normalized_by_group.get(group)
+        if existing is None or priority < existing.priority:
+            normalized_by_group[group] = GroupPreferenceData(group=group, priority=priority)
+    return sorted(normalized_by_group.values(), key=lambda item: (item.priority, item.group))
+
+
 def _normalize_model_slug(value: str | None) -> str | None:
     if value is None:
         return None
@@ -1107,6 +1200,8 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
         enforced_reasoning_effort=data.enforced_reasoning_effort,
         enforced_service_tier=data.enforced_service_tier,
         kyc_only=data.kyc_only,
+        allowed_groups=data.allowed_groups,
+        preferred_groups=data.preferred_groups,
         expires_at=data.expires_at,
         is_active=data.is_active,
         created_at=data.created_at,
@@ -1122,6 +1217,8 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
 def _to_api_key_data(row: ApiKey, *, usage_summary: ApiKeyUsageSummaryData | None = None) -> ApiKeyData:
     limits = [_to_limit_rule_data(limit) for limit in row.limits] if row.limits else []
     account_assignments = getattr(row, "account_assignments", [])
+    allowed_group_assignments = getattr(row, "allowed_group_assignments", [])
+    preferred_group_assignments = getattr(row, "preferred_group_assignments", [])
     return ApiKeyData(
         id=row.id,
         name=row.name,
@@ -1131,6 +1228,15 @@ def _to_api_key_data(row: ApiKey, *, usage_summary: ApiKeyUsageSummaryData | Non
         enforced_reasoning_effort=_normalize_reasoning_effort_lenient(row.enforced_reasoning_effort),
         enforced_service_tier=_normalize_service_tier_lenient(row.enforced_service_tier),
         kyc_only=bool(getattr(row, "kyc_only", False)),
+        key=_decrypt_stored_api_key(getattr(row, "key_encrypted", None)),
+        allowed_groups=sorted({assignment.group_name for assignment in allowed_group_assignments}),
+        preferred_groups=sorted(
+            (
+                GroupPreferenceData(group=assignment.group_name, priority=int(assignment.priority))
+                for assignment in preferred_group_assignments
+            ),
+            key=lambda item: (item.priority, item.group),
+        ),
         expires_at=row.expires_at,
         is_active=row.is_active,
         created_at=row.created_at,
@@ -1140,6 +1246,15 @@ def _to_api_key_data(row: ApiKey, *, usage_summary: ApiKeyUsageSummaryData | Non
         account_assignment_scope_enabled=getattr(row, "account_assignment_scope_enabled", False),
         assigned_account_ids=[assignment.account_id for assignment in account_assignments],
     )
+
+
+def _decrypt_stored_api_key(encrypted: bytes | None) -> str | None:
+    if not encrypted:
+        return None
+    try:
+        return TokenEncryptor().decrypt(encrypted)
+    except Exception:
+        return None
 
 
 def _to_usage_summary_data(summary: ApiKeyUsageSummary | None) -> ApiKeyUsageSummaryData | None:

@@ -7,10 +7,11 @@ import os
 import signal
 import tempfile
 import textwrap
-import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from app.modules.refresh_api_key import load_codex_lb_refresh_api_key
 
 
 def utcnow() -> datetime:
@@ -173,7 +174,7 @@ class ScholarService:
             self._write_cache()
 
     async def _run_codex_refresh(self) -> dict[str, Any]:
-        api_key = self._load_codex_lb_api_key()
+        api_key = await self._load_codex_lb_api_key()
         if not api_key:
             raise RuntimeError("Scholar refresh is not configured with a usable codex-lb API key.")
 
@@ -438,21 +439,11 @@ class ScholarService:
         temp_path.write_text(json.dumps(self._snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         temp_path.replace(self._cache_file)
 
-    def _load_codex_lb_api_key(self) -> str | None:
-        for env_key in ("CODEX_LB_SCHOLAR_API_KEY", "CODEX_LB_API_KEY", "OPENAI_API_KEY"):
-            value = os.getenv(env_key)
-            if value:
-                return value
-
-        auth_toml = Path.home() / ".codex" / "auth.toml"
-        if not auth_toml.is_file():
-            return None
-        try:
-            auth = tomllib.loads(auth_toml.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        value = auth.get("OPENAI_API_KEY")
-        return value if isinstance(value, str) and value else None
+    async def _load_codex_lb_api_key(self) -> str | None:
+        return await load_codex_lb_refresh_api_key(
+            value_env_keys=("CODEX_LB_SCHOLAR_API_KEY",),
+            name_env_keys=("CODEX_LB_SCHOLAR_API_KEY_NAME",),
+        )
 
     def _load_topic_cache(self) -> list[dict[str, Any]]:
         payload = json.loads(self._topic_cache_file.read_text(encoding="utf-8"))

@@ -19,7 +19,12 @@ export type AccountDetailProps = {
   onResume: (accountId: string) => void;
   onDelete: (accountId: string) => void;
   onReauth: () => void;
-  onUpdateRouting: (accountId: string, configuredPriority: number, kycEnabled?: boolean) => Promise<void>;
+  onUpdateRouting: (
+    accountId: string,
+    configuredPriority: number,
+    kycEnabled?: boolean,
+    groups?: string[],
+  ) => Promise<void>;
   onTestAvailability: (accountId: string) => Promise<void>;
 };
 

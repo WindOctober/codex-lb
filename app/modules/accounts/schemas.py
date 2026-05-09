@@ -74,10 +74,12 @@ class AccountSummary(DashboardModel):
     display_name: str
     plan_type: str
     provider_kind: str = "openai_oauth"
+    stored_api_key: str | None = None
     routing_tier: str = "openai_paid"
     routing_priority: int = 0
     configured_priority: int = 0
     kyc_enabled: bool = False
+    groups: list[str] = Field(default_factory=list)
     status: str
     usage: AccountUsage | None = None
     reset_at_primary: datetime | None = None
@@ -124,6 +126,7 @@ class ApiProviderCreateResponse(AccountImportResponse):
 class AccountUpdateRequest(DashboardModel):
     configured_priority: int = Field(ge=0, le=100000)
     kyc_enabled: bool | None = None
+    groups: list[str] | None = None
 
 
 class AccountPauseResponse(DashboardModel):

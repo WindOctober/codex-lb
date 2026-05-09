@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 import app.modules.proxy.load_balancer as load_balancer_module
+from app.core.account_groups import account_builtin_group_names
 from app.core.balancer.types import UpstreamError
 from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import ModelRegistrySnapshot
@@ -19,6 +20,7 @@ from app.core.utils.time import utcnow
 from app.db.models import (
     ACCOUNT_PROVIDER_API_KEY,
     Account,
+    AccountGroupMembership,
     AccountStatus,
     AdditionalUsageHistory,
     StickySession,
@@ -33,7 +35,8 @@ from app.modules.proxy.load_balancer import (
     NO_PLAN_SUPPORT_FOR_MODEL,
     LoadBalancer,
     RuntimeState,
-    _filter_accounts_for_kyc_access,
+    _build_states,
+    _filter_accounts_for_allowed_groups,
 )
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickySessionsRepository
@@ -74,44 +77,114 @@ def _make_api_key_provider_account(
     return account
 
 
-def test_filter_accounts_for_kyc_access_enforces_kyc_only_keys() -> None:
+def test_filter_accounts_for_allowed_groups_treats_kyc_accounts_as_kyc_group() -> None:
     normal = _make_account("normal")
     kyc = _make_account("kyc")
     kyc.kyc_enabled = True
 
-    filtered = _filter_accounts_for_kyc_access(
-        [normal, kyc],
-        kyc_only=True,
-        kyc_routing_enforcement_enabled=True,
-    )
+    filtered = _filter_accounts_for_allowed_groups([normal, kyc], frozenset({"kyc"}))
 
     assert [account.id for account in filtered] == ["kyc"]
 
 
-def test_filter_accounts_for_kyc_access_blocks_kyc_accounts_for_regular_keys() -> None:
+def test_filter_accounts_for_allowed_groups_treats_non_kyc_accounts_as_general_group() -> None:
     normal = _make_account("normal")
+    normal.plan_type = "free"
     kyc = _make_account("kyc")
     kyc.kyc_enabled = True
+    pro = _make_account("pro")
+    pro.plan_type = "pro"
+    provider = _make_api_key_provider_account("provider", supported_models=["gpt-5"])
 
-    filtered = _filter_accounts_for_kyc_access(
-        [normal, kyc],
-        kyc_only=False,
-        kyc_routing_enforcement_enabled=True,
-    )
+    filtered = _filter_accounts_for_allowed_groups([normal, kyc, pro, provider], frozenset({"general"}))
 
     assert [account.id for account in filtered] == ["normal"]
 
 
-def test_filter_accounts_for_kyc_access_ignores_flag_when_enforcement_disabled() -> None:
+def test_filter_accounts_for_allowed_groups_treats_plus_accounts_as_plus_group() -> None:
+    free = _make_account("free")
+    free.plan_type = "free"
+    plus = _make_account("plus")
+
+    filtered = _filter_accounts_for_allowed_groups([free, plus], frozenset({"plus"}))
+
+    assert [account.id for account in filtered] == ["plus"]
+
+
+def test_filter_accounts_for_allowed_groups_treats_pro_accounts_as_pro_group() -> None:
+    normal = _make_account("normal")
+    pro = _make_account("pro")
+    pro.plan_type = "pro"
+
+    filtered = _filter_accounts_for_allowed_groups([normal, pro], frozenset({"pro"}))
+
+    assert [account.id for account in filtered] == ["pro"]
+
+
+def test_filter_accounts_for_allowed_groups_allows_pro_kyc_account_in_both_builtin_groups() -> None:
+    pro_kyc = _make_account("pro-kyc")
+    pro_kyc.plan_type = "pro"
+    pro_kyc.kyc_enabled = True
+
+    assert _filter_accounts_for_allowed_groups([pro_kyc], frozenset({"pro"})) == [pro_kyc]
+    assert _filter_accounts_for_allowed_groups([pro_kyc], frozenset({"kyc"})) == [pro_kyc]
+
+
+def test_filter_accounts_for_allowed_groups_tracks_plan_changes_for_builtin_plus_group() -> None:
+    account = _make_account("account")
+    assert _filter_accounts_for_allowed_groups([account], frozenset({"plus"})) == [account]
+
+    account.plan_type = "free"
+
+    assert _filter_accounts_for_allowed_groups([account], frozenset({"plus"})) == []
+    assert _filter_accounts_for_allowed_groups([account], frozenset({"general"})) == [account]
+
+
+def test_build_states_prefers_builtin_plus_group_priority() -> None:
+    free = _make_account("free")
+    free.plan_type = "free"
+    plus = _make_account("plus")
+
+    states, _ = _build_states(
+        accounts=[free, plus],
+        latest_primary={},
+        latest_secondary={},
+        runtime={},
+        preferred_group_priorities={"plus": 10},
+    )
+
+    ranks = {state.account_id: state.group_priority_rank for state in states}
+    assert ranks == {"free": 1000000, "plus": 10}
+
+
+def test_filter_accounts_for_allowed_groups_treats_api_key_providers_as_unique_provider_groups() -> None:
+    normal = _make_account("normal")
+    provider = _make_api_key_provider_account("provider", supported_models=["gpt-5"])
+    provider.email = "Provider One (api.example)"
+    provider_group = next(group for group in account_builtin_group_names(provider) if group.startswith("provider:"))
+
+    filtered = _filter_accounts_for_allowed_groups([normal, provider], frozenset({provider_group}))
+
+    assert [account.id for account in filtered] == ["provider"]
+
+
+def test_filter_accounts_for_allowed_groups_matches_explicit_memberships() -> None:
+    fast = _make_account("fast")
+    slow = _make_account("slow")
+    fast.group_memberships = [AccountGroupMembership(account_id=fast.id, group_name="fast")]
+    slow.group_memberships = [AccountGroupMembership(account_id=slow.id, group_name="slow")]
+
+    filtered = _filter_accounts_for_allowed_groups([fast, slow], frozenset({"fast"}))
+
+    assert [account.id for account in filtered] == ["fast"]
+
+
+def test_filter_accounts_for_allowed_groups_allows_all_when_unscoped() -> None:
     normal = _make_account("normal")
     kyc = _make_account("kyc")
     kyc.kyc_enabled = True
 
-    filtered = _filter_accounts_for_kyc_access(
-        [normal, kyc],
-        kyc_only=True,
-        kyc_routing_enforcement_enabled=False,
-    )
+    filtered = _filter_accounts_for_allowed_groups([normal, kyc], None)
 
     assert [account.id for account in filtered] == ["normal", "kyc"]
 

@@ -45,7 +45,7 @@ export function createApiProvider(payload: ApiProviderCreateRequest) {
 
 export function updateAccountRouting(
   accountId: string,
-  payload: { configuredPriority: number; kycEnabled?: boolean },
+  payload: { configuredPriority: number; kycEnabled?: boolean; groups?: string[] },
 ) {
   const validated = AccountUpdateRequestSchema.parse(payload);
   return patch(`${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`, AccountSummarySchema, {

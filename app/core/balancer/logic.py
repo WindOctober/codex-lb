@@ -61,6 +61,7 @@ class AccountState:
     deactivation_reason: str | None = None
     plan_type: str | None = None
     capacity_credits: float | None = None
+    group_priority_rank: int = 1000000
     source_rank: int = 0
     configured_priority: int = 0
     health_tier: int = 0
@@ -72,11 +73,18 @@ class SelectionResult:
     error_message: str | None
 
 
-def _usage_sort_key(state: AccountState) -> tuple[float, float, float, float, str]:
+def _usage_sort_key(state: AccountState) -> tuple[int, float, float, float, float, str]:
     primary_used = state.used_percent if state.used_percent is not None else 0.0
     secondary_used = state.secondary_used_percent if state.secondary_used_percent is not None else primary_used
     last_selected = state.last_selected_at or 0.0
-    return float(state.source_rank), secondary_used, primary_used, last_selected, state.account_id
+    return (
+        state.group_priority_rank,
+        float(state.source_rank),
+        secondary_used,
+        primary_used,
+        last_selected,
+        state.account_id,
+    )
 
 
 def _reset_bucket_days(state: AccountState, current: float) -> int:
@@ -221,14 +229,14 @@ def select_account(
                 return SelectionResult(None, f"Rate limit exceeded. Try again in {wait_seconds:.0f}s")
             return SelectionResult(None, "No available accounts")
 
-    def _reset_first_sort_key(state: AccountState) -> tuple[float, int, float, float, float, str]:
+    def _reset_first_sort_key(state: AccountState) -> tuple[int, float, int, float, float, float, str]:
         reset_bucket_days = _reset_bucket_days(state, current)
-        source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
-        return source_rank, reset_bucket_days, secondary_used, primary_used, last_selected, account_id
+        group_rank, source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
+        return group_rank, source_rank, reset_bucket_days, secondary_used, primary_used, last_selected, account_id
 
-    def _round_robin_sort_key(state: AccountState) -> tuple[float, str]:
+    def _round_robin_sort_key(state: AccountState) -> tuple[int, float, str]:
         # Pick the least recently selected account, then stabilize by account_id.
-        return state.last_selected_at or 0.0, state.account_id
+        return state.group_priority_rank, state.last_selected_at or 0.0, state.account_id
 
     healthy = [s for s in available if s.health_tier == HEALTH_TIER_HEALTHY]
     probing = [s for s in available if s.health_tier == HEALTH_TIER_PROBING]
@@ -241,6 +249,8 @@ def select_account(
         candidate_pool = (
             _prefer_earlier_reset_candidates(effective_pool, current) if prefer_earlier_reset else effective_pool
         )
+        min_group_rank = min(state.group_priority_rank for state in candidate_pool)
+        candidate_pool = [state for state in candidate_pool if state.group_priority_rank == min_group_rank]
         min_source_rank = min(state.source_rank for state in candidate_pool)
         candidate_pool = [state for state in candidate_pool if state.source_rank == min_source_rank]
         if deterministic_probe:
@@ -268,9 +278,17 @@ def _remaining_secondary_credits(state: AccountState) -> float:
     return max(0.0, capacity * (1.0 - min(used_pct, 100.0) / 100.0))
 
 
-def _capacity_probe_sort_key(state: AccountState) -> tuple[float, float, float, float, float, str]:
-    source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
-    return (source_rank, -_remaining_secondary_credits(state), secondary_used, primary_used, last_selected, account_id)
+def _capacity_probe_sort_key(state: AccountState) -> tuple[int, float, float, float, float, float, str]:
+    group_rank, source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
+    return (
+        group_rank,
+        source_rank,
+        -_remaining_secondary_credits(state),
+        secondary_used,
+        primary_used,
+        last_selected,
+        account_id,
+    )
 
 
 def _select_capacity_weighted(available: list[AccountState]) -> AccountState:

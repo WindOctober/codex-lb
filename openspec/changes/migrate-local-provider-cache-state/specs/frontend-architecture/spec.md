@@ -17,6 +17,7 @@ The Accounts page SHALL let operators manage OpenAI OAuth accounts and API-key u
 - **WHEN** an operator requests an availability check for an account
 - **THEN** the app calls `POST /api/accounts/{account_id}/availability`
 - **AND** the UI reports the pass/fail result
+- **AND** any plan label refreshed during the availability check comes from the ChatGPT usage/rate-limit payload instead of OAuth token-refresh ID token claims
 
 ### Requirement: Cache-backed news and scholar pages
 The dashboard SHALL expose News and Scholar pages that render the migrated cache snapshots from fork backend APIs.

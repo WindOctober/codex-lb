@@ -21,6 +21,7 @@ from app.modules.api_keys.service import (
     ApiKeyData,
     ApiKeyNotFoundError,
     ApiKeyUpdateData,
+    GroupPreferenceData,
     LimitRuleInput,
 )
 
@@ -41,6 +42,11 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         enforced_reasoning_effort=row.enforced_reasoning_effort,
         enforced_service_tier=row.enforced_service_tier,
         kyc_only=row.kyc_only,
+        key=row.key,
+        allowed_groups=row.allowed_groups,
+        preferred_groups=[
+            {"group": preference.group, "priority": preference.priority} for preference in row.preferred_groups
+        ],
         expires_at=row.expires_at,
         is_active=row.is_active,
         account_assignment_scope_enabled=row.account_assignment_scope_enabled,
@@ -70,6 +76,22 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
             else None
         ),
     )
+
+
+def _allowed_groups_from_legacy_kyc(
+    allowed_groups: list[str] | None,
+    *,
+    legacy_kyc_only: bool | None,
+) -> list[str] | None:
+    if allowed_groups is not None:
+        return allowed_groups
+    if legacy_kyc_only:
+        return ["kyc"]
+    return None
+
+
+def _allowed_groups_set_from_fields(fields: set[str], *, legacy_kyc_only: bool | None) -> bool:
+    return "allowed_groups" in fields or legacy_kyc_only is True
 
 
 def _build_limit_inputs(payload: ApiKeyCreateRequest | ApiKeyUpdateRequest) -> list[LimitRuleInput]:
@@ -118,7 +140,15 @@ async def create_api_key(
                 enforced_model=payload.enforced_model,
                 enforced_reasoning_effort=payload.enforced_reasoning_effort,
                 enforced_service_tier=payload.enforced_service_tier,
-                kyc_only=payload.kyc_only,
+                kyc_only=False,
+                allowed_groups=_allowed_groups_from_legacy_kyc(
+                    payload.allowed_groups,
+                    legacy_kyc_only=payload.kyc_only,
+                ),
+                preferred_groups=[
+                    GroupPreferenceData(group=item.group, priority=item.priority)
+                    for item in (payload.preferred_groups or [])
+                ],
                 expires_at=payload.expires_at,
                 limits=limit_inputs,
             )
@@ -131,10 +161,7 @@ async def create_api_key(
         actor_ip=request.client.host if request.client else None,
         details={"key_id": created.id},
     )
-    return ApiKeyCreateResponse(
-        **resp.model_dump(),
-        key=created.key,
-    )
+    return ApiKeyCreateResponse(**resp.model_dump())
 
 
 @router.get("/", response_model=list[ApiKeyResponse])
@@ -158,6 +185,8 @@ async def update_api_key(
     limit_inputs = _build_limit_inputs(payload) if limits_set else None
 
     update = ApiKeyUpdateData(
+        kyc_only=False,
+        kyc_only_set="kyc_only" in fields,
         name=payload.name,
         name_set="name" in fields,
         allowed_models=payload.allowed_models,
@@ -168,8 +197,15 @@ async def update_api_key(
         enforced_reasoning_effort_set="enforced_reasoning_effort" in fields,
         enforced_service_tier=payload.enforced_service_tier,
         enforced_service_tier_set="enforced_service_tier" in fields,
-        kyc_only=payload.kyc_only,
-        kyc_only_set="kyc_only" in fields,
+        allowed_groups=_allowed_groups_from_legacy_kyc(
+            payload.allowed_groups,
+            legacy_kyc_only=payload.kyc_only,
+        ),
+        allowed_groups_set=_allowed_groups_set_from_fields(fields, legacy_kyc_only=payload.kyc_only),
+        preferred_groups=[
+            GroupPreferenceData(group=item.group, priority=item.priority) for item in (payload.preferred_groups or [])
+        ],
+        preferred_groups_set="preferred_groups" in fields,
         expires_at=payload.expires_at,
         expires_at_set="expires_at" in fields,
         is_active=payload.is_active,
@@ -223,10 +259,7 @@ async def regenerate_api_key(
     except ApiKeyNotFoundError as exc:
         raise DashboardNotFoundError(str(exc)) from exc
     resp = _to_response(row)
-    return ApiKeyCreateResponse(
-        **resp.model_dump(),
-        key=row.key,
-    )
+    return ApiKeyCreateResponse(**resp.model_dump())
 
 
 @router.get("/{key_id}/trends", response_model=ApiKeyTrendsResponse)

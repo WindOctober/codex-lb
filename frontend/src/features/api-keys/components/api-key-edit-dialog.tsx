@@ -23,6 +23,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ExpiryPicker } from "@/features/api-keys/components/expiry-picker";
+import { GroupSelector } from "@/features/api-keys/components/group-selector";
 import { LimitRulesEditor } from "@/features/api-keys/components/limit-rules-editor";
 import { AccountMultiSelect } from "@/features/api-keys/components/account-multi-select";
 import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-select";
@@ -71,6 +72,10 @@ function hasSelectionChange(initialIds: string[], nextIds: string[]): boolean {
   return nextIds.some((accountId) => !initialIdSet.has(accountId));
 }
 
+function hasStringListChange(initial: string[], next: string[]): boolean {
+  return initial.join(",") !== next.join(",");
+}
+
 function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps) {
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -92,20 +97,23 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
   const [enforcedServiceTier, setEnforcedServiceTier] = useState<string>(
     apiKey.enforcedServiceTier || "none",
   );
-  const [kycOnly, setKycOnly] = useState<boolean>(apiKey.kycOnly);
+  const [allowedGroups, setAllowedGroups] = useState<string[]>(apiKey.allowedGroups ?? []);
+  const [preferredGroups, setPreferredGroups] = useState<string[]>(
+    (apiKey.preferredGroups ?? []).map((item) => item.group),
+  );
 
   const handleSubmit = async (values: FormValues) => {
     const normalizedLimits = normalizeLimitRules(limitRules);
     const shouldSubmitAssignedAccountIds =
       hasSelectionChange(apiKey.assignedAccountIds, selectedAccountIds) ||
       (apiKey.accountAssignmentScopeEnabled && selectedAccountIds.length === 0);
+    const preferredGroupPreferences = preferredGroups.map((group, index) => ({ group, priority: (index + 1) * 10 }));
     const payload: ApiKeyUpdateRequest = {
       name: values.name,
       allowedModels: selectedModels.length > 0 ? selectedModels : null,
       enforcedModel: enforcedModel.trim() ? enforcedModel.trim() : null,
       enforcedReasoningEffort: enforcedReasoningEffort === "none" ? null : enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
       enforcedServiceTier: enforcedServiceTier === "none" ? null : enforcedServiceTier as ServiceTierType,
-      kycOnly,
       expiresAt: expiresAt?.toISOString() ?? null,
       isActive: values.isActive,
     };
@@ -114,6 +122,12 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
     }
     if (hasLimitRuleChanges(initialLimitRules, limitRules)) {
       payload.limits = normalizedLimits;
+    }
+    if (hasStringListChange(apiKey.allowedGroups ?? [], allowedGroups)) {
+      payload.allowedGroups = allowedGroups;
+    }
+    if (hasStringListChange((apiKey.preferredGroups ?? []).map((item) => item.group), preferredGroups)) {
+      payload.preferredGroups = preferredGroupPreferences;
     }
     try {
       await onSubmit(payload);
@@ -155,14 +169,26 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
               <AccountMultiSelect value={selectedAccountIds} onChange={setSelectedAccountIds} />
             </div>
 
-            <div className="flex items-center justify-between rounded-md border p-2">
-              <div>
-                <div className="text-sm font-medium">KYC-only</div>
-                <div className="text-xs text-muted-foreground">
-                  This key can only route accounts marked as KYC.
-                </div>
-              </div>
-              <Switch checked={kycOnly} onCheckedChange={setKycOnly} />
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Allowed groups</div>
+              <GroupSelector
+                value={allowedGroups}
+                onChange={setAllowedGroups}
+                emptyLabel='No restriction: all groups are allowed. OpenAI OAuth accounts use "general", "plus", "pro", or "kyc"; providers each have their own "provider:*" group.'
+                addPlaceholder="Add allowed group"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Preferred groups</div>
+              <GroupSelector
+                value={preferredGroups}
+                onChange={setPreferredGroups}
+                emptyLabel="No preference: route by the global strategy."
+                addPlaceholder="Add preferred group"
+                ordered
+              />
+              <p className="text-xs text-muted-foreground">Order sets priority from highest to lowest.</p>
             </div>
 
             <div className="space-y-1">

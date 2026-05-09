@@ -24,6 +24,11 @@ class LimitRuleResponse(DashboardModel):
     reset_at: datetime
 
 
+class GroupPreference(DashboardModel):
+    group: str = Field(min_length=1, max_length=128)
+    priority: int = Field(default=100, ge=0, le=100000)
+
+
 class ApiKeyCreateRequest(DashboardModel):
     name: str = Field(min_length=1, max_length=128)
     allowed_models: list[str] | None = None
@@ -31,6 +36,8 @@ class ApiKeyCreateRequest(DashboardModel):
     enforced_reasoning_effort: str | None = Field(default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh)$")
     enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
     kyc_only: bool = False
+    allowed_groups: list[str] | None = None
+    preferred_groups: list[GroupPreference] | None = None
     weekly_token_limit: int | None = Field(default=None, ge=1)
     expires_at: datetime | None = None
     limits: list[LimitRuleCreate] | None = None
@@ -43,6 +50,8 @@ class ApiKeyUpdateRequest(DashboardModel):
     enforced_reasoning_effort: str | None = Field(default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh)$")
     enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
     kyc_only: bool | None = None
+    allowed_groups: list[str] | None = None
+    preferred_groups: list[GroupPreference] | None = None
     weekly_token_limit: int | None = Field(default=None, ge=1)
     expires_at: datetime | None = None
     is_active: bool | None = None
@@ -67,6 +76,9 @@ class ApiKeyResponse(DashboardModel):
     enforced_reasoning_effort: str | None
     enforced_service_tier: str | None
     kyc_only: bool = False
+    key: str | None = None
+    allowed_groups: list[str] = Field(default_factory=list)
+    preferred_groups: list[GroupPreference] = Field(default_factory=list)
     expires_at: datetime | None
     is_active: bool
     account_assignment_scope_enabled: bool = False

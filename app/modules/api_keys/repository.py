@@ -13,7 +13,9 @@ from app.db.models import (
     Account,
     ApiKey,
     ApiKeyAccountAssignment,
+    ApiKeyAllowedGroup,
     ApiKeyLimit,
+    ApiKeyPreferredGroup,
     ApiKeyUsageReservation,
     ApiKeyUsageReservationItem,
     LimitType,
@@ -90,6 +92,8 @@ class ApiKeysRepository:
             .options(
                 selectinload(ApiKey.limits),
                 selectinload(ApiKey.account_assignments),
+                selectinload(ApiKey.allowed_group_assignments),
+                selectinload(ApiKey.preferred_group_assignments),
             )
         )
 
@@ -199,6 +203,7 @@ class ApiKeysRepository:
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
         key_prefix: str | _Unset = _UNSET,
+        key_encrypted: bytes | None | _Unset = _UNSET,
         commit: bool = True,
     ) -> ApiKey | None:
         row = await self.get_by_id(key_id)
@@ -237,6 +242,9 @@ class ApiKeysRepository:
         if key_prefix is not _UNSET:
             assert isinstance(key_prefix, str)
             row.key_prefix = key_prefix
+        if key_encrypted is not _UNSET:
+            assert key_encrypted is None or isinstance(key_encrypted, bytes)
+            row.key_encrypted = key_encrypted
         if commit:
             await self._session.commit()
         return await self.get_by_id(key_id)
@@ -314,6 +322,38 @@ class ApiKeysRepository:
         parent = await self._session.get(ApiKey, key_id)
         if parent is not None:
             await self._session.refresh(parent, attribute_names=["account_assignments"])
+
+    async def replace_allowed_groups(self, key_id: str, group_names: list[str], *, commit: bool = True) -> None:
+        await self._session.execute(delete(ApiKeyAllowedGroup).where(ApiKeyAllowedGroup.api_key_id == key_id))
+        for group_name in group_names:
+            self._session.add(ApiKeyAllowedGroup(api_key_id=key_id, group_name=group_name))
+        if commit:
+            await self._session.commit()
+        parent = await self._session.get(ApiKey, key_id)
+        if parent is not None:
+            await self._session.refresh(parent, attribute_names=["allowed_group_assignments"])
+
+    async def replace_preferred_groups(
+        self,
+        key_id: str,
+        preferences,
+        *,
+        commit: bool = True,
+    ) -> None:
+        await self._session.execute(delete(ApiKeyPreferredGroup).where(ApiKeyPreferredGroup.api_key_id == key_id))
+        for preference in preferences:
+            self._session.add(
+                ApiKeyPreferredGroup(
+                    api_key_id=key_id,
+                    group_name=preference.group,
+                    priority=preference.priority,
+                )
+            )
+        if commit:
+            await self._session.commit()
+        parent = await self._session.get(ApiKey, key_id)
+        if parent is not None:
+            await self._session.refresh(parent, attribute_names=["preferred_group_assignments"])
 
     async def increment_limit_usage(
         self,

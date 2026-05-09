@@ -54,11 +54,13 @@ export function useAccountMutations() {
       accountId,
       configuredPriority,
       kycEnabled,
+      groups,
     }: {
       accountId: string;
       configuredPriority: number;
       kycEnabled?: boolean;
-    }) => updateAccountRouting(accountId, { configuredPriority, kycEnabled }),
+      groups?: string[];
+    }) => updateAccountRouting(accountId, { configuredPriority, kycEnabled, groups }),
     onSuccess: () => {
       toast.success("Routing settings updated");
       invalidateAccountRelatedQueries(queryClient);

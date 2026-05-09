@@ -948,7 +948,7 @@ def test_select_account_capacity_weighted_pro_plus_same_usage_prefers_pro_by_cap
         used_percent=50.0,
         secondary_used_percent=10.0,
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
     plus = AccountState(
         "plus",
@@ -966,7 +966,7 @@ def test_select_account_capacity_weighted_pro_plus_same_usage_prefers_pro_by_cap
         counts[result.account.account_id] += 1
 
     pro_ratio = counts["pro"] / n
-    expected_pro_ratio = 50400.0 / (50400.0 + 7560.0)
+    expected_pro_ratio = 151200.0 / (151200.0 + 7560.0)
     assert abs(pro_ratio - expected_pro_ratio) <= 0.05
 
 
@@ -1042,7 +1042,7 @@ def test_select_account_capacity_weighted_all_exhausted_falls_back_deterministic
         used_percent=40.0,
         secondary_used_percent=100.0,
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
 
     for _ in range(50):
@@ -1109,7 +1109,7 @@ def test_select_account_capacity_weighted_unknown_plan_uses_conservative_fallbac
         used_percent=0.0,
         secondary_used_percent=0.0,
         plan_type="plus",
-        capacity_credits=7560.0,
+        capacity_credits=11340.0,
     )
 
     counts = {"unknown-plan": 0, "plus": 0}
@@ -1140,7 +1140,7 @@ def test_select_account_capacity_weighted_education_alias_uses_edu_capacity():
         used_percent=0.0,
         secondary_used_percent=0.0,
         plan_type="plus",
-        capacity_credits=7560.0,
+        capacity_credits=11340.0,
     )
 
     counts = {"education": 0, "plus": 0}
@@ -1162,7 +1162,7 @@ def test_select_account_capacity_weighted_three_tiers_distribution_matches_capac
         used_percent=10.0,
         secondary_used_percent=0.0,
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
     plus = AccountState(
         "plus",
@@ -1190,9 +1190,9 @@ def test_select_account_capacity_weighted_three_tiers_distribution_matches_capac
     pro_ratio = counts["pro"] / n
     plus_ratio = counts["plus"] / n
     free_ratio = counts["free"] / n
-    total_capacity = 50400.0 + 7560.0 + 1134.0
+    total_capacity = 151200.0 + 7560.0 + 1134.0
 
-    assert abs(pro_ratio - (50400.0 / total_capacity)) <= 0.05
+    assert abs(pro_ratio - (151200.0 / total_capacity)) <= 0.05
     assert abs(plus_ratio - (7560.0 / total_capacity)) <= 0.05
     assert abs(free_ratio - (1134.0 / total_capacity)) <= 0.05
     assert pro_ratio > plus_ratio > free_ratio
@@ -1217,7 +1217,7 @@ def test_select_account_capacity_weighted_prefers_earlier_reset_bucket():
         secondary_used_percent=10.0,
         secondary_reset_at=int(now + 4 * 24 * 3600),
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
 
     for _ in range(100):
@@ -1242,7 +1242,7 @@ def test_select_account_capacity_weighted_prefers_capacity_within_same_reset_buc
         secondary_used_percent=10.0,
         secondary_reset_at=int(now + 3 * 3600),
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
     plus = AccountState(
         "plus",
@@ -1260,7 +1260,7 @@ def test_select_account_capacity_weighted_prefers_capacity_within_same_reset_buc
         secondary_used_percent=0.0,
         secondary_reset_at=int(now + 5 * 24 * 3600),
         plan_type="enterprise",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
 
     counts = {"pro": 0, "plus": 0, "late": 0}
@@ -1276,7 +1276,7 @@ def test_select_account_capacity_weighted_prefers_capacity_within_same_reset_buc
 
     assert counts["late"] == 0
     pro_ratio = counts["pro"] / n
-    expected_pro_ratio = 50400.0 / (50400.0 + 7560.0)
+    expected_pro_ratio = 151200.0 / (151200.0 + 7560.0)
     assert abs(pro_ratio - expected_pro_ratio) <= 0.05
 
 
@@ -1290,7 +1290,7 @@ def test_select_account_capacity_weighted_with_prefer_deprioritizes_missing_rese
         secondary_used_percent=0.0,
         secondary_reset_at=None,
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
     known_reset = AccountState(
         "known-reset",
@@ -1332,7 +1332,7 @@ def test_select_account_capacity_weighted_with_prefer_falls_back_when_earliest_b
         secondary_used_percent=100.0,
         secondary_reset_at=int(now + 3 * 3600),
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
     later_healthy = AccountState(
         "later-healthy",
@@ -1341,7 +1341,7 @@ def test_select_account_capacity_weighted_with_prefer_falls_back_when_earliest_b
         secondary_used_percent=0.0,
         secondary_reset_at=int(now + 3 * 24 * 3600),
         plan_type="enterprise",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
 
     for _ in range(100):

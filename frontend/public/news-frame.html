@@ -4,33 +4,37 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Codex LB 情报页</title>
-    <link rel="stylesheet" href="/news-frame.css?v=20260423-news" />
-    <script type="module" src="/news-frame.js?v=20260423-news"></script>
+    <link rel="stylesheet" href="/news-frame.css?v=20260502-view-scope" />
+    <script type="module" src="/news-frame.js?v=20260502-view-scope"></script>
   </head>
   <body>
     <div class="news-shell">
       <div class="news-backdrop news-backdrop-a"></div>
       <div class="news-backdrop news-backdrop-b"></div>
       <header class="masthead reveal" style="--delay: 0.05s">
-        <div class="eyebrow">AI 情报台</div>
+        <div class="masthead-top">
+          <div class="eyebrow">Live Intelligence</div>
+          <nav class="view-switch" aria-label="News view switcher">
+            <button class="view-tab is-active" type="button" data-view="ai">X AI 热讯</button>
+            <button class="view-tab" type="button" data-view="trend">Trend 全网热点</button>
+          </nav>
+        </div>
         <div class="masthead-grid">
           <div>
-            <h1>新闻</h1>
-            <p class="lede">
-              一页面向操作和判断的 AI 情报简报，由 Codex 结合实时 X 检索与当前信源整理生成。
-            </p>
+            <h1>Signal Board</h1>
+            <p id="view-lede" class="lede">X AI 热讯看实验室与 X 信号，Trend 全网热点看多平台时事主线。</p>
           </div>
           <div class="masthead-meta">
             <div class="meta-line">
-              <span>当前状态</span>
+              <span id="status-label">当前状态</span>
               <strong id="status-pill" class="status-pill">启动中</strong>
             </div>
             <div class="meta-line">
-              <span>最近刷新</span>
+              <span id="last-refresh-label">最近刷新</span>
               <strong id="last-refresh">等待中</strong>
             </div>
             <div class="meta-line">
-              <span>下次计划</span>
+              <span id="next-refresh-label">下次计划</span>
               <strong id="next-refresh">待定</strong>
             </div>
             <div class="action-row">
@@ -42,32 +46,58 @@
       </header>
 
       <main class="news-layout">
-        <section class="summary-panel reveal" style="--delay: 0.12s">
-          <div class="section-label">总览</div>
-          <p id="summary-text" class="summary-copy">正在生成首版 AI 情报简报。</p>
-          <div id="alert-strip" class="alert-strip" hidden></div>
+        <section id="view-ai" class="view-panel is-active" data-view-panel="ai">
+          <section class="summary-panel reveal" style="--delay: 0.12s">
+            <div class="section-label">X AI 热讯摘要</div>
+            <p id="summary-text" class="summary-copy">正在生成首版 AI 情报简报。</p>
+            <div id="alert-strip" class="alert-strip" hidden></div>
+          </section>
+
+          <section class="briefing-stage reveal" style="--delay: 0.2s">
+            <div class="stage-header">
+              <div>
+                <div class="section-label">已确认动态</div>
+                <h2>OpenAI + Anthropic</h2>
+              </div>
+              <p>当前最值得盯住的两条主线，一条看产品发布，一条看算力与分发能力。</p>
+            </div>
+            <div id="company-grid" class="company-grid"></div>
+          </section>
+
+          <section class="rumor-stage reveal" style="--delay: 0.28s">
+            <div class="stage-header">
+              <div>
+                <div class="section-label">未证实信号</div>
+                <h2>高热度 X 讨论</h2>
+              </div>
+              <p>过去三天里热度较高、但尚未被官方确认的 AI 相关信源，默认按传闻处理，当前目标展示约 9 条。</p>
+            </div>
+            <div id="rumor-list" class="rumor-list"></div>
+          </section>
         </section>
 
-        <section class="briefing-stage reveal" style="--delay: 0.2s">
-          <div class="stage-header">
-            <div>
-              <div class="section-label">已确认动态</div>
-              <h2>OpenAI + Anthropic</h2>
+        <section id="view-trend" class="view-panel" data-view-panel="trend" hidden>
+          <section class="trend-hero reveal" style="--delay: 0.12s">
+            <div class="panel-heading">
+              <div>
+                <div class="section-label">全网 Top20</div>
+                <h2 id="hotspot-headline">等待 TrendRadar</h2>
+              </div>
+              <time id="hotspot-time">待定</time>
             </div>
-            <p>当前最值得盯住的两条主线，一条看产品发布，一条看算力与分发能力。</p>
-          </div>
-          <div id="company-grid" class="company-grid"></div>
-        </section>
+            <p id="hotspot-summary" class="panel-summary">后台会用 TrendRadar 抓取多平台前 20 条热点并做聚类摘要。</p>
+          </section>
 
-        <section class="rumor-stage reveal" style="--delay: 0.28s">
-          <div class="stage-header">
+          <section class="trend-modules reveal" style="--delay: 0.28s">
             <div>
-              <div class="section-label">未证实信号</div>
-              <h2>高热度 X 讨论</h2>
+              <div class="section-label">热点聚类</div>
+              <div id="hotspot-clusters" class="hotspot-clusters"></div>
             </div>
-            <p>过去三天里热度较高、但尚未被官方确认的 AI 相关信源，默认按传闻处理，当前目标展示约 9 条。</p>
-          </div>
-          <div id="rumor-list" class="rumor-list"></div>
+            <div>
+              <div class="section-label">Top 20 原始热榜</div>
+              <ol id="hotspot-list" class="hotspot-list"></ol>
+            </div>
+          </section>
         </section>
       </main>
     </div>

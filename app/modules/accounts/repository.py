@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.usage.pricing import (
     UsageTokens,
@@ -18,6 +19,7 @@ from app.db.models import (
     ACCOUNT_PROVIDER_API_KEY,
     ACCOUNT_PROVIDER_OPENAI_OAUTH,
     Account,
+    AccountGroupMembership,
     AccountStatus,
     DashboardSettings,
     RequestLog,
@@ -57,10 +59,15 @@ class AccountsRepository:
         self._session = session
 
     async def get_by_id(self, account_id: str) -> Account | None:
-        return await self._session.get(Account, account_id)
+        result = await self._session.execute(
+            select(Account).options(selectinload(Account.group_memberships)).where(Account.id == account_id)
+        )
+        return result.scalar_one_or_none()
 
     async def list_accounts(self) -> list[Account]:
-        result = await self._session.execute(select(Account).order_by(Account.email))
+        result = await self._session.execute(
+            select(Account).options(selectinload(Account.group_memberships)).order_by(Account.email)
+        )
         return list(result.scalars().all())
 
     async def list_openai_accounts(self) -> list[Account]:
@@ -327,6 +334,7 @@ class AccountsRepository:
         *,
         configured_priority: int,
         kyc_enabled: bool | None = None,
+        groups: list[str] | None = None,
     ) -> Account | None:
         values: dict[str, object] = {"upstream_priority": configured_priority}
         if kyc_enabled is not None:
@@ -338,6 +346,12 @@ class AccountsRepository:
             .returning(Account.id)
         )
         updated_id = result.scalar_one_or_none()
+        if updated_id is not None and groups is not None:
+            await self._session.execute(
+                delete(AccountGroupMembership).where(AccountGroupMembership.account_id == account_id)
+            )
+            for group_name in groups:
+                self._session.add(AccountGroupMembership(account_id=account_id, group_name=group_name))
         await self._session.commit()
         if updated_id is None:
             return None

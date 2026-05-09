@@ -95,26 +95,6 @@ describe("RoutingSettings", () => {
     });
   });
 
-  it("saves the KYC routing enforcement toggle", async () => {
-    const user = userEvent.setup();
-    const onSave = vi.fn().mockResolvedValue(undefined);
-    render(<RoutingSettings settings={BASE_SETTINGS} busy={false} onSave={onSave} />);
-
-    await user.click(screen.getAllByRole("switch")[2]!);
-
-    expect(onSave).toHaveBeenCalledWith({
-      stickyThreadsEnabled: false,
-      upstreamStreamTransport: "default",
-      preferEarlierResetAccounts: true,
-      routingStrategy: "usage_weighted",
-      openaiCacheAffinityMaxAgeSeconds: 300,
-      kycRoutingEnforcementEnabled: false,
-      importWithoutOverwrite: false,
-      totpRequiredOnLogin: false,
-      apiKeyAuthEnabled: true,
-    });
-  });
-
   it("shows the configured upstream transport", () => {
     render(<RoutingSettings settings={BASE_SETTINGS} busy={false} onSave={vi.fn().mockResolvedValue(undefined)} />);
 

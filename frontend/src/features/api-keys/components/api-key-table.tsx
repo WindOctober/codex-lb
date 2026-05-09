@@ -1,6 +1,7 @@
 import { Ellipsis, KeyRound, Pencil, RefreshCw, Trash2 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { CopyButton } from "@/components/copy-button";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -109,7 +110,7 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
       <TableHeader>
         <TableRow>
           <TableHead className="w-[20%] min-w-[12rem] pl-4 text-[11px] uppercase tracking-wider text-muted-foreground/80">Name</TableHead>
-          <TableHead className="w-[10%] min-w-[8rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Prefix</TableHead>
+          <TableHead className="w-[10%] min-w-[8rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Key</TableHead>
           <TableHead className="w-[9%] min-w-[6.5rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Models</TableHead>
           <TableHead className="w-[26%] min-w-[17rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Usage</TableHead>
           <TableHead className="w-[14%] min-w-[12rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Limit</TableHead>
@@ -125,7 +126,12 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
           return (
             <TableRow key={apiKey.id}>
               <TableCell className="pl-4 font-medium truncate">{apiKey.name}</TableCell>
-              <TableCell className="truncate font-mono text-xs">{apiKey.keyPrefix}</TableCell>
+              <TableCell className="truncate font-mono text-xs">
+                <div className="flex items-center gap-1">
+                  <span className="truncate">{apiKey.keyPrefix}</span>
+                  {apiKey.key ? <CopyButton value={apiKey.key} label={`Copy ${apiKey.name} key`} iconOnly /> : null}
+                </div>
+              </TableCell>
               <TableCell className="truncate">{models}</TableCell>
               <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getUsageValue(apiKey)}</TableCell>
               <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getLimitValue(apiKey)}</TableCell>
@@ -135,7 +141,7 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
                   <Badge className={apiKey.isActive ? "bg-emerald-500 text-white" : "bg-zinc-500 text-white"}>
                     {apiKey.isActive ? "Active" : "Disabled"}
                   </Badge>
-                  {apiKey.kycOnly ? <Badge variant="secondary">KYC</Badge> : null}
+                  {(apiKey.allowedGroups ?? []).length > 0 ? <Badge variant="outline">Groups</Badge> : null}
                 </div>
               </TableCell>
               <TableCell className="pr-4 text-right">

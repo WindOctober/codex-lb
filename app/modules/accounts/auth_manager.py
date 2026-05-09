@@ -13,7 +13,6 @@ from app.core.auth.refresh import RefreshError, TokenRefreshResult, refresh_acce
 from app.core.balancer import PERMANENT_FAILURE_CODES
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
-from app.core.plan_types import coerce_account_plan_type
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 
@@ -174,12 +173,7 @@ class AuthManager:
         account.last_refresh = utcnow()
         if result.account_id:
             account.chatgpt_account_id = result.account_id
-        if result.plan_type is not None:
-            account.plan_type = coerce_account_plan_type(
-                result.plan_type,
-                account.plan_type or DEFAULT_PLAN,
-            )
-        elif not account.plan_type:
+        if not account.plan_type:
             account.plan_type = DEFAULT_PLAN
         if result.email:
             account.email = result.email

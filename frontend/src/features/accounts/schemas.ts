@@ -66,10 +66,12 @@ export const AccountSummarySchema = z.object({
   displayName: z.string(),
   planType: z.string(),
   providerKind: z.string().optional(),
+  storedApiKey: z.string().nullable().optional(),
   routingTier: z.string().optional(),
   routingPriority: z.number().int().optional(),
   configuredPriority: z.number().int().optional(),
   kycEnabled: z.boolean().optional(),
+  groups: z.array(z.string()).optional(),
   status: z.string(),
   usage: AccountUsageSchema.nullable().optional(),
   resetAtPrimary: z.string().datetime({ offset: true }).nullable().optional(),
@@ -116,6 +118,7 @@ export const ApiProviderCreateResponseSchema = AccountImportResponseSchema.exten
 export const AccountUpdateRequestSchema = z.object({
   configuredPriority: z.number().int().min(0).max(100000),
   kycEnabled: z.boolean().optional(),
+  groups: z.array(z.string()).optional(),
 });
 
 export const AccountAvailabilityResponseSchema = z.object({

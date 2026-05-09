@@ -97,6 +97,12 @@ class Account(Base):
         back_populates="account",
         cascade="all, delete-orphan",
     )
+    group_memberships: Mapped[list["AccountGroupMembership"]] = relationship(
+        "AccountGroupMembership",
+        back_populates="account",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
     request_logs: Mapped[list["RequestLog"]] = relationship(
         "RequestLog",
         back_populates="account",
@@ -323,6 +329,7 @@ class ApiKey(Base):
     name: Mapped[str] = mapped_column(String, nullable=False)
     key_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     key_prefix: Mapped[str] = mapped_column(String, nullable=False)
+    key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     allowed_models: Mapped[str | None] = mapped_column(Text, nullable=True)
     enforced_model: Mapped[str | None] = mapped_column(String, nullable=True)
     enforced_reasoning_effort: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -351,6 +358,32 @@ class ApiKey(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+    allowed_group_assignments: Mapped[list["ApiKeyAllowedGroup"]] = relationship(
+        "ApiKeyAllowedGroup",
+        back_populates="api_key",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    preferred_group_assignments: Mapped[list["ApiKeyPreferredGroup"]] = relationship(
+        "ApiKeyPreferredGroup",
+        back_populates="api_key",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+class AccountGroupMembership(Base):
+    __tablename__ = "account_groups"
+
+    account_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    group_name: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    account: Mapped["Account"] = relationship("Account", back_populates="group_memberships")
 
 
 class ApiKeyAccountAssignment(Base):
@@ -370,6 +403,35 @@ class ApiKeyAccountAssignment(Base):
 
     api_key: Mapped["ApiKey"] = relationship("ApiKey", back_populates="account_assignments")
     account: Mapped["Account"] = relationship("Account", back_populates="api_key_assignments")
+
+
+class ApiKeyAllowedGroup(Base):
+    __tablename__ = "api_key_allowed_groups"
+
+    api_key_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("api_keys.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    group_name: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    api_key: Mapped["ApiKey"] = relationship("ApiKey", back_populates="allowed_group_assignments")
+
+
+class ApiKeyPreferredGroup(Base):
+    __tablename__ = "api_key_preferred_groups"
+
+    api_key_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("api_keys.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    group_name: Mapped[str] = mapped_column(String, primary_key=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100, server_default=text("100"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    api_key: Mapped["ApiKey"] = relationship("ApiKey", back_populates="preferred_group_assignments")
 
 
 class LimitType(str, Enum):
@@ -694,6 +756,9 @@ Index("idx_sticky_account", StickySession.account_id)
 Index("idx_sticky_kind_updated_at", StickySession.kind, StickySession.updated_at.desc())
 Index("idx_api_keys_hash", ApiKey.key_hash)
 Index("idx_api_key_accounts_account_id", ApiKeyAccountAssignment.account_id)
+Index("idx_account_groups_group_name", AccountGroupMembership.group_name)
+Index("idx_api_key_allowed_groups_group_name", ApiKeyAllowedGroup.group_name)
+Index("idx_api_key_preferred_groups_group_name", ApiKeyPreferredGroup.group_name)
 Index("idx_api_key_limits_key_id", ApiKeyLimit.api_key_id)
 Index("idx_api_key_usage_reservations_key_id", ApiKeyUsageReservation.api_key_id)
 Index("idx_api_key_usage_reservations_status", ApiKeyUsageReservation.status)

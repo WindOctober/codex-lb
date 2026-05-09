@@ -107,6 +107,42 @@ async def test_refresh_account_preserves_plan_type_when_missing(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_refresh_account_ignores_plan_type_from_token_refresh(monkeypatch):
+    async def _fake_refresh(_: str) -> TokenRefreshResult:
+        return TokenRefreshResult(
+            access_token="new-access",
+            refresh_token="new-refresh",
+            id_token="new-id",
+            account_id="acc_1",
+            plan_type="free",
+            email=None,
+        )
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
+
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_1",
+        email="user@example.com",
+        plan_type="pro",
+        access_token_encrypted=encryptor.encrypt("access-old"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-old"),
+        id_token_encrypted=encryptor.encrypt("id-old"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    repo = _DummyRepo()
+    manager = AuthManager(cast(AccountsRepositoryPort, repo))
+
+    updated = await manager.refresh_account(account)
+
+    assert updated.plan_type == "pro"
+    assert repo.tokens_payload is not None
+    assert repo.tokens_payload["plan_type"] == "pro"
+
+
+@pytest.mark.asyncio
 async def test_ensure_fresh_singleflights_concurrent_refreshes(monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()

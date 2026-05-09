@@ -21,8 +21,8 @@ PLAN_CAPACITY_CREDITS_PRIMARY = {
     "business": 337.5,
     "team": 337.5,
     "edu": 337.5,
-    "pro": 2250.0,
-    "enterprise": 2250.0,
+    "pro": 6750.0,
+    "enterprise": 6750.0,
 }
 
 PLAN_CAPACITY_CREDITS_SECONDARY = {
@@ -31,8 +31,8 @@ PLAN_CAPACITY_CREDITS_SECONDARY = {
     "business": 11340.0,
     "team": 11340.0,
     "edu": 11340.0,
-    "pro": 75600.0,
-    "enterprise": 75600.0,
+    "pro": 226800.0,
+    "enterprise": 226800.0,
 }
 
 DEFAULT_WINDOW_MINUTES_PRIMARY = 300

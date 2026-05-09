@@ -30,6 +30,11 @@ export const ApiKeyUsageSummarySchema = z.object({
   totalCostUsd: z.number().nonnegative().default(0),
 });
 
+export const GroupPreferenceSchema = z.object({
+  group: z.string().min(1),
+  priority: z.number().int().min(0).max(100000).default(100),
+});
+
 export const SERVICE_TIERS = ["auto", "default", "priority", "flex"] as const;
 export type ServiceTierType = (typeof SERVICE_TIERS)[number];
 
@@ -48,6 +53,9 @@ export const ApiKeySchema = z.object({
     .nullable()
     .default(null),
   kycOnly: z.boolean().default(false),
+  key: z.string().nullable().optional(),
+  allowedGroups: z.array(z.string()).optional(),
+  preferredGroups: z.array(GroupPreferenceSchema).optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable(),
   isActive: z.boolean(),
   accountAssignmentScopeEnabled: z.boolean().default(false),
@@ -71,6 +79,8 @@ export const ApiKeyCreateRequestSchema = z.object({
     .nullable()
     .optional(),
   kycOnly: z.boolean().optional(),
+  allowedGroups: z.array(z.string()).nullable().optional(),
+  preferredGroups: z.array(GroupPreferenceSchema).nullable().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
   limits: z.array(LimitRuleCreateSchema).optional(),
@@ -93,6 +103,8 @@ export const ApiKeyUpdateRequestSchema = z.object({
     .nullable()
     .optional(),
   kycOnly: z.boolean().optional(),
+  allowedGroups: z.array(z.string()).nullable().optional(),
+  preferredGroups: z.array(GroupPreferenceSchema).nullable().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
   isActive: z.boolean().optional(),

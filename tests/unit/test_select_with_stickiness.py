@@ -290,7 +290,7 @@ async def test_capacity_weighted_pool_health_check_prefers_budget_safe_candidate
         used_percent=96.0,
         secondary_used_percent=96.0,
         plan_type="pro",
-        capacity_credits=50400.0,
+        capacity_credits=151200.0,
     )
     acc_b = AccountState(
         "b",

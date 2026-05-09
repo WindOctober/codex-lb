@@ -1,4 +1,5 @@
 import { Inbox } from "lucide-react";
+import type { CSSProperties } from "react";
 import { useMemo, useState } from "react";
 
 import { isEmailLabel } from "@/components/blur-email";
@@ -7,6 +8,7 @@ import { usePrivacyStore } from "@/hooks/use-privacy";
 import { EmptyState } from "@/components/empty-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -57,7 +59,93 @@ const PLAN_CLASS_MAP: Record<string, string> = {
   plus: "bg-emerald-500/15 text-emerald-700 border-emerald-500/20 hover:bg-emerald-500/20 dark:text-emerald-400",
   team: "bg-sky-500/15 text-sky-700 border-sky-500/20 hover:bg-sky-500/20 dark:text-sky-300",
   pro: "bg-violet-500/15 text-violet-700 border-violet-500/20 hover:bg-violet-500/20 dark:text-violet-300",
+  api_key_provider: "bg-cyan-500/15 text-cyan-700 border-cyan-500/20 hover:bg-cyan-500/20 dark:text-cyan-300",
 };
+
+type PlanRowTokens = {
+  bg: string;
+  border: string;
+  accent: string;
+  glow: string;
+  sheen: string;
+};
+
+type PlanRowStyle = CSSProperties & {
+  "--plan-row-bg": string;
+  "--plan-row-border": string;
+  "--plan-row-accent": string;
+  "--plan-row-glow": string;
+  "--plan-row-sheen": string;
+};
+
+const PLAN_ROW_TOKENS: Record<string, PlanRowTokens> = {
+  free: {
+    bg: "linear-gradient(100deg, rgba(113,113,122,0.11), rgba(113,113,122,0.045) 42%, rgba(113,113,122,0.015))",
+    border: "rgba(113,113,122,0.22)",
+    accent: "rgba(161,161,170,0.58)",
+    glow: "rgba(113,113,122,0.42)",
+    sheen: "rgba(255,255,255,0.07)",
+  },
+  plus: {
+    bg: "linear-gradient(100deg, rgba(16,185,129,0.18), rgba(20,184,166,0.075) 44%, rgba(16,185,129,0.018))",
+    border: "rgba(16,185,129,0.28)",
+    accent: "rgba(52,211,153,0.82)",
+    glow: "rgba(16,185,129,0.56)",
+    sheen: "rgba(236,253,245,0.1)",
+  },
+  team: {
+    bg: "linear-gradient(100deg, rgba(14,165,233,0.17), rgba(99,102,241,0.07) 46%, rgba(14,165,233,0.018))",
+    border: "rgba(14,165,233,0.27)",
+    accent: "rgba(56,189,248,0.78)",
+    glow: "rgba(14,165,233,0.54)",
+    sheen: "rgba(240,249,255,0.1)",
+  },
+  pro: {
+    bg: "linear-gradient(100deg, rgba(139,92,246,0.22), rgba(217,70,239,0.08) 46%, rgba(139,92,246,0.022))",
+    border: "rgba(167,139,250,0.34)",
+    accent: "rgba(196,181,253,0.9)",
+    glow: "rgba(168,85,247,0.68)",
+    sheen: "rgba(245,243,255,0.12)",
+  },
+  enterprise: {
+    bg: "linear-gradient(100deg, rgba(245,158,11,0.2), rgba(251,191,36,0.075) 44%, rgba(245,158,11,0.02))",
+    border: "rgba(245,158,11,0.3)",
+    accent: "rgba(251,191,36,0.84)",
+    glow: "rgba(245,158,11,0.58)",
+    sheen: "rgba(255,251,235,0.11)",
+  },
+  api_key_provider: {
+    bg: "linear-gradient(100deg, rgba(6,182,212,0.18), rgba(59,130,246,0.075) 44%, rgba(6,182,212,0.02))",
+    border: "rgba(6,182,212,0.29)",
+    accent: "rgba(34,211,238,0.82)",
+    glow: "rgba(6,182,212,0.58)",
+    sheen: "rgba(236,254,255,0.11)",
+  },
+};
+
+const PLAN_ROW_CLASSNAME =
+  "group/request-row border-0 bg-[image:var(--plan-row-bg)] [background-size:100%_100%] transition-[background,filter,transform] duration-200 hover:-translate-y-0.5 hover:brightness-110 " +
+  "[&>td]:border-y [&>td]:border-[color:var(--plan-row-border)] [&>td]:bg-transparent [&>td]:transition-[border-color] [&>td]:duration-200 " +
+  "[&>td:first-child]:rounded-l-2xl [&>td:first-child]:border-l [&>td:first-child]:shadow-[inset_3px_0_0_var(--plan-row-accent)] " +
+  "[&>td:last-child]:rounded-r-2xl [&>td:last-child]:border-r";
+
+function getPlanRowStyle(planType: string | null): PlanRowStyle {
+  const tokens = (planType && PLAN_ROW_TOKENS[planType]) || PLAN_ROW_TOKENS.free;
+  return {
+    "--plan-row-bg": tokens.bg,
+    "--plan-row-border": tokens.border,
+    "--plan-row-accent": tokens.accent,
+    "--plan-row-glow": tokens.glow,
+    "--plan-row-sheen": tokens.sheen,
+  };
+}
+
+function formatPlanBadgeLabel(planType: string): string {
+  if (planType === "api_key_provider") {
+    return "Provider";
+  }
+  return formatSlug(planType);
+}
 
 export type RecentRequestsTableProps = {
   requests: RequestLog[];
@@ -115,9 +203,9 @@ export function RecentRequestsTable({
 
   return (
     <div className="space-y-3">
-    <div className="rounded-xl border bg-card">
+    <div className="rounded-xl border bg-card/80 p-2 shadow-sm backdrop-blur">
       <div className="relative overflow-x-auto">
-        <Table className="min-w-[1240px] table-fixed">
+        <Table className="min-w-[1240px] table-fixed border-separate border-spacing-y-2">
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <TableHead className="w-28 pl-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/80">Time</TableHead>
@@ -143,10 +231,14 @@ export function RecentRequestsTable({
               const showRequestedTier =
                 !!request.requestedServiceTier && request.requestedServiceTier !== visibleServiceTier;
               const planType = request.planType?.trim().toLowerCase() || null;
-              const planLabel = planType ? formatSlug(planType) : "--";
+              const planLabel = planType ? formatPlanBadgeLabel(planType) : "--";
 
               return (
-                <TableRow key={request.requestId}>
+                <TableRow
+                  key={request.requestId}
+                  className={PLAN_ROW_CLASSNAME}
+                  style={getPlanRowStyle(planType)}
+                >
                   <TableCell className="pl-4 align-top">
                     <div className="leading-tight">
                       <div className="text-sm font-medium">{time.time}</div>
@@ -164,7 +256,11 @@ export function RecentRequestsTable({
                     {planType ? (
                       <Badge
                         variant="outline"
-                        className={PLAN_CLASS_MAP[planType] ?? PLAN_CLASS_MAP.free}
+                        className={cn(
+                          "max-w-20 truncate px-2",
+                          PLAN_CLASS_MAP[planType] ?? PLAN_CLASS_MAP.free,
+                        )}
+                        title={formatSlug(planType)}
                       >
                         {planLabel}
                       </Badge>
@@ -285,7 +381,7 @@ export function RecentRequestsTable({
               <div className="grid gap-3 sm:grid-cols-3">
                 <RequestDetailField label="Status" value={selectedRequest ? (REQUEST_STATUS_LABELS[selectedRequest.status] ?? selectedRequest.status) : "—"} />
                 <RequestDetailField label="Model" value={selectedRequest ? formatModelLabel(selectedRequest.model, selectedRequest.reasoningEffort, selectedRequest.actualServiceTier ?? selectedRequest.serviceTier) : "—"} mono />
-                <RequestDetailField label="Plan" value={selectedRequest?.planType ? formatSlug(selectedRequest.planType) : "—"} />
+                <RequestDetailField label="Plan" value={selectedRequest?.planType ? formatPlanBadgeLabel(selectedRequest.planType) : "—"} />
                 <RequestDetailField label="Transport" value={selectedRequest?.transport ? (TRANSPORT_LABELS[selectedRequest.transport] ?? selectedRequest.transport) : "—"} />
                 <RequestDetailField label="Time" value={selectedRequest ? formatDateTimeInline(selectedRequest.requestedAt) : "—"} />
                 <RequestDetailField label="Error Code" value={selectedRequest?.errorCode ?? "—"} mono />

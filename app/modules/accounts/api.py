@@ -126,7 +126,10 @@ async def update_account(
     payload: AccountUpdateRequest = Body(...),
     context: AccountsContext = Depends(get_accounts_context),
 ) -> AccountSummary:
-    account = await context.service.update_account(account_id, payload)
+    try:
+        account = await context.service.update_account(account_id, payload)
+    except ValueError as exc:
+        raise DashboardBadRequestError(str(exc), code="invalid_account_payload") from exc
     if account is None:
         raise DashboardNotFoundError("Account not found", code="account_not_found")
     return account

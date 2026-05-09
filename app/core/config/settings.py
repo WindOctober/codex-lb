@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     upstream_connect_timeout_seconds: float = 8.0
     upstream_compact_timeout_seconds: float | None = None
     upstream_websocket_trust_env: bool = False
-    proxy_request_budget_seconds: float = Field(default=180.0, gt=0)
+    proxy_request_budget_seconds: float = Field(default=240.0, gt=0)
     proxy_reconnect_request_budget_seconds: float = Field(default=240.0, gt=0)
     compact_request_budget_seconds: float = Field(default=75.0, gt=0)
     stream_idle_timeout_seconds: float = 300.0
@@ -163,7 +163,9 @@ class Settings(BaseSettings):
     http_responses_session_bridge_codex_idle_ttl_seconds: float = Field(default=900.0, gt=0)
     http_responses_session_bridge_codex_prewarm_enabled: bool = False
     http_responses_session_bridge_max_sessions: int = Field(default=256, gt=0)
-    http_responses_session_bridge_queue_limit: int = Field(default=8, gt=0)
+    http_responses_session_bridge_queue_limit: int = Field(default=0, ge=0)
+    http_responses_session_bridge_soft_shard_pending_limit: int = Field(default=1, ge=1)
+    http_responses_session_bridge_soft_shard_max_shards: int = Field(default=64, ge=1)
     http_responses_session_bridge_gateway_safe_mode: bool = False
     http_responses_session_bridge_instance_id: str = Field(default_factory=_default_http_bridge_instance_id)
     http_responses_session_bridge_instance_ring: Annotated[list[str], NoDecode] = Field(default_factory=list)

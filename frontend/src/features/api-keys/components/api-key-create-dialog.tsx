@@ -14,8 +14,8 @@ import {
 } from "@/components/ui/dialog";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
 import { ExpiryPicker } from "@/features/api-keys/components/expiry-picker";
+import { GroupSelector } from "@/features/api-keys/components/group-selector";
 import { LimitRulesEditor } from "@/features/api-keys/components/limit-rules-editor";
 import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-select";
 import type { ApiKeyCreateRequest, LimitRuleCreate, ServiceTierType } from "@/features/api-keys/schemas";
@@ -52,7 +52,8 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
   const [enforcedModel, setEnforcedModel] = useState("");
   const [enforcedReasoningEffort, setEnforcedReasoningEffort] = useState("none");
   const [enforcedServiceTier, setEnforcedServiceTier] = useState("none");
-  const [kycOnly, setKycOnly] = useState(false);
+  const [allowedGroups, setAllowedGroups] = useState<string[]>([]);
+  const [preferredGroups, setPreferredGroups] = useState<string[]>([]);
 
   const handleSubmit = async (values: FormValues) => {
     const validLimits = limitRules.filter((r) => r.maxValue > 0);
@@ -62,7 +63,8 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
       enforcedModel: enforcedModel.trim() ? enforcedModel.trim() : null,
       enforcedReasoningEffort: enforcedReasoningEffort === "none" ? null : enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
       enforcedServiceTier: enforcedServiceTier === "none" ? null : enforcedServiceTier as ServiceTierType,
-      kycOnly,
+      allowedGroups,
+      preferredGroups: preferredGroups.map((group, index) => ({ group, priority: (index + 1) * 10 })),
       expiresAt: expiresAt?.toISOString(),
       limits: validLimits.length > 0 ? validLimits : undefined,
     };
@@ -78,7 +80,8 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
     setEnforcedModel("");
     setEnforcedReasoningEffort("none");
     setEnforcedServiceTier("none");
-    setKycOnly(false);
+    setAllowedGroups([]);
+    setPreferredGroups([]);
     onOpenChange(false);
   };
 
@@ -116,14 +119,26 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
                   <ModelMultiSelect value={selectedModels} onChange={setSelectedModels} />
                 </div>
 
-                <div className="flex items-center justify-between rounded-md border p-2">
-                  <div>
-                    <div className="text-sm font-medium">KYC-only</div>
-                    <div className="text-xs text-muted-foreground">
-                      This key can only route accounts marked as KYC.
-                    </div>
-                  </div>
-                  <Switch checked={kycOnly} onCheckedChange={setKycOnly} />
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Allowed groups</label>
+                  <GroupSelector
+                    value={allowedGroups}
+                    onChange={setAllowedGroups}
+                    emptyLabel='No restriction: all groups are allowed. OpenAI OAuth accounts use "general", "plus", "pro", or "kyc"; providers each have their own "provider:*" group.'
+                    addPlaceholder="Add allowed group"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Preferred groups</label>
+                  <GroupSelector
+                    value={preferredGroups}
+                    onChange={setPreferredGroups}
+                    emptyLabel="No preference: route by the global strategy."
+                    addPlaceholder="Add preferred group"
+                    ordered
+                  />
+                  <p className="text-xs text-muted-foreground">Order sets priority from highest to lowest.</p>
                 </div>
 
                 <div className="space-y-1">

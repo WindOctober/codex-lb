@@ -152,6 +152,40 @@ describe("RecentRequestsTable", () => {
     expect(screen.getAllByText("--")[0]).toBeInTheDocument();
   });
 
+  it("renders API key provider plans with a compact label", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "provider-account",
+            planType: "api_key_provider",
+            apiKeyName: "Provider Key",
+            requestId: "req-provider",
+            model: "gpt-5.1",
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            tokens: 12,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            latencyMs: 10,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Provider")).toBeInTheDocument();
+    expect(screen.queryByText("Api key provider")).not.toBeInTheDocument();
+  });
+
   it("shows details action for error-code-only rows", async () => {
     render(
       <RecentRequestsTable

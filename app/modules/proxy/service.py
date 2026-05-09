@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from app.core import shutdown as shutdown_state
 from app.core import usage as usage_core
+from app.core.account_groups import account_builtin_group_names
 from app.core.auth.refresh import (
     RefreshError,
     pop_token_refresh_timeout_override,
@@ -289,6 +290,8 @@ class _HTTPBridgeRuntimeConfig:
     codex_idle_ttl_seconds: float
     max_sessions: int
     queue_limit: int
+    soft_shard_pending_limit: int
+    soft_shard_max_shards: int
     prompt_cache_idle_ttl_seconds: float
     gateway_safe_mode: bool
 
@@ -2721,12 +2724,13 @@ class ProxyService:
         self,
         request_state: _WebSocketRequestState,
         *,
-        response_create_gate: asyncio.Semaphore,
+        response_create_gate: asyncio.Semaphore | None,
         compact: bool = False,
     ) -> None:
         request_state.response_create_gate = response_create_gate
-        await response_create_gate.acquire()
-        request_state.response_create_gate_acquired = True
+        if response_create_gate is not None:
+            await response_create_gate.acquire()
+            request_state.response_create_gate_acquired = True
         request_state.awaiting_response_created = True
         try:
             request_state.response_create_admission = await self._get_work_admission().acquire_response_create(
@@ -3249,6 +3253,49 @@ class ProxyService:
         async with session.pending_lock:
             return max(len(session.pending_requests), session.queued_request_count)
 
+    async def _select_http_bridge_soft_shard_key_locked(
+        self,
+        base_key: "_HTTPBridgeSessionKey",
+        *,
+        api_key: ApiKeyData | None,
+        request_model: str | None,
+        pending_limit: int,
+        max_shards: int,
+    ) -> "_HTTPBridgeSessionKey":
+        if max_shards <= 1:
+            return base_key
+
+        reusable_over_limit: list[tuple[int, int, _HTTPBridgeSessionKey]] = []
+        first_available_new_key: _HTTPBridgeSessionKey | None = None
+        for shard_index in range(max_shards):
+            shard_key = _http_bridge_soft_shard_key(base_key, shard_index)
+            if shard_key in self._http_bridge_inflight_sessions:
+                continue
+            session = self._http_bridge_sessions.get(shard_key)
+            if session is None or session.closed:
+                if first_available_new_key is None:
+                    first_available_new_key = shard_key
+                continue
+            if (
+                session.account.status != AccountStatus.ACTIVE
+                or session.codex_session
+                or not _http_bridge_session_allows_api_key(session, api_key)
+                or not _http_bridge_session_account_supports_request_model(session, request_model)
+            ):
+                if shard_index == 0:
+                    return base_key
+                continue
+            pending_count = await self._http_bridge_pending_count(session)
+            if pending_count < pending_limit:
+                return shard_key
+            reusable_over_limit.append((pending_count, shard_index, shard_key))
+
+        if first_available_new_key is not None:
+            return first_available_new_key
+        if reusable_over_limit:
+            return min(reusable_over_limit, key=lambda item: (item[0], item[1]))[2]
+        return base_key
+
     async def _select_account_with_budget_compatible(
         self,
         deadline: float,
@@ -3500,6 +3547,34 @@ class ProxyService:
                             missing_turn_state_alias = True
 
                 await self._prune_http_bridge_sessions_locked()
+                if _http_bridge_soft_sharding_allowed(
+                    key,
+                    incoming_turn_state=incoming_turn_state,
+                    previous_response_id=previous_response_id,
+                    forwarded_request=forwarded_request,
+                ):
+                    selected_shard_key = await self._select_http_bridge_soft_shard_key_locked(
+                        key,
+                        api_key=api_key,
+                        request_model=request_model,
+                        pending_limit=settings.http_responses_session_bridge_soft_shard_pending_limit,
+                        max_shards=settings.http_responses_session_bridge_soft_shard_max_shards,
+                    )
+                    if selected_shard_key != key:
+                        _log_http_bridge_event(
+                            "soft_shard_select",
+                            selected_shard_key,
+                            account_id=None,
+                            model=request_model,
+                            detail=(
+                                f"base_key={_hash_identifier(key.affinity_key)}, "
+                                f"shard={_http_bridge_soft_shard_index(selected_shard_key)}"
+                            ),
+                            cache_key_family=selected_shard_key.affinity_kind,
+                            model_class=_extract_model_class(request_model) if request_model else None,
+                        )
+                        key = selected_shard_key
+                        durable_lookup = None
 
                 existing = self._http_bridge_sessions.get(key)
                 if (
@@ -4136,7 +4211,12 @@ class ProxyService:
 
             created_session: _HTTPBridgeSession | None = None
             session_registered = False
-            require_preferred_account = previous_response_id is not None and preferred_account_id is not None
+            hard_session_account_id = old_account_id if old_account_id is not None and key.strength == "hard" else None
+            create_preferred_account_id = preferred_account_id or hard_session_account_id
+            require_preferred_account = (
+                (previous_response_id is not None and preferred_account_id is not None)
+                or hard_session_account_id is not None
+            )
             allow_durable_takeover = (
                 force_durable_takeover
                 or not durable_account_supports_request_model
@@ -4151,7 +4231,7 @@ class ProxyService:
                     request_model=request_model,
                     idle_ttl_seconds=effective_idle_ttl_seconds,
                     request_stage=request_stage,
-                    preferred_account_id=preferred_account_id,
+                    preferred_account_id=create_preferred_account_id,
                     require_preferred_account=require_preferred_account,
                 )
                 await self._claim_durable_http_bridge_session(
@@ -4644,7 +4724,7 @@ class ProxyService:
             upstream_control=_WebSocketUpstreamControl(),
             pending_requests=deque(),
             pending_lock=anyio.Lock(),
-            response_create_gate=asyncio.Semaphore(1),
+            response_create_gate=None,
             queued_request_count=0,
             last_used_at=time.monotonic(),
             idle_ttl_seconds=idle_ttl_seconds,
@@ -4702,7 +4782,7 @@ class ProxyService:
         gate_acquired = False
         request_enqueued = False
         async with session.pending_lock:
-            if session.queued_request_count >= queue_limit:
+            if queue_limit > 0 and session.queued_request_count >= queue_limit:
                 _log_http_bridge_event(
                     "queue_full",
                     session.key,
@@ -5644,7 +5724,7 @@ class ProxyService:
         client_send_lock: anyio.Lock,
         api_key: ApiKeyData | None,
         upstream_control: _WebSocketUpstreamControl,
-        response_create_gate: asyncio.Semaphore,
+        response_create_gate: asyncio.Semaphore | None,
         proxy_request_budget_seconds: float,
         stream_idle_timeout_seconds: float,
         downstream_activity: _DownstreamWebSocketActivity,
@@ -5822,7 +5902,7 @@ class ProxyService:
         pending_lock: anyio.Lock,
         api_key: ApiKeyData | None,
         upstream_control: _WebSocketUpstreamControl,
-        response_create_gate: asyncio.Semaphore,
+        response_create_gate: asyncio.Semaphore | None,
     ) -> str:
         event_block = f"data: {text}\n\n"
         payload = parse_sse_data_json(event_block)
@@ -6083,7 +6163,7 @@ class ProxyService:
         payload: dict[str, JsonValue] | None,
         api_key: ApiKeyData | None,
         upstream_control: _WebSocketUpstreamControl,
-        response_create_gate: asyncio.Semaphore,
+        response_create_gate: asyncio.Semaphore | None,
     ) -> None:
         status = "success"
         error_code = None
@@ -6245,7 +6325,11 @@ class ProxyService:
             error_message=error_message,
         )
         response_create_gate = request_state.response_create_gate
-        if response_create_gate is not None:
+        if (
+            response_create_gate is not None
+            or request_state.response_create_admission is not None
+            or request_state.awaiting_response_created
+        ):
             _release_websocket_response_create_gate(request_state, response_create_gate)
         async with client_send_lock:
             await websocket.send_text(
@@ -6308,8 +6392,13 @@ class ProxyService:
                     error_code=request_error_code,
                     error_message=request_error_message,
                 )
-            if response_create_gate is not None:
-                _release_websocket_response_create_gate(request_state, response_create_gate)
+            state_response_create_gate = response_create_gate or request_state.response_create_gate
+            if (
+                state_response_create_gate is not None
+                or request_state.response_create_admission is not None
+                or request_state.awaiting_response_created
+            ):
+                _release_websocket_response_create_gate(request_state, state_response_create_gate)
             if request_state.event_queue is not None:
                 await request_state.event_queue.put(
                     format_sse_event(
@@ -6375,7 +6464,11 @@ class ProxyService:
             error_param=error_param,
         )
         response_create_gate = request_state.response_create_gate
-        if response_create_gate is not None:
+        if (
+            response_create_gate is not None
+            or request_state.response_create_admission is not None
+            or request_state.awaiting_response_created
+        ):
             _release_websocket_response_create_gate(request_state, response_create_gate)
         try:
             await self._send_downstream_websocket_text(
@@ -7880,12 +7973,16 @@ class ProxyService:
             if api_key is not None and api_key.account_assignment_scope_enabled
             else None
         )
+        allowed_groups = set(api_key.allowed_groups) if api_key is not None and api_key.allowed_groups else None
+        preferred_group_priorities = (
+            {preference.group: preference.priority for preference in api_key.preferred_groups}
+            if api_key is not None and api_key.preferred_groups
+            else None
+        )
         excluded_account_ids_set = set(exclude_account_ids or ())
         try:
             with anyio.fail_after(remaining_budget):
                 settings = await get_settings_cache().get()
-                kyc_enforcement_enabled = bool(getattr(settings, "kyc_routing_enforcement_enabled", True))
-                kyc_only = bool(api_key and api_key.kyc_only) if kyc_enforcement_enabled else None
                 if (
                     preferred_account_id is not None
                     and preferred_account_id not in excluded_account_ids_set
@@ -7901,8 +7998,8 @@ class ProxyService:
                         model=model,
                         additional_limit_name=additional_limit_name,
                         account_ids={preferred_account_id},
-                        kyc_only=kyc_only,
-                        kyc_routing_enforcement_enabled=kyc_enforcement_enabled,
+                        allowed_groups=allowed_groups,
+                        preferred_group_priorities=preferred_group_priorities,
                         budget_threshold_pct=settings.sticky_reallocation_budget_threshold_pct,
                     )
                     if preferred_selection.account is not None:
@@ -7925,8 +8022,8 @@ class ProxyService:
                     additional_limit_name=additional_limit_name,
                     account_ids=scoped_account_ids,
                     exclude_account_ids=excluded_account_ids_set,
-                    kyc_only=kyc_only,
-                    kyc_routing_enforcement_enabled=kyc_enforcement_enabled,
+                    allowed_groups=allowed_groups,
+                    preferred_group_priorities=preferred_group_priorities,
                     budget_threshold_pct=settings.sticky_reallocation_budget_threshold_pct,
                 )
                 if selection.account is not None and selection.account.id in excluded_account_ids_set:
@@ -8114,6 +8211,7 @@ class _HTTPBridgeSessionKey:
 
 
 _HARD_HTTP_BRIDGE_AFFINITY_KINDS = frozenset({"turn_state_header", "session_header"})
+_HTTP_BRIDGE_SOFT_SHARD_MARKER = "#codex-lb-shard="
 
 
 @dataclass(frozen=True, slots=True)
@@ -8134,7 +8232,7 @@ class _HTTPBridgeSession:
     upstream_control: _WebSocketUpstreamControl
     pending_requests: deque[_WebSocketRequestState]
     pending_lock: anyio.Lock
-    response_create_gate: asyncio.Semaphore
+    response_create_gate: asyncio.Semaphore | None
     queued_request_count: int
     last_used_at: float
     idle_ttl_seconds: float
@@ -8857,13 +8955,16 @@ def _build_stream_incomplete_terminal_event_for_request(
 
 def _release_websocket_response_create_gate(
     request_state: _WebSocketRequestState,
-    response_create_gate: asyncio.Semaphore,
+    response_create_gate: asyncio.Semaphore | None,
 ) -> None:
     if request_state.response_create_admission is not None:
         request_state.response_create_admission.release()
         request_state.response_create_admission = None
     request_state.awaiting_response_created = False
     request_state.response_create_gate = None
+    if response_create_gate is None:
+        request_state.response_create_gate_acquired = False
+        return
     if not request_state.response_create_gate_acquired:
         return
     request_state.response_create_gate_acquired = False
@@ -10078,10 +10179,68 @@ def _http_bridge_previous_response_alias_key(response_id: str, api_key_id: str |
     return (response_id.strip(), api_key_id)
 
 
+def _http_bridge_soft_sharding_allowed(
+    key: "_HTTPBridgeSessionKey",
+    *,
+    incoming_turn_state: str | None,
+    previous_response_id: str | None,
+    forwarded_request: bool,
+) -> bool:
+    return (
+        key.affinity_kind == "prompt_cache"
+        and key.strength != "hard"
+        and incoming_turn_state is None
+        and previous_response_id is None
+        and not forwarded_request
+        and _http_bridge_soft_shard_index(key) == 0
+    )
+
+
+def _http_bridge_soft_shard_key(base_key: "_HTTPBridgeSessionKey", shard_index: int) -> "_HTTPBridgeSessionKey":
+    if shard_index <= 0:
+        return base_key
+    return _HTTPBridgeSessionKey(
+        affinity_kind=base_key.affinity_kind,
+        affinity_key=f"{base_key.affinity_key}{_HTTP_BRIDGE_SOFT_SHARD_MARKER}{shard_index}",
+        api_key_id=base_key.api_key_id,
+        strength=base_key.strength,
+    )
+
+
+def _http_bridge_soft_shard_index(key: "_HTTPBridgeSessionKey") -> int:
+    marker_index = key.affinity_key.rfind(_HTTP_BRIDGE_SOFT_SHARD_MARKER)
+    if marker_index < 0:
+        return 0
+    raw_index = key.affinity_key[marker_index + len(_HTTP_BRIDGE_SOFT_SHARD_MARKER) :]
+    try:
+        return int(raw_index)
+    except ValueError:
+        return 0
+
+
 def _http_bridge_session_allows_api_key(session: "_HTTPBridgeSession", api_key: ApiKeyData | None) -> bool:
-    if api_key is None or not api_key.account_assignment_scope_enabled:
+    if api_key is None:
         return True
-    return session.account.id in api_key.assigned_account_ids
+    return _api_key_allows_account(api_key, session.account)
+
+
+def _api_key_allows_account(api_key: ApiKeyData, account: Account) -> bool:
+    if api_key.account_assignment_scope_enabled and account.id not in api_key.assigned_account_ids:
+        return False
+    if not api_key.allowed_groups:
+        return True
+    return bool(_account_group_names(account) & set(api_key.allowed_groups))
+
+
+def _account_group_names(account: Account) -> set[str]:
+    memberships = account.__dict__.get("group_memberships", [])
+    groups = {
+        membership.group_name.strip().lower()
+        for membership in memberships
+        if getattr(membership, "group_name", None) and membership.group_name.strip()
+    }
+    groups.update(account_builtin_group_names(account))
+    return groups
 
 
 def _http_bridge_session_reusable_for_request(
@@ -10725,6 +10884,8 @@ def _http_bridge_runtime_config(
         codex_idle_ttl_seconds=app_settings.http_responses_session_bridge_codex_idle_ttl_seconds,
         max_sessions=app_settings.http_responses_session_bridge_max_sessions,
         queue_limit=app_settings.http_responses_session_bridge_queue_limit,
+        soft_shard_pending_limit=app_settings.http_responses_session_bridge_soft_shard_pending_limit,
+        soft_shard_max_shards=app_settings.http_responses_session_bridge_soft_shard_max_shards,
         prompt_cache_idle_ttl_seconds=float(
             dashboard_settings.http_responses_session_bridge_prompt_cache_idle_ttl_seconds,
         ),

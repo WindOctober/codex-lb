@@ -198,6 +198,51 @@ def test_schema_migration_contract_matches_after_upgrade(tmp_path: Path) -> None
     assert check_schema_drift(url) == ()
 
 
+def test_kyc_only_api_keys_convert_to_kyc_group_assignments(tmp_path: Path) -> None:
+    db_path = tmp_path / "kyc-only-to-group.db"
+    url = _db_url(db_path)
+    sync_url = to_sync_database_url(url)
+
+    run_upgrade(url, "20260501_000000_add_account_groups_and_stored_api_keys", bootstrap_legacy=False)
+
+    with create_engine(sync_url, future=True).begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO api_keys (id, name, key_hash, key_prefix, kyc_only, is_active)
+                VALUES
+                  ('key_kyc', 'KYC key', 'hash_kyc', 'sk-kyc', 1, 1),
+                  ('key_regular', 'Regular key', 'hash_regular', 'sk-reg', 0, 1)
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO api_key_allowed_groups (api_key_id, group_name)
+                VALUES
+                  ('key_kyc', 'legacy'),
+                  ('key_regular', 'paid')
+                """
+            )
+        )
+
+    run_upgrade(url, "head", bootstrap_legacy=False)
+
+    with create_engine(sync_url, future=True).connect() as connection:
+        kyc_only = connection.execute(text("SELECT kyc_only FROM api_keys WHERE id = 'key_kyc'")).scalar_one()
+        kyc_groups = connection.execute(
+            text("SELECT group_name FROM api_key_allowed_groups WHERE api_key_id = 'key_kyc' ORDER BY group_name")
+        ).scalars().all()
+        regular_groups = connection.execute(
+            text("SELECT group_name FROM api_key_allowed_groups WHERE api_key_id = 'key_regular' ORDER BY group_name")
+        ).scalars().all()
+
+    assert bool(kyc_only) is False
+    assert kyc_groups == ["kyc"]
+    assert regular_groups == ["paid"]
+
+
 def test_base_revision_does_not_depend_on_live_metadata(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "base.db"
     url = _db_url(db_path)

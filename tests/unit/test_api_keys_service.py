@@ -5,7 +5,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, ApiKey, ApiKeyAccountAssignment, ApiKeyLimit, LimitType
+from app.db.models import (
+    Account,
+    AccountStatus,
+    ApiKey,
+    ApiKeyAccountAssignment,
+    ApiKeyAllowedGroup,
+    ApiKeyLimit,
+    ApiKeyPreferredGroup,
+    LimitType,
+)
 from app.modules.api_keys.repository import (
     _UNSET,
     ApiKeyTrendBucket,
@@ -22,6 +31,7 @@ from app.modules.api_keys.service import (
     ApiKeysRepositoryProtocol,
     ApiKeysService,
     ApiKeyUpdateData,
+    GroupPreferenceData,
     LimitRuleInput,
     _build_api_key_trends,
 )
@@ -34,6 +44,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         self.rows: dict[str, ApiKey] = {}
         self._limits: dict[str, list[ApiKeyLimit]] = {}
         self._account_assignments: dict[str, list[ApiKeyAccountAssignment]] = {}
+        self._allowed_groups: dict[str, list[ApiKeyAllowedGroup]] = {}
+        self._preferred_groups: dict[str, list[ApiKeyPreferredGroup]] = {}
         self._accounts: dict[str, Account] = {}
         self._limit_id_seq = 0
         self._reservations: dict[str, UsageReservationData] = {}
@@ -42,6 +54,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         self.rows[row.id] = row
         row.limits = []
         row.account_assignments = []
+        row.allowed_group_assignments = []
+        row.preferred_group_assignments = []
         return row
 
     async def get_by_id(self, key_id: str) -> ApiKey | None:
@@ -49,6 +63,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         if row is not None:
             row.limits = self._limits.get(key_id, [])
             row.account_assignments = self._account_assignments.get(key_id, [])
+            row.allowed_group_assignments = self._allowed_groups.get(key_id, [])
+            row.preferred_group_assignments = self._preferred_groups.get(key_id, [])
         return row
 
     async def get_by_hash(self, key_hash: str) -> ApiKey | None:
@@ -56,6 +72,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             if row.key_hash == key_hash:
                 row.limits = self._limits.get(row.id, [])
                 row.account_assignments = self._account_assignments.get(row.id, [])
+                row.allowed_group_assignments = self._allowed_groups.get(row.id, [])
+                row.preferred_group_assignments = self._preferred_groups.get(row.id, [])
                 return row
         return None
 
@@ -64,6 +82,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         for row in result:
             row.limits = self._limits.get(row.id, [])
             row.account_assignments = self._account_assignments.get(row.id, [])
+            row.allowed_group_assignments = self._allowed_groups.get(row.id, [])
+            row.preferred_group_assignments = self._preferred_groups.get(row.id, [])
         return result
 
     async def list_accounts_by_ids(self, account_ids: list[str]) -> list[Account]:
@@ -87,6 +107,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
         key_prefix: str | _Unset = _UNSET,
+        key_encrypted: bytes | None | _Unset = _UNSET,
         commit: bool = True,
     ) -> ApiKey | None:
         del commit
@@ -105,11 +126,14 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             "is_active": is_active,
             "key_hash": key_hash,
             "key_prefix": key_prefix,
+            "key_encrypted": key_encrypted,
         }.items():
             if value is _UNSET:
                 continue
             setattr(row, field, value)
         row.limits = self._limits.get(key_id, [])
+        row.allowed_group_assignments = self._allowed_groups.get(key_id, [])
+        row.preferred_group_assignments = self._preferred_groups.get(key_id, [])
         return row
 
     async def delete(self, key_id: str) -> bool:
@@ -177,6 +201,31 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         row = self.rows.get(key_id)
         if row is not None:
             row.account_assignments = assignments
+
+    async def replace_allowed_groups(self, key_id: str, group_names: list[str], *, commit: bool = True) -> None:
+        del commit
+        assignments = [ApiKeyAllowedGroup(api_key_id=key_id, group_name=group_name) for group_name in group_names]
+        self._allowed_groups[key_id] = assignments
+        row = self.rows.get(key_id)
+        if row is not None:
+            row.allowed_group_assignments = assignments
+
+    async def replace_preferred_groups(
+        self,
+        key_id: str,
+        preferences: list[GroupPreferenceData],
+        *,
+        commit: bool = True,
+    ) -> None:
+        del commit
+        assignments = [
+            ApiKeyPreferredGroup(api_key_id=key_id, group_name=preference.group, priority=preference.priority)
+            for preference in preferences
+        ]
+        self._preferred_groups[key_id] = assignments
+        row = self.rows.get(key_id)
+        if row is not None:
+            row.preferred_group_assignments = assignments
 
     async def increment_limit_usage(
         self,
