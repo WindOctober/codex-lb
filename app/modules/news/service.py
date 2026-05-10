@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.config.settings import get_settings
 from app.db.session import SessionLocal
 from app.modules.news.repository import NewsHistoryRecord, NewsRepository
 from app.modules.refresh_api_key import load_codex_lb_refresh_api_key
@@ -257,12 +258,16 @@ class NewsService:
         refresh_interval_seconds: int = 6 * 60 * 60,
         trendradar_refresh_interval_seconds: int = 60 * 60,
         initial_delay_seconds: int = 3,
+        refresh_enabled: bool = False,
+        trendradar_refresh_enabled: bool = False,
     ) -> None:
         self._project_root = project_root
         self._cache_file = cache_file
         self._refresh_interval = refresh_interval_seconds
         self._trendradar_refresh_interval = trendradar_refresh_interval_seconds
         self._initial_delay_seconds = initial_delay_seconds
+        self._refresh_enabled = refresh_enabled
+        self._trendradar_refresh_enabled = trendradar_refresh_enabled
         self._job_timeout_seconds = int(os.getenv("CODEX_LB_NEWS_JOB_TIMEOUT_SECONDS", "3600"))
         self._trendradar_timeout_seconds = int(os.getenv("CODEX_LB_TRENDRADAR_TIMEOUT_SECONDS", "240"))
         self._trendradar_root = Path(
@@ -306,10 +311,12 @@ class NewsService:
         self._ensure_bootstrap_content()
         self._ensure_item_state(seed_existing_items=True)
         await self._seed_history_from_snapshot()
-        self._loop_task = asyncio.create_task(self._run_loop(), name="codex-lb-news-loop")
-        self._trendradar_loop_task = asyncio.create_task(
-            self._run_trendradar_loop(), name="codex-lb-news-trendradar-loop"
-        )
+        if self._refresh_enabled:
+            self._loop_task = asyncio.create_task(self._run_loop(), name="codex-lb-news-loop")
+        if self._trendradar_refresh_enabled:
+            self._trendradar_loop_task = asyncio.create_task(
+                self._run_trendradar_loop(), name="codex-lb-news-trendradar-loop"
+            )
 
     async def stop(self) -> None:
         tasks = [
@@ -351,9 +358,13 @@ class NewsService:
         payload["x_ai_dynamics"] = self._normalize_x_ai_dynamics(payload.get("x_ai_dynamics"))
         payload["hotspot_digest"] = self._normalize_hotspot_digest(payload.get("hotspot_digest"))
         payload.pop("item_state", None)
+        payload["refresh_enabled"] = self._refresh_enabled
+        payload["trendradar_refresh_enabled"] = self._trendradar_refresh_enabled
         return payload
 
     async def request_refresh(self, *, force: bool = False) -> bool:
+        if not self._refresh_enabled:
+            return False
         if not force and not self._should_auto_refresh():
             return False
         if self._refresh_task is not None and not self._refresh_task.done():
@@ -370,6 +381,8 @@ class NewsService:
             await asyncio.sleep(self._auto_check_seconds)
 
     async def request_trendradar_refresh(self, *, force: bool = False) -> bool:
+        if not self._trendradar_refresh_enabled:
+            return False
         if not force and not self._should_auto_refresh_trendradar():
             return False
         if self._trendradar_refresh_task is not None and not self._trendradar_refresh_task.done():
@@ -2137,6 +2150,7 @@ class NewsService:
 
 
 def build_news_service() -> NewsService:
+    settings = get_settings()
     encryption_key_file = os.getenv("CODEX_LB_ENCRYPTION_KEY_FILE")
     if encryption_key_file:
         project_root = Path(encryption_key_file).expanduser().resolve().parent.parent
@@ -2152,4 +2166,6 @@ def build_news_service() -> NewsService:
         refresh_interval_seconds=refresh_seconds,
         trendradar_refresh_interval_seconds=trendradar_refresh_seconds,
         initial_delay_seconds=initial_delay_seconds,
+        refresh_enabled=settings.news_refresh_enabled,
+        trendradar_refresh_enabled=settings.trendradar_refresh_enabled,
     )

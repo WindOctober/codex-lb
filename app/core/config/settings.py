@@ -75,6 +75,10 @@ def _parse_port_value(raw: str) -> int | None:
     return port
 
 
+def _parse_bool_env(raw: str) -> bool:
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _configured_http_port() -> int:
     raw_env_port = os.getenv("PORT")
     if raw_env_port is not None:
@@ -184,8 +188,12 @@ class Settings(BaseSettings):
     max_decompressed_body_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     image_inline_fetch_enabled: bool = True
     image_inline_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    model_registry_enabled: bool = True
+    model_registry_enabled: bool = False
     model_registry_refresh_interval_seconds: int = Field(default=300, gt=0)
+    api_provider_model_refresh_enabled: bool = False
+    news_refresh_enabled: bool = False
+    trendradar_refresh_enabled: bool = False
+    scholar_refresh_enabled: bool = False
     model_registry_client_version: str = "0.150.0"
     model_context_window_overrides: Annotated[dict[str, int], NoDecode] = Field(default_factory=dict)
     proxy_unauthenticated_client_cidrs: Annotated[list[str], NoDecode] = Field(default_factory=list)
@@ -253,6 +261,12 @@ class Settings(BaseSettings):
     # HTTP connector limits
     http_connector_limit: int = 100
     http_connector_limit_per_host: int = 50
+
+    # Traffic dashboard and Windows reverse-tunnel collector heartbeat.
+    traffic_dashboard_enabled: bool = True
+    traffic_dashboard_token: str | None = None
+    traffic_heartbeat_stale_seconds: float = Field(default=90.0, gt=0)
+    traffic_request_ring_size: int = Field(default=2000, ge=1)
 
     @field_validator("database_url")
     @classmethod
@@ -419,6 +433,19 @@ class Settings(BaseSettings):
             raise ValueError("dashboard_auth_mode=trusted_header requires firewall_trust_proxy_headers=true")
         if not self.firewall_trusted_proxy_cidrs:
             raise ValueError("dashboard_auth_mode=trusted_header requires non-empty firewall_trusted_proxy_cidrs")
+        return self
+
+    @model_validator(mode="after")
+    def _apply_unprefixed_traffic_env(self) -> "Settings":
+        # The project normally uses CODEX_LB_*; accept the requested TRAFFIC_* names too.
+        if (value := os.getenv("TRAFFIC_DASHBOARD_ENABLED")) is not None:
+            self.traffic_dashboard_enabled = _parse_bool_env(value)
+        if (value := os.getenv("TRAFFIC_DASHBOARD_TOKEN")) is not None:
+            self.traffic_dashboard_token = value or None
+        if (value := os.getenv("TRAFFIC_HEARTBEAT_STALE_SECONDS")) is not None:
+            self.traffic_heartbeat_stale_seconds = float(value)
+        if (value := os.getenv("TRAFFIC_REQUEST_RING_SIZE")) is not None:
+            self.traffic_request_ring_size = int(value)
         return self
 
 

@@ -63,6 +63,9 @@ from app.modules.scholar.service import build_scholar_service
 from app.modules.settings import api as settings_api
 from app.modules.sticky_sessions import api as sticky_sessions_api
 from app.modules.sticky_sessions.cleanup_scheduler import build_sticky_session_cleanup_scheduler
+from app.modules.traffic import api as traffic_api
+from app.modules.traffic.middleware import TrafficMetricsMiddleware
+from app.modules.traffic.store import get_traffic_store
 from app.modules.usage import api as usage_api
 from app.modules.usage.additional_quota_keys import reload_additional_quota_registry
 
@@ -128,18 +131,21 @@ async def lifespan(app: FastAPI):
     bridge_durable_schema_ready = await _ensure_bridge_durable_schema_ready(settings)
     if bridge_durable_schema_ready:
         startup_module.mark_bridge_durable_schema_ready()
-    try:
-        provider_refresh = await refresh_api_provider_model_snapshots_on_startup()
-        if provider_refresh.checked:
-            logger.info(
-                "API provider model snapshots refreshed checked=%d refreshed=%d changed=%d failed=%d",
-                provider_refresh.checked,
-                provider_refresh.refreshed,
-                provider_refresh.changed,
-                provider_refresh.failed,
-            )
-    except Exception:
-        logger.warning("API provider model snapshot startup refresh failed", exc_info=True)
+    if settings.api_provider_model_refresh_enabled:
+        try:
+            provider_refresh = await refresh_api_provider_model_snapshots_on_startup()
+            if provider_refresh.checked:
+                logger.info(
+                    "API provider model snapshots refreshed checked=%d refreshed=%d changed=%d failed=%d",
+                    provider_refresh.checked,
+                    provider_refresh.refreshed,
+                    provider_refresh.changed,
+                    provider_refresh.failed,
+                )
+        except Exception:
+            logger.warning("API provider model snapshot startup refresh failed", exc_info=True)
+    else:
+        logger.info("API provider model snapshot startup refresh disabled")
     usage_scheduler = build_usage_refresh_scheduler()
     model_scheduler = build_model_refresh_scheduler()
     sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()
@@ -329,6 +335,10 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    get_traffic_store().configure(
+        ring_size=settings.traffic_request_ring_size,
+        heartbeat_stale_seconds=settings.traffic_heartbeat_stale_seconds,
+    )
     configure_memory_monitor(
         warning_threshold_mb=settings.memory_warning_threshold_mb,
         reject_threshold_mb=settings.memory_reject_threshold_mb,
@@ -345,6 +355,7 @@ def create_app() -> FastAPI:
     add_request_decompression_middleware(app)
     add_request_id_middleware(app)
     add_api_firewall_middleware(app)
+    app.add_middleware(cast(Any, TrafficMetricsMiddleware), enabled=settings.traffic_dashboard_enabled)
     app.add_middleware(cast(Any, MetricsMiddleware), enabled=settings.metrics_enabled)
     if settings.backpressure_max_concurrent_requests > 0:
         app.add_middleware(
@@ -388,13 +399,14 @@ def create_app() -> FastAPI:
     app.include_router(api_keys_api.router)
     app.include_router(news_api.router)
     app.include_router(scholar_api.router)
+    app.include_router(traffic_api.router)
     app.include_router(health_api.router)
 
     static_dir = Path(__file__).parent / "static"
     index_html = static_dir / "index.html"
     static_root = static_dir.resolve()
     frontend_build_hint = "Frontend assets are missing. Run `cd frontend && bun run build`."
-    excluded_prefixes = ("api/", "v1/", "backend-api/", "health")
+    excluded_prefixes = ("api/", "v1/", "backend-api/", "health", "__traffic/")
 
     def _is_static_asset_path(path: str) -> bool:
         if path.startswith("assets/"):

@@ -149,6 +149,12 @@ def _reset_global_state() -> None:
         set_bridge_drain_active(False)
     except Exception:
         pass
+    try:
+        from app.modules.traffic.store import get_traffic_store
+
+        get_traffic_store().reset()
+    except Exception:
+        pass
 
 
 @pytest.fixture(autouse=True)

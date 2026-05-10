@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from app.core.config.settings import get_settings
 from app.modules.refresh_api_key import load_codex_lb_refresh_api_key
 
 
@@ -68,12 +69,14 @@ class ScholarService:
         topic_cache_file: Path,
         refresh_interval_seconds: int = 15 * 24 * 60 * 60,
         initial_delay_seconds: int = 7,
+        refresh_enabled: bool = False,
     ) -> None:
         self._project_root = project_root
         self._cache_file = cache_file
         self._topic_cache_file = topic_cache_file
         self._refresh_interval = refresh_interval_seconds
         self._initial_delay_seconds = initial_delay_seconds
+        self._refresh_enabled = refresh_enabled
         self._job_timeout_seconds = int(os.getenv("CODEX_LB_SCHOLAR_JOB_TIMEOUT_SECONDS", "3600"))
         self._max_refresh_seconds = int(
             os.getenv("CODEX_LB_SCHOLAR_MAX_REFRESH_SECONDS", str(self._job_timeout_seconds + 120))
@@ -96,7 +99,8 @@ class ScholarService:
         self._load_cache()
         self._reconcile_loaded_snapshot()
         self._ensure_bootstrap_content()
-        self._loop_task = asyncio.create_task(self._run_loop(), name="codex-lb-scholar-loop")
+        if self._refresh_enabled:
+            self._loop_task = asyncio.create_task(self._run_loop(), name="codex-lb-scholar-loop")
 
     async def stop(self) -> None:
         tasks = [task for task in (self._loop_task, self._refresh_task) if task is not None]
@@ -117,9 +121,12 @@ class ScholarService:
             payload["background_note"] = "Scholar 后台长刷新超过阈值，当前先展示上一版可用内容。"
         payload["is_stale"] = self._is_stale(payload.get("last_completed_at"))
         payload["next_refresh_due_at"] = self._next_refresh_due_at(payload.get("last_completed_at"))
+        payload["refresh_enabled"] = self._refresh_enabled
         return payload
 
     async def request_refresh(self, *, force: bool = False) -> bool:
+        if not self._refresh_enabled:
+            return False
         if not force and not self._should_auto_refresh():
             return False
         if self._refresh_task is not None and not self._refresh_task.done():
@@ -567,6 +574,7 @@ class ScholarService:
 
 
 def build_scholar_service() -> ScholarService:
+    settings = get_settings()
     encryption_key_file = os.getenv("CODEX_LB_ENCRYPTION_KEY_FILE")
     if encryption_key_file:
         project_root = Path(encryption_key_file).expanduser().resolve().parent.parent
@@ -585,4 +593,5 @@ def build_scholar_service() -> ScholarService:
         topic_cache_file=topic_cache_file,
         refresh_interval_seconds=refresh_seconds,
         initial_delay_seconds=initial_delay_seconds,
+        refresh_enabled=settings.scholar_refresh_enabled,
     )

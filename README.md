@@ -59,6 +59,9 @@ uvx codex-lb
 
 Open [localhost:2455](http://localhost:2455) → Add account → Done.
 
+Traffic monitoring for reverse tunnels is available at [localhost:2455/__traffic](http://localhost:2455/__traffic).
+See [docs/traffic-dashboard.md](docs/traffic-dashboard.md) for the heartbeat payload and port sharding setup.
+
 ## Remote Setup
 
 When accessing the dashboard remotely for the first time, a bootstrap token is required to set the initial password.
