@@ -31,4 +31,6 @@
 - [x] 5.2 Run Alembic policy and schema drift checks on the copied DB.
 - [x] 5.3 Run frontend typecheck/build.
 - [x] 5.4 Run the repository pytest suite after the compatibility migration.
-- [ ] 5.5 Run `openspec validate --specs` (blocked locally: `openspec` CLI is not installed in this environment).
+- [x] 5.5 Add regression coverage for availability probes preserving active accounts after transient refresh failures.
+- [x] 5.6 Run isolated temporary-instance smoke validation for account availability transient refresh failures.
+- [ ] 5.7 Run `openspec validate --specs` (blocked locally: `openspec` CLI is not installed in this environment).

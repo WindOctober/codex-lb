@@ -1,0 +1,4 @@
+id: add-http-bridge-capacity-keepalive
+status: draft
+title: Keep HTTP bridge streams alive during capacity waits
+owner: local

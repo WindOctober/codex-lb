@@ -1,0 +1,4 @@
+- [x] 1. Make `instructions` optional-by-omission for Responses and Responses Compact request validation.
+- [x] 2. Add unit coverage for omitted instructions on both request forms.
+- [x] 3. Validate the targeted tests and isolated backend behavior.
+- [x] 4. Restart only the primary backend and verify both direct and Caddy health endpoints.

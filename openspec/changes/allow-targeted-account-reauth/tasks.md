@@ -1,0 +1,6 @@
+- [x] 1. Extend OAuth request/state schemas to carry an optional target account ID through browser, device, and manual callback completion.
+- [x] 2. Add targeted OpenAI OAuth account update logic that preserves selected account data while replacing OAuth identity and tokens.
+- [x] 3. Wire the Accounts frontend re-auth action to pass the selected account ID and allow it for non-provider accounts in any status.
+- [x] 4. Update mocks and frontend schemas/tests for targeted OAuth start payloads and action availability.
+- [x] 5. Add backend integration coverage for active-account targeted re-auth with a different incoming identity and conflict rejection.
+- [x] 6. Validate OpenSpec, backend tests, and frontend build/tests relevant to the change.

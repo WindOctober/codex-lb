@@ -1,0 +1,5 @@
+- [x] 1. Add upstream egress settings and OpenSpec requirements.
+- [x] 2. Implement runtime egress state machine and lifecycle hooks.
+- [x] 3. Route new upstream HTTP/SSE, compact, transcription, usage, model-probe, and WebSocket requests through the selected egress.
+- [x] 4. Add unit coverage for egress switching and request proxy selection.
+- [x] 5. Validate with targeted lint/tests, OpenSpec validation, frontend build if static assets are affected, and isolated backend preflight.

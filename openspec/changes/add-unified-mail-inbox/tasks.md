@@ -1,0 +1,8 @@
+- [x] 1. Add mail inbox OpenSpec requirements for accounts, messages, focus rules, and standalone frontend route.
+- [x] 2. Add database models and migration for mail accounts, normalized messages, and focus rules.
+- [x] 3. Implement `app/modules/mail_inbox` repository, service, schemas, and dashboard-authenticated API router.
+- [x] 4. Register mail inbox dependencies and router.
+- [x] 5. Add integration tests for account creation, message listing filters, focus rule matching, and no credential leakage.
+- [x] 6. Add frontend schemas, API client, hooks, Mail route, navigation item, and focused-message UI.
+- [x] 7. Add frontend tests for schema parsing and focused-message rendering.
+- [x] 8. Run OpenSpec validation plus focused backend/frontend checks.
