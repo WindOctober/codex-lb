@@ -53,7 +53,6 @@ export const ApiKeySchema = z.object({
     .nullable()
     .default(null),
   kycOnly: z.boolean().default(false),
-  key: z.string().nullable().optional(),
   allowedGroups: z.array(z.string()).optional(),
   preferredGroups: z.array(GroupPreferenceSchema).optional(),
   expiresAt: z.string().datetime({ offset: true }).nullable(),

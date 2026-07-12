@@ -1,7 +1,6 @@
 import { Ellipsis, KeyRound, Pencil, RefreshCw, Trash2 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
-import { CopyButton } from "@/components/copy-button";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -127,10 +126,7 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
             <TableRow key={apiKey.id}>
               <TableCell className="pl-4 font-medium truncate">{apiKey.name}</TableCell>
               <TableCell className="truncate font-mono text-xs">
-                <div className="flex items-center gap-1">
-                  <span className="truncate">{apiKey.keyPrefix}</span>
-                  {apiKey.key ? <CopyButton value={apiKey.key} label={`Copy ${apiKey.name} key`} iconOnly /> : null}
-                </div>
+                {apiKey.keyPrefix}
               </TableCell>
               <TableCell className="truncate">{models}</TableCell>
               <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getUsageValue(apiKey)}</TableCell>

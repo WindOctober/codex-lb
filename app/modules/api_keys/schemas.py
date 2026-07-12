@@ -76,7 +76,6 @@ class ApiKeyResponse(DashboardModel):
     enforced_reasoning_effort: str | None
     enforced_service_tier: str | None
     kyc_only: bool = False
-    key: str | None = None
     allowed_groups: list[str] = Field(default_factory=list)
     preferred_groups: list[GroupPreference] = Field(default_factory=list)
     expires_at: datetime | None

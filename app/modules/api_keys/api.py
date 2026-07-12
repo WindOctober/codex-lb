@@ -42,7 +42,6 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         enforced_reasoning_effort=row.enforced_reasoning_effort,
         enforced_service_tier=row.enforced_service_tier,
         kyc_only=row.kyc_only,
-        key=row.key,
         allowed_groups=row.allowed_groups,
         preferred_groups=[
             {"group": preference.group, "priority": preference.priority} for preference in row.preferred_groups
@@ -161,7 +160,7 @@ async def create_api_key(
         actor_ip=request.client.host if request.client else None,
         details={"key_id": created.id},
     )
-    return ApiKeyCreateResponse(**resp.model_dump())
+    return ApiKeyCreateResponse(**resp.model_dump(), key=created.key)
 
 
 @router.get("/", response_model=list[ApiKeyResponse])
@@ -259,7 +258,7 @@ async def regenerate_api_key(
     except ApiKeyNotFoundError as exc:
         raise DashboardNotFoundError(str(exc)) from exc
     resp = _to_response(row)
-    return ApiKeyCreateResponse(**resp.model_dump())
+    return ApiKeyCreateResponse(**resp.model_dump(), key=row.key)
 
 
 @router.get("/{key_id}/trends", response_model=ApiKeyTrendsResponse)
