@@ -157,27 +157,349 @@ def test_select_account_skips_rate_limited_until_reset():
     assert result.account.account_id == "b"
 
 
-def test_select_account_round_robin_prefers_least_recently_selected():
+@pytest.mark.parametrize(
+    "routing_strategy",
+    ["usage_weighted", "capacity_weighted", "high_waterline", "primary_drain"],
+)
+def test_select_account_starred_priority_runs_before_strategy(routing_strategy):
+    states = [
+        AccountState(
+            "strategy-winner",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            secondary_used_percent=0.0,
+            capacity_credits=1000.0,
+            primary_drain_score=500.0,
+        ),
+        AccountState(
+            "starred",
+            AccountStatus.ACTIVE,
+            used_percent=80.0,
+            secondary_used_percent=80.0,
+            capacity_credits=10.0,
+            primary_drain_priority_enabled=True,
+        ),
+    ]
+
+    result = select_account(states, routing_strategy=routing_strategy, deterministic_probe=True)
+
+    assert result.account is not None
+    assert result.account.account_id == "starred"
+
+
+def test_select_account_starred_priority_runs_before_reset_primer():
+    now = 1_700_000_000.0
+    primer = AccountState(
+        "primer",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        secondary_reset_at=int(now + 6 * 24 * 3600 + 23 * 3600),
+        capacity_credits=10.0,
+    )
+    starred = AccountState(
+        "starred",
+        AccountStatus.ACTIVE,
+        used_percent=80.0,
+        secondary_used_percent=80.0,
+        secondary_reset_at=int(now + 2 * 3600),
+        capacity_credits=10.0,
+        primary_drain_priority_enabled=True,
+    )
+
+    result = select_account([primer, starred], now=now, routing_strategy="capacity_weighted", deterministic_probe=True)
+
+    assert result.account is not None
+    assert result.account.account_id == "starred"
+
+
+def test_select_account_unavailable_starred_priority_falls_back():
     now = 1_700_000_000.0
     states = [
-        AccountState("a", AccountStatus.ACTIVE, used_percent=90.0, last_selected_at=now - 2),
-        AccountState("b", AccountStatus.ACTIVE, used_percent=10.0, last_selected_at=now - 30),
-        AccountState("c", AccountStatus.ACTIVE, used_percent=5.0, last_selected_at=now - 5),
+        AccountState(
+            "starred",
+            AccountStatus.RATE_LIMITED,
+            used_percent=99.0,
+            reset_at=now + 300,
+            primary_drain_priority_enabled=True,
+        ),
+        AccountState("available", AccountStatus.ACTIVE, used_percent=10.0),
     ]
-    result = select_account(states, now=now, routing_strategy="round_robin")
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted")
+
+    assert result.account is not None
+    assert result.account.account_id == "available"
+
+
+@pytest.mark.parametrize(
+    "routing_strategy",
+    ["usage_weighted", "capacity_weighted", "high_waterline", "primary_drain"],
+)
+def test_select_account_primes_full_secondary_reset_window_before_strategy(routing_strategy):
+    now = 1_700_000_000.0
+    primer = AccountState(
+        "primer",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        secondary_reset_at=int(now + 6 * 24 * 3600 + 23 * 3600),
+        capacity_credits=10.0,
+    )
+    normal_winner = AccountState(
+        "normal",
+        AccountStatus.ACTIVE,
+        used_percent=10.0,
+        secondary_used_percent=10.0,
+        secondary_reset_at=int(now + 2 * 3600),
+        capacity_credits=1000.0,
+        primary_drain_score=500.0,
+    )
+
+    result = select_account(
+        [normal_winner, primer],
+        now=now,
+        routing_strategy=routing_strategy,
+        deterministic_probe=True,
+        prefer_earlier_reset=True,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "primer"
+
+
+def test_select_account_reset_primer_ignores_near_reset_full_account():
+    now = 1_700_000_000.0
+    near_reset = AccountState(
+        "near-reset",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        secondary_reset_at=int(now + 2 * 3600),
+        capacity_credits=10.0,
+    )
+    normal = AccountState(
+        "normal",
+        AccountStatus.ACTIVE,
+        used_percent=10.0,
+        secondary_used_percent=10.0,
+        secondary_reset_at=int(now + 3 * 3600),
+        capacity_credits=1000.0,
+    )
+
+    result = select_account(
+        [near_reset, normal],
+        now=now,
+        routing_strategy="capacity_weighted",
+        deterministic_probe=True,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "normal"
+
+
+def test_select_account_reset_primer_respects_recent_selection_cooldown():
+    now = 1_700_000_000.0
+    recently_selected = AccountState(
+        "recent",
+        AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        secondary_reset_at=int(now + 6 * 24 * 3600 + 23 * 3600),
+        last_selected_at=now - 60,
+        capacity_credits=10.0,
+    )
+    normal = AccountState(
+        "normal",
+        AccountStatus.ACTIVE,
+        used_percent=10.0,
+        secondary_used_percent=10.0,
+        secondary_reset_at=int(now + 3 * 3600),
+        capacity_credits=1000.0,
+    )
+
+    result = select_account(
+        [recently_selected, normal],
+        now=now,
+        routing_strategy="capacity_weighted",
+        deterministic_probe=True,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "normal"
+
+
+def test_select_account_high_waterline_prefers_account_above_average_remaining():
+    states = [
+        AccountState("a", AccountStatus.ACTIVE, used_percent=50.0, secondary_used_percent=50.0),
+        AccountState("b", AccountStatus.ACTIVE, used_percent=0.0, secondary_used_percent=0.0),
+        AccountState("c", AccountStatus.ACTIVE, used_percent=50.0, secondary_used_percent=50.0),
+    ]
+    result = select_account(states, routing_strategy="high_waterline")
     assert result.account is not None
     assert result.account.account_id == "b"
 
 
-def test_select_account_round_robin_prefers_never_selected():
-    now = 1_700_000_000.0
+def test_select_account_high_waterline_falls_back_to_capacity_when_near_average():
     states = [
-        AccountState("a", AccountStatus.ACTIVE, used_percent=1.0, last_selected_at=now - 1),
-        AccountState("b", AccountStatus.ACTIVE, used_percent=99.0, last_selected_at=None),
+        AccountState("a", AccountStatus.ACTIVE, used_percent=10.0, secondary_used_percent=10.0, capacity_credits=10.0),
+        AccountState("b", AccountStatus.ACTIVE, used_percent=10.5, secondary_used_percent=10.5, capacity_credits=100.0),
     ]
-    result = select_account(states, now=now, routing_strategy="round_robin")
+    result = select_account(states, routing_strategy="high_waterline", deterministic_probe=True)
     assert result.account is not None
     assert result.account.account_id == "b"
+
+
+def test_select_account_primary_drain_prefers_stronger_drain_score():
+    states = [
+        AccountState(
+            "low",
+            AccountStatus.ACTIVE,
+            used_percent=30.0,
+            secondary_used_percent=30.0,
+            primary_drain_score=30.0,
+        ),
+        AccountState(
+            "high",
+            AccountStatus.ACTIVE,
+            used_percent=12.0,
+            secondary_used_percent=12.0,
+            primary_drain_score=220.0,
+        ),
+    ]
+    result = select_account(states, routing_strategy="primary_drain")
+    assert result.account is not None
+    assert result.account.account_id == "high"
+
+
+def test_select_account_primary_drain_hard_prefers_priority_flag():
+    states = [
+        AccountState(
+            "ordinary",
+            AccountStatus.ACTIVE,
+            used_percent=99.0,
+            secondary_used_percent=99.0,
+            primary_drain_score=300.0,
+        ),
+        AccountState(
+            "priority",
+            AccountStatus.ACTIVE,
+            used_percent=40.0,
+            secondary_used_percent=40.0,
+            primary_drain_score=5.0,
+            primary_drain_priority_enabled=True,
+        ),
+    ]
+    result = select_account(states, routing_strategy="primary_drain")
+    assert result.account is not None
+    assert result.account.account_id == "priority"
+
+
+def test_select_account_primary_drain_prefers_priority_full_primary_window():
+    states = [
+        AccountState(
+            "priority_with_stronger_score",
+            AccountStatus.ACTIVE,
+            used_percent=90.0,
+            secondary_used_percent=20.0,
+            primary_drain_score=300.0,
+            primary_drain_priority_enabled=True,
+        ),
+        AccountState(
+            "priority_full_primary",
+            AccountStatus.ACTIVE,
+            used_percent=100.0,
+            secondary_used_percent=20.0,
+            primary_drain_score=5.0,
+            primary_drain_priority_enabled=True,
+        ),
+        AccountState(
+            "ordinary_full_primary",
+            AccountStatus.ACTIVE,
+            used_percent=100.0,
+            secondary_used_percent=20.0,
+            primary_drain_score=500.0,
+        ),
+    ]
+
+    result = select_account(states, routing_strategy="primary_drain")
+
+    assert result.account is not None
+    assert result.account.account_id == "priority_full_primary"
+
+
+def test_select_account_primary_drain_falls_back_when_priority_flag_unavailable():
+    now = time.time()
+    states = [
+        AccountState(
+            "priority",
+            AccountStatus.RATE_LIMITED,
+            used_percent=99.0,
+            secondary_used_percent=99.0,
+            reset_at=now + 300,
+            primary_drain_score=300.0,
+            primary_drain_priority_enabled=True,
+        ),
+        AccountState(
+            "ordinary",
+            AccountStatus.ACTIVE,
+            used_percent=40.0,
+            secondary_used_percent=40.0,
+            primary_drain_score=5.0,
+        ),
+    ]
+    result = select_account(states, now=now, routing_strategy="primary_drain")
+    assert result.account is not None
+    assert result.account.account_id == "ordinary"
+
+
+def test_select_account_primary_drain_selects_priority_without_drain_score():
+    states = [
+        AccountState("ordinary", AccountStatus.ACTIVE, used_percent=20.0, capacity_credits=100.0),
+        AccountState(
+            "priority",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            capacity_credits=10.0,
+            primary_drain_priority_enabled=True,
+        ),
+    ]
+    result = select_account(states, routing_strategy="primary_drain", deterministic_probe=True)
+    assert result.account is not None
+    assert result.account.account_id == "priority"
+
+
+def test_select_account_primary_drain_priority_bypasses_health_tier_prefilter():
+    states = [
+        AccountState(
+            "ordinary",
+            AccountStatus.ACTIVE,
+            used_percent=10.0,
+            capacity_credits=100.0,
+            health_tier=0,
+        ),
+        AccountState(
+            "priority",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            capacity_credits=10.0,
+            health_tier=1,
+            primary_drain_priority_enabled=True,
+        ),
+    ]
+    result = select_account(states, routing_strategy="primary_drain", deterministic_probe=True)
+    assert result.account is not None
+    assert result.account.account_id == "priority"
+
+
+def test_select_account_primary_drain_falls_back_to_capacity_without_signal():
+    states = [
+        AccountState("small", AccountStatus.ACTIVE, used_percent=0.0, capacity_credits=10.0),
+        AccountState("large", AccountStatus.ACTIVE, used_percent=0.0, capacity_credits=100.0),
+    ]
+    result = select_account(states, routing_strategy="primary_drain", deterministic_probe=True)
+    assert result.account is not None
+    assert result.account.account_id == "large"
 
 
 def test_handle_rate_limit_sets_reset_at_from_message(monkeypatch):
@@ -188,6 +510,20 @@ def test_handle_rate_limit_sets_reset_at_from_message(monkeypatch):
     assert state.status == AccountStatus.RATE_LIMITED
     assert state.cooldown_until is not None
     assert state.cooldown_until == pytest.approx(now + 1.5)
+
+
+def test_select_account_reports_retry_after_for_recoverable_limit():
+    now = 1_700_000_000.0
+    states = [
+        AccountState("a", AccountStatus.RATE_LIMITED, used_percent=100.0, reset_at=now + 9.0),
+        AccountState("b", AccountStatus.QUOTA_EXCEEDED, used_percent=100.0, reset_at=now + 4.0),
+    ]
+
+    result = select_account(states, now=now)
+
+    assert result.account is None
+    assert result.error_message == "Rate limit exceeded. Try again in 4s"
+    assert result.retry_after_seconds == pytest.approx(4.0)
 
 
 def test_handle_rate_limit_uses_backoff_when_no_delay(monkeypatch):
@@ -1001,6 +1337,95 @@ def test_select_account_capacity_weighted_same_tier_lower_usage_selected_more():
     assert abs(low_ratio - expected_low_ratio) <= 0.05
 
 
+def test_select_account_capacity_weighted_biases_lower_configured_priority_without_excluding_peers():
+    random.seed(44)
+    n = 4000
+    prioritized = AccountState(
+        "priority-50",
+        AccountStatus.ACTIVE,
+        used_percent=50.0,
+        secondary_used_percent=50.0,
+        plan_type="pro",
+        capacity_credits=151200.0,
+        configured_priority=50,
+    )
+    peers = [
+        AccountState(
+            f"priority-100-{index}",
+            AccountStatus.ACTIVE,
+            used_percent=50.0,
+            secondary_used_percent=50.0,
+            plan_type="pro",
+            capacity_credits=151200.0,
+            configured_priority=100,
+        )
+        for index in range(3)
+    ]
+
+    counts = {state.account_id: 0 for state in [prioritized, *peers]}
+    for _ in range(n):
+        result = select_account([prioritized, *peers], routing_strategy="capacity_weighted")
+        assert result.account is not None
+        counts[result.account.account_id] += 1
+
+    prioritized_ratio = counts["priority-50"] / n
+    assert 0.35 <= prioritized_ratio <= 0.45
+    assert all(counts[peer.account_id] > 0 for peer in peers)
+
+
+def test_select_account_capacity_weighted_priority_and_capacity_match_observed_openai_bias():
+    random.seed(45)
+    n = 4000
+    preferred = AccountState(
+        "2908709191",
+        AccountStatus.ACTIVE,
+        used_percent=2.0,
+        secondary_used_percent=23.0,
+        plan_type="pro",
+        capacity_credits=151200.0,
+        configured_priority=50,
+    )
+    peers = [
+        AccountState(
+            "betsun",
+            AccountStatus.ACTIVE,
+            used_percent=8.0,
+            secondary_used_percent=80.0,
+            plan_type="pro",
+            capacity_credits=151200.0,
+            configured_priority=100,
+        ),
+        AccountState(
+            "340",
+            AccountStatus.ACTIVE,
+            used_percent=5.0,
+            secondary_used_percent=83.0,
+            plan_type="pro",
+            capacity_credits=151200.0,
+            configured_priority=100,
+        ),
+        AccountState(
+            "silence",
+            AccountStatus.ACTIVE,
+            used_percent=8.0,
+            secondary_used_percent=80.0,
+            plan_type="pro",
+            capacity_credits=151200.0,
+            configured_priority=100,
+        ),
+    ]
+
+    counts = {state.account_id: 0 for state in [preferred, *peers]}
+    for _ in range(n):
+        result = select_account([preferred, *peers], routing_strategy="capacity_weighted")
+        assert result.account is not None
+        counts[result.account.account_id] += 1
+
+    preferred_ratio = counts["2908709191"] / n
+    assert 0.65 <= preferred_ratio <= 0.80
+    assert all(counts[peer.account_id] > 0 for peer in peers)
+
+
 def test_select_account_capacity_weighted_respects_source_rank_before_capacity():
     high_priority = AccountState(
         "oauth-plus",
@@ -1256,8 +1681,8 @@ def test_select_account_capacity_weighted_prefers_capacity_within_same_reset_buc
     late = AccountState(
         "late",
         AccountStatus.ACTIVE,
-        used_percent=0.0,
-        secondary_used_percent=0.0,
+        used_percent=1.0,
+        secondary_used_percent=1.0,
         secondary_reset_at=int(now + 5 * 24 * 3600),
         plan_type="enterprise",
         capacity_credits=151200.0,
@@ -1337,8 +1762,8 @@ def test_select_account_capacity_weighted_with_prefer_falls_back_when_earliest_b
     later_healthy = AccountState(
         "later-healthy",
         AccountStatus.ACTIVE,
-        used_percent=0.0,
-        secondary_used_percent=0.0,
+        used_percent=1.0,
+        secondary_used_percent=1.0,
         secondary_reset_at=int(now + 3 * 24 * 3600),
         plan_type="enterprise",
         capacity_credits=151200.0,

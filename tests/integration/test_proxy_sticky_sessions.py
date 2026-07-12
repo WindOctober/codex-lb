@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 
 import app.modules.proxy.service as proxy_module
+from app.core.config.settings import Settings
 from app.core.crypto import TokenEncryptor
 from app.core.openai.models import OpenAIResponsePayload
 from app.core.utils.time import utcnow
@@ -86,13 +87,18 @@ def _install_proxy_settings_cache(
     sticky_reallocation_budget_threshold_pct: float = 95.0,
     openai_prompt_cache_key_derivation_enabled: bool = True,
 ) -> None:
-    settings = SimpleNamespace(
+    dashboard_settings = SimpleNamespace(
         prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
         sticky_threads_enabled=sticky_threads_enabled,
+        upstream_stream_transport="default",
         openai_cache_affinity_max_age_seconds=openai_cache_affinity_max_age_seconds,
         sticky_reallocation_budget_threshold_pct=sticky_reallocation_budget_threshold_pct,
-        openai_prompt_cache_key_derivation_enabled=openai_prompt_cache_key_derivation_enabled,
         routing_strategy="usage_weighted",
+        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
+        http_responses_session_bridge_gateway_safe_mode=False,
+    )
+    app_settings = Settings(
+        openai_prompt_cache_key_derivation_enabled=openai_prompt_cache_key_derivation_enabled,
         proxy_request_budget_seconds=75.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,
@@ -107,15 +113,13 @@ def _install_proxy_settings_cache(
         http_responses_session_bridge_codex_idle_ttl_seconds=900.0,
         http_responses_session_bridge_max_sessions=128,
         http_responses_session_bridge_queue_limit=8,
-        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
-        http_responses_session_bridge_gateway_safe_mode=False,
         proxy_token_refresh_limit=32,
         proxy_upstream_websocket_connect_limit=64,
         proxy_response_create_limit=64,
         proxy_compact_response_create_limit=16,
     )
-    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(settings))
-    monkeypatch.setattr(proxy_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(dashboard_settings))
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: app_settings)
 
 
 @pytest.mark.asyncio

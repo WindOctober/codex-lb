@@ -11,9 +11,18 @@ from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRe
 from app.core.types import JsonValue
 
 
-def test_responses_requires_instructions():
-    with pytest.raises(ValidationError):
-        ResponsesRequest.model_validate({"model": "gpt-5.1", "input": []})
+def test_responses_defaults_omitted_instructions_to_empty_string():
+    request = ResponsesRequest.model_validate({"model": "gpt-5.6-sol", "input": []})
+
+    assert request.instructions == ""
+    assert request.to_payload()["instructions"] == ""
+
+
+def test_compact_defaults_omitted_instructions_to_empty_string():
+    request = ResponsesCompactRequest.model_validate({"model": "gpt-5.6-sol", "input": []})
+
+    assert request.instructions == ""
+    assert request.to_payload()["instructions"] == ""
 
 
 def test_responses_requires_input():
@@ -42,6 +51,27 @@ def test_store_false_is_preserved():
     assert request.to_payload()["store"] is False
 
 
+def test_responses_defaults_service_tier_to_default():
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.service_tier == "default"
+    assert request.to_payload()["service_tier"] == "default"
+
+
+def test_responses_normalizes_auto_service_tier_to_default():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "service_tier": "auto",
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.service_tier == "default"
+    assert request.to_payload()["service_tier"] == "default"
+
+
 def test_compact_store_true_is_coerced_to_false():
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "store": True}
     request = ResponsesCompactRequest.model_validate(payload)
@@ -62,6 +92,27 @@ def test_compact_store_false_is_preserved():
 
     assert request.store is False
     assert "store" not in request.to_payload()
+
+
+def test_compact_defaults_service_tier_to_default():
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    assert request.service_tier == "default"
+    assert request.to_payload()["service_tier"] == "default"
+
+
+def test_compact_normalizes_auto_service_tier_to_default():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "input": [],
+        "service_tier": "auto",
+    }
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    assert request.service_tier == "default"
+    assert request.to_payload()["service_tier"] == "default"
 
 
 def test_known_unsupported_upstream_fields_are_stripped():
@@ -254,6 +305,29 @@ def test_v1_responses_preserves_service_tier():
 
     dumped = request.to_payload()
     assert dumped["service_tier"] == "priority"
+
+
+def test_v1_responses_defaults_service_tier_to_default():
+    payload = {
+        "model": "gpt-5.1",
+        "input": "hello",
+    }
+    request = V1ResponsesRequest.model_validate(payload).to_responses_request()
+
+    assert request.service_tier == "default"
+    assert request.to_payload()["service_tier"] == "default"
+
+
+def test_v1_responses_normalizes_auto_service_tier_to_default():
+    payload = {
+        "model": "gpt-5.1",
+        "input": "hello",
+        "service_tier": "auto",
+    }
+    request = V1ResponsesRequest.model_validate(payload).to_responses_request()
+
+    assert request.service_tier == "default"
+    assert request.to_payload()["service_tier"] == "default"
 
 
 def test_v1_responses_normalizes_fast_service_tier_to_priority_for_upstream():

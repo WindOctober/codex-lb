@@ -160,6 +160,24 @@ async def test_fallback_overwrites_sticky_when_reallocate_sticky_true():
 
 
 @pytest.mark.asyncio
+async def test_sticky_upsert_failure_does_not_block_selected_account():
+    acc_a = _active("a")
+    repo = _make_sticky_repo(existing_account_id=None)
+    repo.upsert.side_effect = RuntimeError("sticky store unavailable")
+
+    result = await _invoke_stickiness(
+        [acc_a],
+        "key1",
+        repo,
+        reallocate_sticky=False,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
 async def test_sticky_preserved_then_returns_to_original_on_recovery():
     """After a temporary fallback (without overwrite), the NEXT request
     returns to the original account once it recovers."""
@@ -215,6 +233,47 @@ async def test_sticky_deleted_when_pinned_account_removed_from_pool():
     repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
 
 
+@pytest.mark.asyncio
+async def test_primary_drain_rebinds_non_priority_sticky_to_available_priority():
+    acc_a = _active("a", used_percent=5.0)
+    acc_b = _active("b", used_percent=80.0)
+    acc_b.primary_drain_priority_enabled = True
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        routing_strategy="primary_drain",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "b"
+    repo.delete.assert_called_once_with("key1", kind=StickySessionKind.PROMPT_CACHE)
+    repo.upsert.assert_called_once_with("key1", "b", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+async def test_primary_drain_sticky_falls_back_when_priority_rate_limited():
+    now = time.time()
+    acc_a = _active("a", used_percent=5.0)
+    acc_b = _rate_limited("b", reset_at=now + 300)
+    acc_b.primary_drain_priority_enabled = True
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness(
+        [acc_a, acc_b],
+        "key1",
+        repo,
+        routing_strategy="primary_drain",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
 # ---------------------------------------------------------------------------
 # Pool exhaustion guard — prevent thrashing when all accounts are depleted
 # ---------------------------------------------------------------------------
@@ -261,7 +320,7 @@ async def test_pool_exhausted_but_better_candidate_exists_reallocates():
 
 
 @pytest.mark.asyncio
-async def test_round_robin_pool_health_check_prefers_budget_safe_candidate():
+async def test_high_waterline_pool_health_check_prefers_budget_safe_candidate():
     now = time.time()
     acc_a = AccountState("a", AccountStatus.ACTIVE, used_percent=96.0, last_selected_at=now - 10)
     acc_b = AccountState("b", AccountStatus.ACTIVE, used_percent=50.0, last_selected_at=now - 1)
@@ -273,7 +332,7 @@ async def test_round_robin_pool_health_check_prefers_budget_safe_candidate():
         "key-round-robin",
         repo,
         reallocate_sticky=False,
-        routing_strategy="round_robin",
+        routing_strategy="high_waterline",
     )
 
     assert result.account is not None

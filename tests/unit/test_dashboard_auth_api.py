@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from starlette.requests import Request
 
+from app.core.auth.dashboard_mode import DashboardAuthMode, DashboardRequestAuth
 from app.core.exceptions import DashboardAuthError
 from app.dependencies import DashboardAuthContext
 from app.modules.dashboard_auth.api import disable_totp, verify_totp
@@ -17,7 +18,7 @@ pytestmark = pytest.mark.unit
 
 
 def _build_request(path: str) -> Request:
-    return Request(
+    request = Request(
         {
             "type": "http",
             "http_version": "1.1",
@@ -30,6 +31,8 @@ def _build_request(path: str) -> Request:
             "client": ("127.0.0.1", 12345),
         }
     )
+    request.state.dashboard_request_auth = DashboardRequestAuth(mode=DashboardAuthMode.STANDARD)
+    return request
 
 
 @pytest.mark.asyncio

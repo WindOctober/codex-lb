@@ -229,10 +229,10 @@ def test_owner_mismatch_raises_409_for_retry() -> None:
     """
     import inspect
 
-    from app.modules.proxy import service as proxy_service_module
+    from app.modules.proxy._service.http_bridge import lifecycle as bridge_lifecycle_module
 
-    source = inspect.getsource(proxy_service_module)
+    source = inspect.getsource(bridge_lifecycle_module)
     assert "owner_mismatch_retry" in source, (
-        "Expected 'owner_mismatch_retry' log event in service.py. "
+        "Expected 'owner_mismatch_retry' log event in the bridge lifecycle. "
         "The mismatch block should raise 409 for retry, not fall through."
     )

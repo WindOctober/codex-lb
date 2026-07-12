@@ -32,7 +32,7 @@ async def test_init_http_client_uses_separate_http_and_websocket_sessions() -> N
     assert client.session is http_session
     assert client.websocket_session is websocket_session
     assert client.retry_client is retry_client
-    assert client_session_cls.call_args_list[0].kwargs["trust_env"] is True
+    assert client_session_cls.call_args_list[0].kwargs["trust_env"] is False
     assert client_session_cls.call_args_list[1].kwargs["trust_env"] is False
     retry_client_cls.assert_called_once_with(client_session=http_session, raise_for_status=False)
 

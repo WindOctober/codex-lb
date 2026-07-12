@@ -537,6 +537,23 @@ async def test_create_key_normalizes_fast_service_tier_alias() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_key_normalizes_auto_service_tier_alias_to_default() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="service-tier-default-policy",
+            allowed_models=None,
+            enforced_service_tier="AUTO",
+            expires_at=None,
+        )
+    )
+
+    assert created.enforced_service_tier == "default"
+
+
+@pytest.mark.asyncio
 async def test_update_key_normalizes_service_tier_alias() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)

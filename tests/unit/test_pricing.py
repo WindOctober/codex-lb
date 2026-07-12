@@ -63,6 +63,16 @@ def test_get_pricing_for_model_gpt_5_4_alias():
     assert model == "gpt-5.4"
 
 
+def test_get_pricing_for_model_gpt_5_5_alias():
+    result = get_pricing_for_model("gpt-5.5-2026-05-01", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+    assert result is not None
+    model, price = result
+    assert model == "gpt-5.5"
+    assert price.input_per_1m == 5.0
+    assert price.cached_input_per_1m == 0.5
+    assert price.output_per_1m == 30.0
+
+
 def test_get_pricing_for_model_gpt_5_4_mini_alias():
     result = get_pricing_for_model("gpt-5.4-mini-2026-03-17", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
     assert result is not None
@@ -139,6 +149,19 @@ def test_calculate_cost_from_usage_service_tier_trims_whitespace():
     assert flex_cost == pytest.approx(2.625)
 
 
+def test_calculate_cost_from_usage_gpt_5_5_service_tiers():
+    usage = UsageTokens(input_tokens=100_000.0, output_tokens=100_000.0)
+    price = DEFAULT_PRICING_MODELS["gpt-5.5"]
+
+    standard_cost = calculate_cost_from_usage(usage, price)
+    priority_cost = calculate_cost_from_usage(usage, price, service_tier="priority")
+    flex_cost = calculate_cost_from_usage(usage, price, service_tier="flex")
+
+    assert standard_cost == pytest.approx(3.5)
+    assert priority_cost == pytest.approx(8.75)
+    assert flex_cost == pytest.approx(1.75)
+
+
 def test_calculate_cost_from_usage_legacy_gpt_5_service_tiers() -> None:
     usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
 
@@ -201,6 +224,20 @@ def test_calculate_cost_from_usage_gpt_5_4_long_context():
     cost = calculate_cost_from_usage(usage, price)
 
     expected = (250_000 / 1_000_000) * 5.0 + (50_000 / 1_000_000) * 0.5 + (100_000 / 1_000_000) * 22.5
+    assert cost == pytest.approx(expected)
+
+
+def test_calculate_cost_from_usage_gpt_5_5_long_context():
+    usage = UsageTokens(
+        input_tokens=300_000.0,
+        output_tokens=100_000.0,
+        cached_input_tokens=50_000.0,
+    )
+    price = DEFAULT_PRICING_MODELS["gpt-5.5"]
+
+    cost = calculate_cost_from_usage(usage, price)
+
+    expected = (250_000 / 1_000_000) * 10.0 + (50_000 / 1_000_000) * 1.0 + (100_000 / 1_000_000) * 45.0
     assert cost == pytest.approx(expected)
 
 

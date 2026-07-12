@@ -5,9 +5,37 @@ from dataclasses import replace
 
 import pytest
 
-from app.core.openai.model_registry import ModelRegistry, ReasoningLevel, UpstreamModel
+from app.core.openai.model_registry import ModelRegistry, ReasoningLevel, UpstreamModel, is_public_model
 
 pytestmark = pytest.mark.unit
+
+BOOTSTRAP_MODEL_SLUGS = {
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.2",
+    "codex-auto-review",
+}
+
+EXPECTED_CORE_MODEL_PLANS = {
+    "plus",
+    "pro",
+    "prolite",
+    "team",
+    "business",
+    "enterprise",
+    "edu",
+    "education",
+    "go",
+    "hc",
+    "finserv",
+    "quorum",
+    "self_serve_business_usage_based",
+    "enterprise_cbp_usage_based",
+}
 
 
 def _model(slug: str) -> UpstreamModel:
@@ -32,6 +60,10 @@ def _model(slug: str) -> UpstreamModel:
     )
 
 
+def _model_with_support(slug: str, *, supported_in_api: bool) -> UpstreamModel:
+    return replace(_model(slug), supported_in_api=supported_in_api)
+
+
 @pytest.mark.asyncio
 async def test_initial_snapshot_is_none():
     registry = ModelRegistry(ttl_seconds=60.0)
@@ -43,6 +75,14 @@ async def test_plan_types_for_model_returns_none_when_uninitialized():
     registry = ModelRegistry(ttl_seconds=60.0)
     result = registry.plan_types_for_model("some-model")
     assert result is None
+
+
+def test_plan_types_for_model_uses_bootstrap_when_uninitialized():
+    registry = ModelRegistry(ttl_seconds=60.0)
+
+    assert registry.plan_types_for_model("gpt-5.6-sol") is not None
+    assert registry.plan_types_for_model("gpt-5.4") == EXPECTED_CORE_MODEL_PLANS
+    assert registry.plan_types_for_model("GPT-5.4") == EXPECTED_CORE_MODEL_PLANS
 
 
 @pytest.mark.asyncio
@@ -81,9 +121,38 @@ async def test_prefers_websockets_uses_snapshot_value():
 def test_prefers_websockets_uses_bootstrap_fallback_when_uninitialized():
     registry = ModelRegistry(ttl_seconds=60.0)
 
+    assert registry.prefers_websockets("gpt-5.6-sol") is True
+    assert registry.prefers_websockets("gpt-5.5") is True
     assert registry.prefers_websockets("gpt-5.4") is True
     assert registry.prefers_websockets("gpt-5.4-2026") is True
     assert registry.prefers_websockets("gpt-5.1") is False
+
+
+def test_bootstrap_models_include_current_codex_catalog():
+    registry = ModelRegistry(ttl_seconds=60.0)
+    models = registry.get_models_with_fallback()
+
+    assert set(models) == BOOTSTRAP_MODEL_SLUGS
+
+    sol = models["gpt-5.6-sol"]
+    assert sol.display_name == "GPT-5.6-Sol"
+    assert sol.context_window == 372_000
+    assert sol.default_reasoning_level == "low"
+    assert {level.effort for level in sol.supported_reasoning_levels} == {
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    }
+    assert sol.supported_in_api is True
+    assert sol.raw["visibility"] == "list"
+
+    auto_review = models["codex-auto-review"]
+    assert auto_review.raw["visibility"] == "hide"
+    assert auto_review.raw["max_context_window"] == 1_000_000
+    assert auto_review.available_in_plans == EXPECTED_CORE_MODEL_PLANS
 
 
 @pytest.mark.asyncio
@@ -174,6 +243,15 @@ def test_ttl_must_be_positive():
         ModelRegistry(ttl_seconds=0)
     with pytest.raises(ValueError, match="positive"):
         ModelRegistry(ttl_seconds=-1.0)
+
+
+def test_is_public_model_requires_supported_in_api_true():
+    public = _model_with_support("model-public", supported_in_api=True)
+    hidden = _model_with_support("model-hidden", supported_in_api=False)
+
+    assert is_public_model(public, None)
+    assert not is_public_model(hidden, None)
+    assert not is_public_model(hidden, {"model-hidden", "model-public"})
 
 
 @pytest.mark.asyncio

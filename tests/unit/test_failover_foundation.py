@@ -38,6 +38,15 @@ class TestClassifyUpstreamFailure:
         )
         assert result["failure_class"] == "rate_limit"
 
+    def test_selected_model_capacity_message_is_rate_limit(self) -> None:
+        result = classify_upstream_failure(
+            error_code="invalid_request_error",
+            error=UpstreamError(message="Selected model is at capacity. Please try a different model."),
+            http_status=400,
+            phase="first_event",
+        )
+        assert result["failure_class"] == "rate_limit"
+
     def test_insufficient_quota(self) -> None:
         result = classify_upstream_failure(
             error_code="insufficient_quota",
@@ -74,6 +83,15 @@ class TestClassifyUpstreamFailure:
         )
         assert result["failure_class"] == "retryable_transient"
 
+    def test_server_is_overloaded_without_http_status_is_retryable_transient(self) -> None:
+        result = classify_upstream_failure(
+            error_code="server_is_overloaded",
+            error=UpstreamError(message="Our servers are currently overloaded. Please try again later."),
+            http_status=None,
+            phase="first_event",
+        )
+        assert result["failure_class"] == "retryable_transient"
+
     def test_http_500_unknown_code(self) -> None:
         result = classify_upstream_failure(
             error_code="unknown_thing",
@@ -91,6 +109,24 @@ class TestClassifyUpstreamFailure:
             phase="connect",
         )
         assert result["failure_class"] == "retryable_transient"
+
+    def test_connect_forbidden_is_retryable_transient(self) -> None:
+        result = classify_upstream_failure(
+            error_code="forbidden",
+            error=UpstreamError(message="Forbidden"),
+            http_status=403,
+            phase="connect",
+        )
+        assert result["failure_class"] == "retryable_transient"
+
+    def test_first_event_forbidden_stays_non_retryable(self) -> None:
+        result = classify_upstream_failure(
+            error_code="forbidden",
+            error=UpstreamError(message="Forbidden"),
+            http_status=403,
+            phase="first_event",
+        )
+        assert result["failure_class"] == "non_retryable"
 
     def test_non_retryable_bad_request(self) -> None:
         result = classify_upstream_failure(

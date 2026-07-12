@@ -4,11 +4,22 @@ import asyncio
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import (
+    Account,
+    AccountGroupMembership,
+    AccountStatus,
+    AdditionalUsageHistory,
+    ApiKey,
+    ApiKeyAccountAssignment,
+    HttpBridgeSessionRecord,
+    RequestLog,
+    StickySession,
+    UsageHistory,
+)
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountIdentityConflictError, AccountsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
@@ -139,6 +150,88 @@ async def test_accounts_upsert_with_merge_disabled_uses_identity_lock_on_postgre
         await repo.upsert(_make_account("acc_non_merge_lock", "non-merge-lock@example.com"), merge_by_email=False)
 
         assert acquired_identity_locks == ["acc_non_merge_lock"]
+
+
+@pytest.mark.asyncio
+async def test_merge_account_data_moves_owned_rows_and_collapses_duplicates(db_setup):
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        await repo.upsert(_make_account("acc_source", "source@example.com"), merge_by_email=False)
+        await repo.upsert(_make_account("acc_target", "target@example.com"), merge_by_email=False)
+
+        session.add_all(
+            [
+                UsageHistory(account_id="acc_source", used_percent=12.0),
+                AdditionalUsageHistory(
+                    account_id="acc_source",
+                    quota_key="gpt-5",
+                    limit_name="GPT-5",
+                    metered_feature="messages",
+                    window="primary",
+                    used_percent=20.0,
+                ),
+                RequestLog(
+                    account_id="acc_source",
+                    request_id="req_merge_source",
+                    model="gpt-5.1",
+                    status="success",
+                ),
+                StickySession(key="sticky-merge-source", account_id="acc_source"),
+                HttpBridgeSessionRecord(
+                    id="bridge-merge-source",
+                    session_key_kind="codex",
+                    session_key_value="turn-1",
+                    session_key_hash="turn-1-hash",
+                    api_key_scope="global",
+                    account_id="acc_source",
+                ),
+                ApiKey(id="key_shared", name="shared", key_hash="hash_shared", key_prefix="sk-shared"),
+                ApiKey(id="key_source", name="source", key_hash="hash_source", key_prefix="sk-source"),
+                ApiKeyAccountAssignment(api_key_id="key_shared", account_id="acc_target"),
+                ApiKeyAccountAssignment(api_key_id="key_shared", account_id="acc_source"),
+                ApiKeyAccountAssignment(api_key_id="key_source", account_id="acc_source"),
+                AccountGroupMembership(account_id="acc_target", group_name="shared"),
+                AccountGroupMembership(account_id="acc_source", group_name="shared"),
+                AccountGroupMembership(account_id="acc_source", group_name="source-only"),
+            ]
+        )
+        await session.commit()
+
+        result = await repo.merge_account_data("acc_source", "acc_target")
+
+        assert result is not None
+        assert result.usage_history_rows == 1
+        assert result.additional_usage_history_rows == 1
+        assert result.request_log_rows == 1
+        assert result.sticky_session_rows == 1
+        assert result.http_bridge_session_rows == 1
+        assert result.api_key_assignment_rows == 2
+        assert result.duplicate_api_key_assignment_rows == 1
+        assert result.account_group_rows == 2
+        assert result.duplicate_account_group_rows == 1
+
+        assert await session.get(Account, "acc_source") is None
+        assert await session.get(Account, "acc_target") is not None
+
+        for model in (UsageHistory, AdditionalUsageHistory, RequestLog, StickySession, HttpBridgeSessionRecord):
+            source_count = await session.scalar(
+                select(func.count()).select_from(model).where(model.account_id == "acc_source")
+            )
+            target_count = await session.scalar(
+                select(func.count()).select_from(model).where(model.account_id == "acc_target")
+            )
+            assert source_count == 0
+            assert target_count == 1
+
+        assignments = await session.execute(
+            select(ApiKeyAccountAssignment.api_key_id).where(ApiKeyAccountAssignment.account_id == "acc_target")
+        )
+        assert set(assignments.scalars().all()) == {"key_shared", "key_source"}
+
+        groups = await session.execute(
+            select(AccountGroupMembership.group_name).where(AccountGroupMembership.account_id == "acc_target")
+        )
+        assert set(groups.scalars().all()) == {"shared", "source-only"}
 
 
 @pytest.mark.asyncio

@@ -141,7 +141,7 @@ async def test_proxy_responses_no_accounts(async_client):
 
 
 @pytest.mark.asyncio
-async def test_proxy_responses_stream_surfaces_additional_quota_data_unavailable(async_client):
+async def test_proxy_responses_stream_falls_back_when_additional_quota_data_is_unavailable(async_client):
     email = "gated-unavailable@example.com"
     raw_account_id = "acc_gated_unavailable"
     auth_json = _make_auth_json(raw_account_id, email)
@@ -156,15 +156,18 @@ async def test_proxy_responses_stream_surfaces_additional_quota_data_unavailable
 
     event = _extract_first_event(lines)
     assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "additional_quota_data_unavailable"
+    assert event["response"]["error"]["code"] == "upstream_unavailable"
 
 
 @pytest.mark.asyncio
-async def test_proxy_responses_requires_instructions(async_client):
+async def test_proxy_responses_allows_omitted_instructions(async_client):
     payload = {"model": "gpt-5.1", "input": []}
     resp = await async_client.post("/backend-api/codex/responses", json=payload)
 
-    assert resp.status_code == 400
+    assert resp.status_code == 200
+    event = _extract_first_event([line for line in resp.text.splitlines() if line])
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "no_accounts"
 
 
 @pytest.mark.asyncio

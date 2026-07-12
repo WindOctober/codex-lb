@@ -200,11 +200,9 @@ async def test_request_logs_options_respects_non_status_filters(async_client, db
             requested_at=old,
         )
 
+    scoped_since = (now - timedelta(hours=1)).replace(tzinfo=None).isoformat() + "Z"
     scoped = await async_client.get(
-        "/api/request-logs/options"
-        "?accountId=acc_scope_a"
-        "&modelOption=gpt-5.1:::"
-        f"&since={(now - timedelta(hours=1)).isoformat()}"
+        f"/api/request-logs/options?accountId=acc_scope_a&modelOption=gpt-5.1:::&since={scoped_since}"
     )
 
     assert scoped.status_code == 200

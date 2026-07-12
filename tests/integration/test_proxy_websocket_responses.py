@@ -609,6 +609,7 @@ def test_v1_responses_websocket_reuses_upstream_for_sequential_requests(app_inst
     assert [json.loads(message) for message in first_upstream.sent_text] == [
         {
             "model": "gpt-5.4",
+            "service_tier": "default",
             "instructions": "",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "first"}]}],
             "tools": [],
@@ -619,6 +620,7 @@ def test_v1_responses_websocket_reuses_upstream_for_sequential_requests(app_inst
         },
         {
             "model": "gpt-5.5",
+            "service_tier": "default",
             "instructions": "",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "second"}]}],
             "tools": [],
@@ -972,6 +974,7 @@ def test_backend_responses_websocket_forwards_previous_response_id(app_instance,
     assert [json.loads(message) for message in fake_upstream.sent_text] == [
         {
             "model": "gpt-5.4",
+            "service_tier": "default",
             "instructions": "",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
             "tools": [],
@@ -1064,6 +1067,7 @@ def test_v1_responses_websocket_forwards_previous_response_id(app_instance, monk
     assert [json.loads(message) for message in fake_upstream.sent_text] == [
         {
             "model": "gpt-5.4",
+            "service_tier": "default",
             "instructions": "",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
             "tools": [],
@@ -3923,6 +3927,7 @@ def test_backend_responses_websocket_reconnects_after_account_health_failure(app
     assert [json.loads(message) for message in first_upstream.sent_text] == [
         {
             "model": "gpt-5.1",
+            "service_tier": "default",
             "instructions": "",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "first"}]}],
             "tools": [],
@@ -3934,6 +3939,7 @@ def test_backend_responses_websocket_reconnects_after_account_health_failure(app
     assert [json.loads(message) for message in second_upstream.sent_text] == [
         {
             "model": "gpt-5.2",
+            "service_tier": "default",
             "instructions": "",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "second"}]}],
             "tools": [],

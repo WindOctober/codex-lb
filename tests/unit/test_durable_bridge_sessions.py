@@ -148,6 +148,73 @@ async def test_durable_bridge_claim_renews_same_owner_epoch(
 
 
 @pytest.mark.asyncio
+async def test_durable_bridge_registers_latest_input_metadata(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-input-metadata",
+        api_key_id="key-1",
+        instance_id="instance-a",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state="http_turn_1",
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_input_metadata",
+        lease_ttl_seconds=60.0,
+        input_item_count=3,
+        input_full_fingerprint="a" * 64,
+    )
+
+    lookup = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-input-metadata",
+        api_key_id="key-1",
+        turn_state=None,
+        session_header=None,
+        previous_response_id="resp_input_metadata",
+    )
+
+    assert lookup is not None
+    assert lookup.latest_response_id == "resp_input_metadata"
+    assert lookup.latest_input_item_count == 3
+    assert lookup.latest_input_full_fingerprint == "a" * 64
+
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_without_input_metadata",
+        lease_ttl_seconds=60.0,
+    )
+
+    lookup_without_metadata = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-input-metadata",
+        api_key_id="key-1",
+        turn_state=None,
+        session_header=None,
+        previous_response_id="resp_without_input_metadata",
+    )
+
+    assert lookup_without_metadata is not None
+    assert lookup_without_metadata.latest_response_id == "resp_without_input_metadata"
+    assert lookup_without_metadata.latest_input_item_count is None
+    assert lookup_without_metadata.latest_input_full_fingerprint is None
+
+
+@pytest.mark.asyncio
 async def test_durable_bridge_claim_takes_over_after_release(
     coordinator: DurableBridgeSessionCoordinator,
 ) -> None:

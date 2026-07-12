@@ -6,6 +6,17 @@ from app.core.openai.model_registry import ReasoningLevel, UpstreamModel, get_mo
 
 pytestmark = pytest.mark.integration
 
+BOOTSTRAP_MODEL_SLUGS = {
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.2",
+    "codex-auto-review",
+}
+
 
 def _make_upstream_model(
     slug: str,
@@ -69,18 +80,20 @@ async def test_v1_models_list(async_client):
 
 
 @pytest.mark.asyncio
-async def test_v1_models_empty_when_registry_not_populated(async_client):
+async def test_v1_models_uses_bootstrap_models_when_registry_not_populated(async_client):
     registry = get_model_registry()
     registry._snapshot = None
     resp = await async_client.get("/v1/models")
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["object"] == "list"
-    assert payload["data"] == []
+    ids = {item["id"] for item in payload["data"]}
+    assert ids == BOOTSTRAP_MODEL_SLUGS
+    assert "gpt-5.6-sol" in ids
 
 
 @pytest.mark.asyncio
-async def test_v1_models_includes_supported_in_api_false_models(async_client):
+async def test_v1_models_excludes_supported_in_api_false_models(async_client):
     registry = get_model_registry()
     models = [
         _make_upstream_model("gpt-5.2"),
@@ -92,7 +105,8 @@ async def test_v1_models_includes_supported_in_api_false_models(async_client):
     resp = await async_client.get("/v1/models")
     assert resp.status_code == 200
     ids = {item["id"] for item in resp.json()["data"]}
-    assert {"gpt-5.2", "gpt-5.3-codex", "gpt-hidden"}.issubset(ids)
+    assert {"gpt-5.2", "gpt-5.3-codex"}.issubset(ids)
+    assert "gpt-hidden" not in ids
 
 
 @pytest.mark.asyncio
@@ -125,6 +139,9 @@ async def test_backend_codex_models_returns_format1(async_client):
     assert isinstance(payload["models"], list)
     slugs = {m["slug"] for m in payload["models"]}
     assert {"gpt-5.2", "gpt-5.3-codex"}.issubset(slugs)
+    assert payload["object"] == "list"
+    data_ids = {m["id"] for m in payload["data"]}
+    assert {"gpt-5.2", "gpt-5.3-codex"}.issubset(data_ids)
 
 
 @pytest.mark.asyncio
@@ -219,7 +236,7 @@ async def test_backend_codex_models_filters_disallowed_models(async_client):
 
 
 @pytest.mark.asyncio
-async def test_backend_codex_models_includes_supported_in_api_false_models(async_client):
+async def test_backend_codex_models_excludes_supported_in_api_false_models(async_client):
     registry = get_model_registry()
     models = [
         _make_upstream_model("gpt-5.2"),
@@ -231,17 +248,22 @@ async def test_backend_codex_models_includes_supported_in_api_false_models(async
     resp = await async_client.get("/backend-api/codex/models")
     assert resp.status_code == 200
     slugs = {m["slug"] for m in resp.json()["models"]}
-    assert {"gpt-5.2", "gpt-5.3-codex", "gpt-hidden"}.issubset(slugs)
+    assert {"gpt-5.2", "gpt-5.3-codex"}.issubset(slugs)
+    assert "gpt-hidden" not in slugs
 
 
 @pytest.mark.asyncio
-async def test_backend_codex_models_empty_when_registry_not_populated(async_client):
+async def test_backend_codex_models_uses_bootstrap_models_when_registry_not_populated(async_client):
     registry = get_model_registry()
     registry._snapshot = None
     resp = await async_client.get("/backend-api/codex/models")
     assert resp.status_code == 200
     payload = resp.json()
-    assert payload["models"] == []
+    slugs = {item["slug"] for item in payload["models"]}
+    assert slugs == BOOTSTRAP_MODEL_SLUGS
+    data_ids = {item["id"] for item in payload["data"]}
+    assert data_ids == BOOTSTRAP_MODEL_SLUGS - {"codex-auto-review"}
+    assert "gpt-5.6-sol" in slugs
 
 
 @pytest.mark.asyncio
@@ -265,6 +287,9 @@ async def test_model_sets_are_consistent_across_api_endpoints(async_client):
     dashboard_ids = {item["id"] for item in dashboard.json()["models"]}
     v1_ids = {item["id"] for item in v1.json()["data"]}
     codex_slugs = {item["slug"] for item in codex.json()["models"]}
+    assert "gpt-hidden" not in dashboard_ids
+    assert "gpt-hidden" not in v1_ids
+    assert "gpt-hidden" not in codex_slugs
     assert dashboard_ids == v1_ids == codex_slugs
 
 

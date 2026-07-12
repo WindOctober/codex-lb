@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import SQLAlchemyError
 
 import app.core.auth.dependencies as auth_dependencies
 import app.core.middleware.api_firewall as api_firewall_module
@@ -86,6 +87,55 @@ async def test_api_key_validation_uses_cache_for_repeated_key(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_api_key_validation_uses_stale_cache_when_db_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key_data = ApiKeyData(
+        id="key_stale_db",
+        name="hot-path-stale",
+        key_prefix="sk-clb-stale",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=datetime.now(UTC),
+        last_used_at=None,
+    )
+
+    class _SettingsCache:
+        async def get(self) -> SimpleNamespace:
+            return SimpleNamespace(api_key_auth_enabled=True)
+
+    class _Service:
+        def __init__(self, _repo: object) -> None:
+            pass
+
+        async def validate_key(self, _token: str) -> ApiKeyData:
+            raise SQLAlchemyError("connection is closed")
+
+    @asynccontextmanager
+    async def _fake_session() -> AsyncIterator[object]:
+        yield object()
+
+    monkeypatch.setattr(auth_dependencies, "get_settings_cache", lambda: _SettingsCache())
+    monkeypatch.setattr(auth_dependencies, "get_background_session", _fake_session)
+    monkeypatch.setattr(auth_dependencies, "ApiKeysRepository", lambda _session: object())
+    monkeypatch.setattr(auth_dependencies, "ApiKeysService", _Service)
+
+    token = "sk-clb-hot-path-stale"
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    cache = get_api_key_cache()
+    await cache.set(token_hash, api_key_data)
+    cache._cache[token_hash].expires_at = 0.0
+
+    resolved = await auth_dependencies.validate_proxy_api_key_authorization(f"Bearer {token}")
+
+    assert resolved == api_key_data
+
+
+@pytest.mark.asyncio
 async def test_firewall_middleware_uses_cache_for_repeated_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 
@@ -124,6 +174,51 @@ async def test_firewall_middleware_uses_cache_for_repeated_ip(monkeypatch: pytes
             response = await client.get("/v1/test")
             assert response.status_code == 200
 
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_firewall_middleware_fails_open_when_allowlist_lookup_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class _Service:
+        def __init__(self, _repo: object) -> None:
+            pass
+
+        async def is_ip_allowed(self, _ip: str | None) -> bool:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("firewall store unavailable")
+
+    @asynccontextmanager
+    async def _fake_session() -> AsyncIterator[object]:
+        yield object()
+
+    monkeypatch.setattr(
+        api_firewall_module,
+        "get_settings",
+        lambda: SimpleNamespace(firewall_trusted_proxy_cidrs=[], firewall_trust_proxy_headers=False),
+    )
+    monkeypatch.setattr(api_firewall_module, "get_background_session", _fake_session)
+    monkeypatch.setattr(api_firewall_module, "FirewallRepository", lambda _session: object())
+    monkeypatch.setattr(api_firewall_module, "FirewallService", _Service)
+
+    app = FastAPI()
+    add_api_firewall_middleware(app)
+
+    @app.get("/v1/test")
+    async def _v1_test() -> dict[str, str]:
+        return {"ok": "true"}
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        first = await client.get("/v1/test")
+        second = await client.get("/v1/test")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
     assert calls == 1
 
 

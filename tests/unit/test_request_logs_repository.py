@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,6 +9,77 @@ from sqlalchemy.exc import ResourceClosedError
 
 from app.db.session import SessionLocal
 from app.modules.request_logs.repository import RequestLogsRepository
+
+
+@pytest.mark.asyncio
+async def test_bridge_latency_health_snapshot_anchors_to_latest_request_log(db_setup) -> None:
+    del db_setup
+    anchor_at = datetime(2026, 1, 1, 12, 2, 30)
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        await repo.add_log(
+            account_id=None,
+            request_id="req-old",
+            model="gpt-5.5",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            latency_first_token_ms=1,
+            status="success",
+            error_code=None,
+            requested_at=anchor_at - timedelta(hours=1),
+        )
+        await repo.add_log(
+            account_id=None,
+            request_id="req-ok",
+            model="gpt-5.5",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1_000,
+            latency_first_token_ms=1_000,
+            status="success",
+            error_code=None,
+            requested_at=anchor_at - timedelta(minutes=2),
+        )
+        await repo.add_log(
+            account_id=None,
+            request_id="req-warning",
+            model="gpt-5.5",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=12_000,
+            latency_first_token_ms=12_000,
+            status="success",
+            error_code=None,
+            requested_at=anchor_at - timedelta(minutes=1),
+        )
+        await repo.add_log(
+            account_id=None,
+            request_id="req-critical",
+            model="gpt-5.5",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=30_000,
+            latency_first_token_ms=30_000,
+            status="success",
+            error_code=None,
+            requested_at=anchor_at,
+        )
+
+        snapshot = await repo.bridge_latency_health_snapshot(
+            latency_window_minutes=3,
+            availability_window_minutes=10,
+            history_bucket_count=3,
+        )
+
+    assert snapshot.anchor_at == anchor_at
+    assert snapshot.latency_first_token_p50_ms == 12_000
+    assert snapshot.latency_first_token_p95_ms == 30_000
+    assert snapshot.latency_first_token_p99_ms == 30_000
+    assert snapshot.success_count == 3
+    assert snapshot.request_count == 3
+    assert snapshot.success_rate_percent == 100.0
+    assert [bucket.status for bucket in snapshot.history] == ["ok", "warning", "critical"]
 
 
 @pytest.mark.asyncio

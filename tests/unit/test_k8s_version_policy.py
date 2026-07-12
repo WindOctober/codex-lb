@@ -16,6 +16,12 @@ def test_chart_readme_documents_modern_support_policy() -> None:
     assert "Validation baseline in CI and smoke installs: `1.35`" in readme
 
 
+def test_chart_defaults_do_not_reenable_http_bridge_queue_cap() -> None:
+    values = yaml.safe_load(Path("deploy/helm/codex-lb/values.yaml").read_text(encoding="utf-8"))
+    assert values["config"]["sessionBridgeQueueLimit"] == 0
+    assert values["config"]["sessionBridgeCodexPrewarmEnabled"] is False
+
+
 def test_ci_uses_1_32_minimum_and_1_35_baseline() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "kubeconform (K8s 1.32.0)" in workflow

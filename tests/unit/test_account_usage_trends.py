@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from app.core.usage.types import UsageTrendBucket
-from app.modules.accounts.mappers import build_account_usage_trends
+from app.db.models import UsageHistory
+from app.modules.accounts.mappers import build_account_quota_timeline, build_account_usage_trends
 
 
 def _bucket(epoch: int, account_id: str, window: str, avg_used: float, samples: int = 1) -> UsageTrendBucket:
@@ -95,3 +98,151 @@ class TestBuildAccountUsageTrends:
         result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
         for point in result["a1"].primary:
             assert point.t.tzinfo is not None
+
+
+class TestBuildAccountQuotaTimeline:
+    def test_builds_primary_usage_and_secondary_remaining_buckets(self):
+        bucket_seconds = 5 * 3600
+        since_epoch = (1_704_067_200 // bucket_seconds) * bucket_seconds
+        primary_history = [
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=30.0,
+                recorded_at=datetime.fromtimestamp(since_epoch + 3600, tz=timezone.utc),
+            ),
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=80.0,
+                recorded_at=datetime.fromtimestamp(since_epoch + 2 * 3600, tz=timezone.utc),
+            ),
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=20.0,
+                recorded_at=datetime.fromtimestamp(since_epoch + bucket_seconds + 3600, tz=timezone.utc),
+            ),
+        ]
+        secondary_history = [
+            UsageHistory(
+                account_id="a1",
+                window="secondary",
+                used_percent=40.0,
+                recorded_at=datetime.fromtimestamp(since_epoch + 2 * 3600, tz=timezone.utc),
+            ),
+            UsageHistory(
+                account_id="a1",
+                window="secondary",
+                used_percent=5.0,
+                reset_at=since_epoch + bucket_seconds + 1800,
+                recorded_at=datetime.fromtimestamp(since_epoch + bucket_seconds + 3600, tz=timezone.utc),
+            ),
+        ]
+
+        timeline = build_account_quota_timeline(
+            primary_history=primary_history,
+            secondary_history=secondary_history,
+            since_epoch=since_epoch,
+            bucket_seconds=bucket_seconds,
+            bucket_count=2,
+            primary_capacity_credits=100.0,
+        )
+
+        assert timeline[0].primary_used_percent == 80.0
+        assert timeline[0].primary_used_credits == 80.0
+        assert timeline[0].secondary_remaining_percent == 60.0
+        assert timeline[0].secondary_reset is False
+        assert timeline[1].primary_used_percent == 0.0
+        assert timeline[1].secondary_remaining_percent == 95.0
+        assert timeline[1].secondary_reset is True
+        assert timeline[1].secondary_reset_at is not None
+        assert timeline[2].primary_used_percent == 20.0
+
+    def test_primary_usage_reanchors_buckets_after_quota_returns_to_full(self):
+        bucket_seconds = 5 * 3600
+        since_epoch = int(datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc).timestamp())
+        aligned_start = (since_epoch // bucket_seconds) * bucket_seconds
+        reset_anchor = aligned_start + 6 * 3600
+        primary_history = [
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=80.0,
+                reset_at=aligned_start + bucket_seconds,
+                window_minutes=300,
+                recorded_at=datetime.fromtimestamp(aligned_start + 1 * 3600, tz=timezone.utc),
+            ),
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=90.0,
+                reset_at=aligned_start + bucket_seconds,
+                window_minutes=300,
+                recorded_at=datetime.fromtimestamp(aligned_start + 4 * 3600, tz=timezone.utc),
+            ),
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=7.0,
+                reset_at=reset_anchor + bucket_seconds,
+                window_minutes=300,
+                recorded_at=datetime.fromtimestamp(reset_anchor + 15 * 60, tz=timezone.utc),
+            ),
+        ]
+
+        timeline = build_account_quota_timeline(
+            primary_history=primary_history,
+            secondary_history=[],
+            since_epoch=since_epoch,
+            bucket_seconds=bucket_seconds,
+            bucket_count=3,
+            primary_capacity_credits=100.0,
+        )
+
+        assert timeline[0].start_at == datetime.fromtimestamp(aligned_start, tz=timezone.utc)
+        assert timeline[0].end_at == datetime.fromtimestamp(aligned_start + bucket_seconds, tz=timezone.utc)
+        assert timeline[0].primary_used_percent == 90.0
+        assert timeline[1].start_at == datetime.fromtimestamp(aligned_start + bucket_seconds, tz=timezone.utc)
+        assert timeline[1].end_at == datetime.fromtimestamp(reset_anchor, tz=timezone.utc)
+        assert timeline[1].primary_used_percent == 0.0
+        assert timeline[2].start_at == datetime.fromtimestamp(reset_anchor, tz=timezone.utc)
+        assert timeline[2].primary_used_percent == 7.0
+
+    def test_primary_usage_merges_tiny_tail_before_reset_anchor(self):
+        bucket_seconds = 5 * 3600
+        aligned_start = int(datetime(2026, 6, 15, 14, 0, tzinfo=timezone.utc).timestamp())
+        reset_anchor = aligned_start + bucket_seconds + 35 * 60
+        primary_history = [
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=86.0,
+                reset_at=aligned_start + bucket_seconds,
+                window_minutes=300,
+                recorded_at=datetime.fromtimestamp(aligned_start + 4 * 3600, tz=timezone.utc),
+            ),
+            UsageHistory(
+                account_id="a1",
+                window="primary",
+                used_percent=7.0,
+                reset_at=reset_anchor + bucket_seconds,
+                window_minutes=300,
+                recorded_at=datetime.fromtimestamp(reset_anchor + 10 * 60, tz=timezone.utc),
+            ),
+        ]
+
+        timeline = build_account_quota_timeline(
+            primary_history=primary_history,
+            secondary_history=[],
+            since_epoch=aligned_start,
+            bucket_seconds=bucket_seconds,
+            bucket_count=3,
+            primary_capacity_credits=100.0,
+        )
+
+        assert timeline[0].start_at == datetime.fromtimestamp(aligned_start, tz=timezone.utc)
+        assert timeline[0].end_at == datetime.fromtimestamp(reset_anchor, tz=timezone.utc)
+        assert timeline[0].primary_used_percent == 86.0
+        assert timeline[1].start_at == datetime.fromtimestamp(reset_anchor, tz=timezone.utc)
+        assert timeline[1].primary_used_percent == 7.0

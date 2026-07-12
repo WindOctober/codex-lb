@@ -5,12 +5,12 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.core.auth import fallback_account_id, generate_unique_account_id
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, UsageHistory
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
@@ -42,10 +42,16 @@ def _make_auth_json(account_id: str | None, email: str, plan_type: str = "plus")
     return {"tokens": tokens}
 
 
-def _make_account(account_id: str, email: str, plan_type: str = "plus") -> Account:
+def _make_account(
+    account_id: str,
+    email: str,
+    plan_type: str = "plus",
+    chatgpt_account_id: str | None = None,
+) -> Account:
     encryptor = TokenEncryptor()
     return Account(
         id=account_id,
+        chatgpt_account_id=chatgpt_account_id,
         email=email,
         plan_type=plan_type,
         access_token_encrypted=encryptor.encrypt("access"),
@@ -149,7 +155,7 @@ async def test_import_overwrites_for_same_account_identity_when_overwrite_enable
 
 
 @pytest.mark.asyncio
-async def test_import_without_overwrite_keeps_same_account_identity_separate(async_client):
+async def test_import_without_overwrite_merges_same_account_identity(async_client, db_setup):
     settings = await async_client.put(
         "/api/settings",
         json={
@@ -174,6 +180,20 @@ async def test_import_without_overwrite_keeps_same_account_identity_separate(asy
     }
     first = await async_client.post("/api/accounts/import", files=files_one)
     assert first.status_code == 200
+    base_account_id = generate_unique_account_id(raw_account_id, email)
+
+    async with SessionLocal() as session:
+        await session.execute(
+            update(Account)
+            .where(Account.id == base_account_id)
+            .values(
+                status=AccountStatus.DEACTIVATED,
+                deactivation_reason="reauth_required",
+                kyc_enabled=True,
+                upstream_priority=12,
+            )
+        )
+        await session.commit()
 
     files_two = {
         "auth_json": (
@@ -185,23 +205,24 @@ async def test_import_without_overwrite_keeps_same_account_identity_separate(asy
     second = await async_client.post("/api/accounts/import", files=files_two)
     assert second.status_code == 200
 
-    base_account_id = generate_unique_account_id(raw_account_id, email)
     first_id = first.json()["accountId"]
     second_id = second.json()["accountId"]
     assert first_id == base_account_id
-    assert second_id != first_id
-    assert second_id.startswith(f"{base_account_id}__copy")
+    assert second_id == first_id
+    assert second.json()["planType"] == "team"
 
     accounts_response = await async_client.get("/api/accounts")
     assert accounts_response.status_code == 200
     accounts = [entry for entry in accounts_response.json()["accounts"] if entry["email"] == email]
-    assert len(accounts) == 2
-    ids = {entry["accountId"] for entry in accounts}
-    assert ids == {first_id, second_id}
+    assert len(accounts) == 1
+    assert accounts[0]["accountId"] == base_account_id
+    assert accounts[0]["status"] == "active"
+    assert accounts[0]["kycEnabled"] is True
+    assert accounts[0]["configuredPriority"] == 12
 
 
 @pytest.mark.asyncio
-async def test_import_returns_409_when_overwrite_mode_cannot_resolve_duplicate_email(async_client):
+async def test_import_returns_409_for_same_email_different_account_identity(async_client):
     enable_separate = await async_client.put(
         "/api/settings",
         json={
@@ -234,45 +255,73 @@ async def test_import_returns_409_when_overwrite_mode_cannot_resolve_duplicate_e
         files={
             "auth_json": (
                 "auth.json",
-                json.dumps(_make_auth_json(raw_account_id, email, "team")),
-                "application/json",
-            )
-        },
-    )
-    assert second.status_code == 200
-    assert second.json()["accountId"] != first.json()["accountId"]
-
-    enable_overwrite = await async_client.put(
-        "/api/settings",
-        json={
-            "stickyThreadsEnabled": False,
-            "preferEarlierResetAccounts": False,
-            "importWithoutOverwrite": False,
-            "totpRequiredOnLogin": False,
-        },
-    )
-    assert enable_overwrite.status_code == 200
-    assert enable_overwrite.json()["importWithoutOverwrite"] is False
-
-    conflict = await async_client.post(
-        "/api/accounts/import",
-        files={
-            "auth_json": (
-                "auth.json",
                 json.dumps(_make_auth_json("acc_conflict_new", email, "pro")),
                 "application/json",
             )
         },
     )
-    assert conflict.status_code == 409
-    payload = conflict.json()
+    assert second.status_code == 409
+    payload = second.json()
     assert payload["error"]["code"] == "duplicate_identity_conflict"
 
     accounts_response = await async_client.get("/api/accounts")
     assert accounts_response.status_code == 200
     accounts = [entry for entry in accounts_response.json()["accounts"] if entry["email"] == email]
-    assert len(accounts) == 2
+    assert len(accounts) == 1
     assert all(entry["planType"] != "pro" for entry in accounts)
+
+
+@pytest.mark.asyncio
+async def test_import_collapses_legacy_same_identity_copies(async_client, db_setup):
+    email = "legacy-copy@example.com"
+    raw_account_id = "acc_legacy_copy"
+    base_account_id = generate_unique_account_id(raw_account_id, email)
+    copy_account_id = f"{base_account_id}__copy2"
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        base = _make_account(base_account_id, email, "plus", chatgpt_account_id=raw_account_id)
+        base.status = AccountStatus.DEACTIVATED
+        base.deactivation_reason = "old_tokens"
+        await accounts_repo.upsert(base, merge_by_email=False)
+
+        copy = _make_account(copy_account_id, email, "plus", chatgpt_account_id=raw_account_id)
+        copy.kyc_enabled = True
+        copy.upstream_priority = 7
+        await accounts_repo.upsert(copy, merge_by_email=False)
+        await usage_repo.add_entry(copy_account_id, 43.0)
+
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={
+            "auth_json": (
+                "auth.json",
+                json.dumps(_make_auth_json(raw_account_id, email, "pro")),
+                "application/json",
+            )
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["accountId"] == base_account_id
+    assert response.json()["planType"] == "pro"
+
+    accounts_response = await async_client.get("/api/accounts")
+    assert accounts_response.status_code == 200
+    accounts = [entry for entry in accounts_response.json()["accounts"] if entry["email"] == email]
+    assert len(accounts) == 1
+    assert accounts[0]["accountId"] == base_account_id
+    assert accounts[0]["kycEnabled"] is True
+    assert accounts[0]["configuredPriority"] == 7
+    assert accounts[0]["status"] == "active"
+
+    async with SessionLocal() as session:
+        remaining = await session.get(Account, copy_account_id)
+        assert remaining is None
+
+        usage = await session.execute(select(UsageHistory.account_id).where(UsageHistory.used_percent == 43.0))
+        assert usage.scalar_one() == base_account_id
 
 
 @pytest.mark.asyncio
@@ -293,6 +342,62 @@ async def test_delete_account_removes_from_list(async_client):
     assert accounts.status_code == 200
     data = accounts.json()["accounts"]
     assert all(account["accountId"] != actual_account_id for account in data)
+
+
+@pytest.mark.asyncio
+async def test_merge_accounts_endpoint_moves_usage_and_removes_source(async_client, db_setup):
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        logs_repo = RequestLogsRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_merge_api_source", "merge-source@example.com"))
+        await accounts_repo.upsert(_make_account("acc_merge_api_target", "merge-target@example.com"))
+        await usage_repo.add_entry("acc_merge_api_source", 42.0)
+        await logs_repo.add_log(
+            account_id="acc_merge_api_source",
+            request_id="req_merge_api_source",
+            model="gpt-5.1",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+        )
+
+    response = await async_client.post(
+        "/api/accounts/merge",
+        json={"sourceAccountId": "acc_merge_api_source", "targetAccountId": "acc_merge_api_target"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "merged"
+    assert payload["sourceAccountId"] == "acc_merge_api_source"
+    assert payload["targetAccountId"] == "acc_merge_api_target"
+    assert payload["usageHistoryRows"] == 1
+    assert payload["requestLogRows"] == 1
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    account_ids = {entry["accountId"] for entry in accounts.json()["accounts"]}
+    assert "acc_merge_api_source" not in account_ids
+    assert "acc_merge_api_target" in account_ids
+
+    trends = await async_client.get("/api/accounts/acc_merge_api_target/trends")
+    assert trends.status_code == 200
+    assert trends.json()["primary"]
+
+
+@pytest.mark.asyncio
+async def test_merge_accounts_endpoint_rejects_same_account(async_client):
+    response = await async_client.post(
+        "/api/accounts/merge",
+        json={"sourceAccountId": "same", "targetAccountId": "same"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_account_merge"
 
 
 @pytest.mark.asyncio
@@ -476,6 +581,56 @@ async def test_accounts_list_request_usage_uses_persisted_cost(async_client, db_
     request_usage = accounts["acc_persisted_cost"]["requestUsage"]
     assert request_usage is not None
     assert request_usage["totalCostUsd"] == pytest.approx(12.345678, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_accounts_list_request_usage_prices_only_legacy_null_cost_rows(async_client, db_setup):
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        logs_repo = RequestLogsRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_mixed_cost", "mixed-cost@example.com"))
+
+        persisted_log = await logs_repo.add_log(
+            account_id="acc_mixed_cost",
+            request_id="req_mixed_cost_persisted",
+            model="gpt-5.4",
+            service_tier="priority",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+        )
+        legacy_log = await logs_repo.add_log(
+            account_id="acc_mixed_cost",
+            request_id="req_mixed_cost_legacy",
+            model="gpt-5.4",
+            service_tier="priority",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            latency_ms=50,
+            status="success",
+            error_code=None,
+        )
+        await session.execute(
+            update(persisted_log.__class__)
+            .where(persisted_log.__class__.id == persisted_log.id)
+            .values(cost_usd=12.345678)
+        )
+        await session.execute(
+            update(legacy_log.__class__).where(legacy_log.__class__.id == legacy_log.id).values(cost_usd=None)
+        )
+        await session.commit()
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    accounts = {item["accountId"]: item for item in response.json()["accounts"]}
+
+    request_usage = accounts["acc_mixed_cost"]["requestUsage"]
+    assert request_usage is not None
+    assert request_usage["requestCount"] == 2
+    assert request_usage["totalCostUsd"] == pytest.approx(47.345678, abs=1e-6)
 
 
 @pytest.mark.asyncio

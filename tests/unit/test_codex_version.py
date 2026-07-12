@@ -7,6 +7,7 @@ import aiohttp
 import pytest
 
 from app.core.clients.codex_version import CodexVersionCache
+from app.core.config.settings import get_settings
 
 
 def _mock_response(*, status: int = 200, json_data: object = None) -> MagicMock:
@@ -85,7 +86,7 @@ async def test_rejects_invalid_version_name():
         version = await cache.get_version()
 
     # Invalid name falls back to settings default
-    assert version == "0.101.0"
+    assert version == get_settings().model_registry_client_version
 
 
 @pytest.mark.asyncio
@@ -97,7 +98,7 @@ async def test_rejects_alpha_version_name():
     with patch("app.core.clients.codex_version.aiohttp.ClientSession", return_value=session):
         version = await cache.get_version()
 
-    assert version == "0.101.0"
+    assert version == get_settings().model_registry_client_version
 
 
 @pytest.mark.asyncio
@@ -133,7 +134,7 @@ async def test_fallback_to_settings_default_when_no_cache():
     with patch("app.core.clients.codex_version.aiohttp.ClientSession", return_value=session_fail):
         version = await cache.get_version()
 
-    assert version == "0.101.0"
+    assert version == get_settings().model_registry_client_version
 
 
 @pytest.mark.asyncio
@@ -146,7 +147,7 @@ async def test_fallback_on_network_exception():
     ):
         version = await cache.get_version()
 
-    assert version == "0.101.0"
+    assert version == get_settings().model_registry_client_version
 
 
 @pytest.mark.asyncio
@@ -177,7 +178,7 @@ async def test_missing_name_field_falls_back():
     with patch("app.core.clients.codex_version.aiohttp.ClientSession", return_value=session):
         version = await cache.get_version()
 
-    assert version == "0.101.0"
+    assert version == get_settings().model_registry_client_version
 
 
 def test_ttl_must_be_positive():

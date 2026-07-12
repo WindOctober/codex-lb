@@ -89,6 +89,36 @@ def _server_error_sse_event() -> str:
     )
 
 
+def _selected_model_capacity_sse_event() -> str:
+    return _sse_event(
+        {
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error",
+                    "message": "Selected model is at capacity. Please try a different model.",
+                },
+            },
+        }
+    )
+
+
+def _server_overloaded_sse_event() -> str:
+    return _sse_event(
+        {
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": "server_error",
+                    "code": "server_is_overloaded",
+                    "message": "Our servers are currently overloaded. Please try again later.",
+                },
+            },
+        }
+    )
+
+
 def _success_sse_event(response_id: str = "resp_ok") -> str:
     return _sse_event(
         {
@@ -105,7 +135,10 @@ def _extract_events(lines: list[str]) -> list[dict]:
     events = []
     for line in lines:
         if line.startswith("data: "):
-            events.append(json.loads(line[6:]))
+            data = line[6:]
+            if data == "[DONE]":
+                continue
+            events.append(json.loads(data))
     return events
 
 
@@ -340,6 +373,66 @@ async def test_stream_connect_phase_429_usage_limit_transparent_failover(async_c
     assert len(completed) == 1
     assert len(failed) == 0
     assert seen_account_ids[:2] == ["acc_stream_429_a", "acc_stream_429_b"]
+
+
+@pytest.mark.asyncio
+async def test_stream_selected_model_capacity_first_event_fails_over(async_client, monkeypatch):
+    """Pre-visible selected-model capacity events should fail over despite invalid_request_error."""
+    await _import_account(async_client, "acc_stream_capacity_a", "streamcapacitya@example.com")
+    await _import_account(async_client, "acc_stream_capacity_b", "streamcapacityb@example.com")
+
+    seen_account_ids: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen_account_ids.append(account_id)
+        if account_id == "acc_stream_capacity_a":
+            yield _selected_model_capacity_sse_event()
+            return
+        yield _success_sse_event("resp_stream_capacity_ok")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.5", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    completed = [e for e in events if e.get("type") == "response.completed"]
+    failed = [e for e in events if e.get("type") == "response.failed"]
+    assert len(completed) == 1
+    assert len(failed) == 0
+    assert seen_account_ids[:2] == ["acc_stream_capacity_a", "acc_stream_capacity_b"]
+
+
+@pytest.mark.asyncio
+async def test_stream_server_overloaded_first_event_fails_over(async_client, monkeypatch):
+    """Pre-visible server_is_overloaded events should fail over to another account."""
+    await _import_account(async_client, "acc_stream_overloaded_a", "streamoverloadeda@example.com")
+    await _import_account(async_client, "acc_stream_overloaded_b", "streamoverloadedb@example.com")
+
+    seen_account_ids: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen_account_ids.append(account_id)
+        if account_id == "acc_stream_overloaded_a":
+            yield _server_overloaded_sse_event()
+            return
+        yield _success_sse_event("resp_stream_overloaded_ok")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.5", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    completed = [e for e in events if e.get("type") == "response.completed"]
+    failed = [e for e in events if e.get("type") == "response.failed"]
+    assert len(completed) == 1
+    assert len(failed) == 0
+    assert seen_account_ids[:2] == ["acc_stream_overloaded_a", "acc_stream_overloaded_b"]
 
 
 @pytest.mark.asyncio

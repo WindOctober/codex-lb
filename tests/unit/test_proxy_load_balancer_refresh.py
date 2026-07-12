@@ -37,6 +37,7 @@ from app.modules.proxy.load_balancer import (
     RuntimeState,
     _build_states,
     _filter_accounts_for_allowed_groups,
+    _select_account_preferring_budget_safe,
 )
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickySessionsRepository
@@ -140,6 +141,215 @@ def test_filter_accounts_for_allowed_groups_tracks_plan_changes_for_builtin_plus
     assert _filter_accounts_for_allowed_groups([account], frozenset({"general"})) == [account]
 
 
+def test_high_waterline_selection_prefers_account_above_average_remaining() -> None:
+    high = load_balancer_module.AccountState(
+        account_id="acc-high",
+        status=AccountStatus.ACTIVE,
+        used_percent=0.0,
+        secondary_used_percent=0.0,
+        plan_type="pro",
+    )
+    low_a = load_balancer_module.AccountState(
+        account_id="acc-low-a",
+        status=AccountStatus.ACTIVE,
+        used_percent=45.0,
+        secondary_used_percent=45.0,
+        plan_type="pro",
+    )
+    low_b = load_balancer_module.AccountState(
+        account_id="acc-low-b",
+        status=AccountStatus.ACTIVE,
+        used_percent=45.0,
+        secondary_used_percent=45.0,
+        plan_type="pro",
+    )
+
+    result = _select_account_preferring_budget_safe(
+        [low_a, high, low_b],
+        prefer_earlier_reset=False,
+        routing_strategy="high_waterline",
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "acc-high"
+
+
+def test_high_waterline_selection_falls_back_when_remaining_is_near_average() -> None:
+    first = load_balancer_module.AccountState(
+        account_id="acc-first",
+        status=AccountStatus.ACTIVE,
+        used_percent=10.0,
+        secondary_used_percent=10.0,
+        last_selected_at=10.0,
+        plan_type="pro",
+    )
+    second = load_balancer_module.AccountState(
+        account_id="acc-second",
+        status=AccountStatus.ACTIVE,
+        used_percent=10.5,
+        secondary_used_percent=10.5,
+        last_selected_at=1.0,
+        plan_type="pro",
+    )
+
+    result = _select_account_preferring_budget_safe(
+        [first, second],
+        prefer_earlier_reset=False,
+        routing_strategy="high_waterline",
+        budget_threshold_pct=95.0,
+        deterministic_probe=True,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "acc-first"
+
+
+def test_primary_drain_selection_bypasses_budget_safe_prefilter() -> None:
+    draining = load_balancer_module.AccountState(
+        account_id="acc-drain",
+        status=AccountStatus.ACTIVE,
+        used_percent=98.0,
+        secondary_used_percent=40.0,
+        primary_drain_score=240.0,
+        plan_type="pro",
+    )
+    safe = load_balancer_module.AccountState(
+        account_id="acc-safe",
+        status=AccountStatus.ACTIVE,
+        used_percent=10.0,
+        secondary_used_percent=10.0,
+        primary_drain_score=20.0,
+        plan_type="pro",
+    )
+
+    result = _select_account_preferring_budget_safe(
+        [safe, draining],
+        prefer_earlier_reset=False,
+        routing_strategy="primary_drain",
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "acc-drain"
+
+
+@pytest.mark.parametrize("routing_strategy", ["usage_weighted", "capacity_weighted", "high_waterline"])
+def test_starred_priority_bypasses_budget_safe_prefilter(routing_strategy: str) -> None:
+    starred = load_balancer_module.AccountState(
+        account_id="acc-starred",
+        status=AccountStatus.ACTIVE,
+        used_percent=91.0,
+        secondary_used_percent=96.0,
+        capacity_credits=1000.0,
+        primary_drain_priority_enabled=True,
+        plan_type="pro",
+    )
+    safe = load_balancer_module.AccountState(
+        account_id="acc-safe",
+        status=AccountStatus.ACTIVE,
+        used_percent=3.0,
+        secondary_used_percent=3.0,
+        capacity_credits=1000.0,
+        plan_type="pro",
+    )
+
+    result = _select_account_preferring_budget_safe(
+        [safe, starred],
+        prefer_earlier_reset=True,
+        routing_strategy=routing_strategy,
+        budget_threshold_pct=95.0,
+        deterministic_probe=True,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "acc-starred"
+
+
+def test_primary_drain_selection_falls_back_when_all_candidates_exceed_budget() -> None:
+    stronger_drain = load_balancer_module.AccountState(
+        account_id="acc-stronger-drain",
+        status=AccountStatus.ACTIVE,
+        used_percent=98.0,
+        secondary_used_percent=40.0,
+        primary_drain_score=240.0,
+        plan_type="pro",
+    )
+    weaker_drain = load_balancer_module.AccountState(
+        account_id="acc-weaker-drain",
+        status=AccountStatus.ACTIVE,
+        used_percent=96.0,
+        secondary_used_percent=40.0,
+        primary_drain_score=20.0,
+        plan_type="pro",
+    )
+
+    result = _select_account_preferring_budget_safe(
+        [weaker_drain, stronger_drain],
+        prefer_earlier_reset=False,
+        routing_strategy="primary_drain",
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "acc-stronger-drain"
+
+
+@pytest.mark.asyncio
+async def test_primary_drain_selection_inputs_keep_non_priority_fallback_accounts() -> None:
+    priority = _make_account("acc-priority", "priority@example.com")
+    priority.primary_drain_priority_enabled = True
+    ordinary = _make_account("acc-ordinary", "ordinary@example.com")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary = {
+        priority.id: UsageHistory(
+            id=1,
+            account_id=priority.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=10.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        ordinary.id: UsageHistory(
+            id=2,
+            account_id=ordinary.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=99.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    accounts_repo = StubAccountsRepository([priority, ordinary])
+    usage_repo = StubUsageRepository(primary=primary, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection_inputs = await balancer._load_selection_inputs(model=None, routing_strategy="primary_drain")
+
+    assert [account.id for account in selection_inputs.accounts] == [priority.id, ordinary.id]
+    assert {account.id for account in selection_inputs.runtime_accounts} == {priority.id, ordinary.id}
+    assert selection_inputs.primary_drain_scores == {priority.id: 10.0, ordinary.id: 99.0}
+
+    cached_selection_inputs = await balancer._load_selection_inputs(model=None, routing_strategy="primary_drain")
+
+    assert cached_selection_inputs.primary_drain_scores == selection_inputs.primary_drain_scores
+
+
+def test_primary_drain_scores_count_recent_full_bucket_streak() -> None:
+    base = datetime(2026, 1, 8, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        UsageHistory(account_id="acc", used_percent=100.0, window="primary", recorded_at=base - timedelta(hours=6)),
+        UsageHistory(account_id="acc", used_percent=25.0, window="primary", recorded_at=base - timedelta(hours=1)),
+    ]
+
+    scores = load_balancer_module._build_primary_drain_scores({"acc": rows}, now=base)
+
+    assert scores["acc"] == pytest.approx(125.0)
+
+
 def test_build_states_prefers_builtin_plus_group_priority() -> None:
     free = _make_account("free")
     free.plan_type = "free"
@@ -149,6 +359,7 @@ def test_build_states_prefers_builtin_plus_group_priority() -> None:
         accounts=[free, plus],
         latest_primary={},
         latest_secondary={},
+        primary_drain_scores={},
         runtime={},
         preferred_group_priorities={"plus": 10},
     )
@@ -273,6 +484,20 @@ class StubUsageRepository(UsageRepository):
             return self._secondary
         self.primary_calls += 1
         return self._primary
+
+    async def bulk_history_since(
+        self,
+        account_ids: list[str],
+        window: str,
+        since: datetime,
+    ) -> dict[str, list[UsageHistory]]:
+        source = self._secondary if window == "secondary" else self._primary
+        account_id_set = set(account_ids)
+        return {
+            account_id: [entry]
+            for account_id, entry in source.items()
+            if account_id in account_id_set and entry.recorded_at >= since
+        }
 
 
 class StubStickySessionsRepository(StickySessionsRepository):
@@ -502,6 +727,146 @@ async def test_select_account_prefers_budget_safe_account_when_any_exist() -> No
 
     assert selection.account is not None
     assert selection.account.id == safe_account.id
+
+
+@pytest.mark.asyncio
+async def test_count_routable_budget_safe_accounts_prefers_safe_pool() -> None:
+    safe_one = _make_account("acc-safe-1", "safe1@example.com")
+    safe_two = _make_account("acc-safe-2", "safe2@example.com")
+    pressured = _make_account("acc-pressured", "pressured@example.com")
+    paused = _make_account("acc-paused", "paused@example.com")
+    paused.status = AccountStatus.PAUSED
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    primary = {
+        safe_one.id: UsageHistory(
+            id=1,
+            account_id=safe_one.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=10.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        safe_two.id: UsageHistory(
+            id=2,
+            account_id=safe_two.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=20.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        pressured.id: UsageHistory(
+            id=3,
+            account_id=pressured.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=99.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    secondary = {
+        safe_one.id: UsageHistory(
+            id=4,
+            account_id=safe_one.id,
+            recorded_at=now,
+            window="secondary",
+            used_percent=80.0,
+            reset_at=now_epoch + 3600,
+            window_minutes=60,
+        ),
+        safe_two.id: UsageHistory(
+            id=5,
+            account_id=safe_two.id,
+            recorded_at=now,
+            window="secondary",
+            used_percent=82.0,
+            reset_at=now_epoch + 3600,
+            window_minutes=60,
+        ),
+        pressured.id: UsageHistory(
+            id=6,
+            account_id=pressured.id,
+            recorded_at=now,
+            window="secondary",
+            used_percent=10.0,
+            reset_at=now_epoch + 3600,
+            window_minutes=60,
+        ),
+    }
+
+    accounts_repo = StubAccountsRepository([safe_one, safe_two, pressured, paused])
+    usage_repo = StubUsageRepository(primary=primary, secondary=secondary)
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    count = await balancer.count_routable_budget_safe_accounts(budget_threshold_pct=95.0)
+    account_ids = await balancer.routable_budget_safe_account_ids(budget_threshold_pct=95.0)
+
+    assert count == 2
+    assert account_ids == {safe_one.id, safe_two.id}
+
+
+@pytest.mark.asyncio
+async def test_count_routable_budget_safe_accounts_falls_back_when_all_pressured() -> None:
+    first = _make_account("acc-first", "first@example.com")
+    second = _make_account("acc-second", "second@example.com")
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary = {
+        first.id: UsageHistory(
+            id=1,
+            account_id=first.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=99.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+        second.id: UsageHistory(
+            id=2,
+            account_id=second.id,
+            recorded_at=now,
+            window="primary",
+            used_percent=98.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        ),
+    }
+    secondary = {
+        first.id: UsageHistory(
+            id=3,
+            account_id=first.id,
+            recorded_at=now,
+            window="secondary",
+            used_percent=96.0,
+            reset_at=now_epoch + 3600,
+            window_minutes=60,
+        ),
+        second.id: UsageHistory(
+            id=4,
+            account_id=second.id,
+            recorded_at=now,
+            window="secondary",
+            used_percent=97.0,
+            reset_at=now_epoch + 3600,
+            window_minutes=60,
+        ),
+    }
+
+    accounts_repo = StubAccountsRepository([first, second])
+    usage_repo = StubUsageRepository(primary=primary, secondary=secondary)
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    count = await balancer.count_routable_budget_safe_accounts(budget_threshold_pct=95.0)
+    account_ids = await balancer.routable_budget_safe_account_ids(budget_threshold_pct=95.0)
+
+    assert count == 2
+    assert account_ids == {first.id, second.id}
 
 
 @pytest.mark.asyncio
@@ -995,7 +1360,7 @@ async def test_select_account_prunes_stale_runtime_for_removed_accounts() -> Non
 
 
 @pytest.mark.asyncio
-async def test_round_robin_does_not_serialize_concurrent_selection(monkeypatch) -> None:
+async def test_capacity_weighted_does_not_serialize_concurrent_selection(monkeypatch) -> None:
     now = utcnow()
     now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
     account_a = _make_account("acc-round-robin-a", "a@example.com")
@@ -1072,7 +1437,7 @@ async def test_round_robin_does_not_serialize_concurrent_selection(monkeypatch) 
 
     async def pick_account() -> str:
         await start.wait()
-        selection = await balancer.select_account(routing_strategy="round_robin")
+        selection = await balancer.select_account(routing_strategy="capacity_weighted")
         assert selection.account is not None
         return selection.account.id
 
@@ -1080,10 +1445,9 @@ async def test_round_robin_does_not_serialize_concurrent_selection(monkeypatch) 
     second = asyncio.create_task(pick_account())
     started = time.perf_counter()
     start.set()
-    selected_ids = await asyncio.gather(first, second)
+    await asyncio.gather(first, second)
     elapsed = time.perf_counter() - started
 
-    assert len(set(selected_ids)) == 2
     assert overlap_observed.is_set()
     assert elapsed < 0.13
 

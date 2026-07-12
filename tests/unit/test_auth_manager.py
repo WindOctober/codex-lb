@@ -407,3 +407,34 @@ async def test_refresh_account_deactivates_when_repo_only_reencrypted_same_refre
     assert exc_info.value.is_permanent is True
     assert repo.status_payload is not None
     assert repo.status_payload["status"] == AccountStatus.DEACTIVATED
+
+
+@pytest.mark.asyncio
+async def test_refresh_account_can_probe_permanent_failure_without_deactivating(monkeypatch):
+    async def _fake_refresh(_: str) -> TokenRefreshResult:
+        raise RefreshError("refresh_token_reused", "refresh token reused", True)
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
+
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_probe_no_deactivate",
+        email="user@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-old"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-old"),
+        id_token_encrypted=encryptor.encrypt("id-old"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    repo = _DummyRepo()
+    manager = AuthManager(cast(AccountsRepositoryPort, repo))
+
+    with pytest.raises(RefreshError) as exc_info:
+        await manager.refresh_account(account, deactivate_on_permanent_error=False)
+
+    assert exc_info.value.is_permanent is True
+    assert repo.status_payload is None
+    assert account.status == AccountStatus.ACTIVE
+    assert account.deactivation_reason is None
