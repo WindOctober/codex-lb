@@ -560,6 +560,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     session.pending_requests.append(warmup_state)
                 request_enqueued = True
                 await session.upstream.send_text(warmup_text)
+                warmup_state.http_bridge_send_completed_at = time.monotonic()
                 while True:
                     event_block = await event_queue.get()
                     if event_block is None:
@@ -649,7 +650,10 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.proxy_injected_previous_response_id = False
                     request_state.request_text = retry_text_data
                 await session.upstream.send_text(retry_text_data)
-            session.last_used_at = time.monotonic()
+            sent_at = time.monotonic()
+            if send_request:
+                request_state.http_bridge_send_completed_at = sent_at
+            session.last_used_at = sent_at
             return True
         except Exception:
             if reset_response_state:
@@ -970,24 +974,41 @@ class _HTTPBridgeRequestSubmitMixin:
     async def _retry_http_bridge_precreated_request(
         self: _HTTPBridgeRequestSubmitService,
         session: _HTTPBridgeSession,
+        *,
+        expected_request_tokens: frozenset[tuple[str, float]] | None = None,
     ) -> bool:
         async with session.pending_lock:
-            retryable_requests = [
-                request_state
-                for request_state in session.pending_requests
-                if request_state.response_id is None
-                and request_state.awaiting_response_created
-                and bool(request_state.request_text)
-            ]
-            if len(retryable_requests) != 1:
+            if len(session.pending_requests) != 1:
                 return False
-            request_state = retryable_requests[0]
-            if request_state.previous_response_id is not None:
+            request_state = session.pending_requests[0]
+            if (
+                expected_request_tokens is not None
+                and (
+                    request_state.request_id,
+                    request_state.http_bridge_send_completed_at,
+                )
+                not in expected_request_tokens
+            ):
+                return False
+            if (
+                request_state.response_id is not None
+                or not request_state.awaiting_response_created
+                or not request_state.request_text
+            ):
                 return False
             if request_state.replay_count >= 1:
                 return False
-            request_text = request_state.request_text
-            assert isinstance(request_text, str)
+            using_fresh_full_resend = request_state.previous_response_id is not None
+            if using_fresh_full_resend:
+                if (
+                    not request_state.proxy_injected_previous_response_id
+                    or not request_state.fresh_upstream_request_is_retry_safe
+                    or not request_state.fresh_upstream_request_text
+                ):
+                    return False
+                request_text = request_state.fresh_upstream_request_text
+            else:
+                request_text = request_state.request_text
             request_state.replay_count += 1
         _log_http_bridge_event(
             "retry_precreated",
@@ -1004,8 +1025,35 @@ class _HTTPBridgeRequestSubmitMixin:
                 request_state=request_state,
                 prefer_same_account=False,
             )
-            await session.upstream.send_text(request_text)
-            session.last_used_at = time.monotonic()
+            async with session.pending_lock:
+                if len(session.pending_requests) != 1 or session.pending_requests[0] is not request_state:
+                    return False
+                if (
+                    expected_request_tokens is not None
+                    and (
+                        request_state.request_id,
+                        request_state.http_bridge_send_completed_at,
+                    )
+                    not in expected_request_tokens
+                ):
+                    return False
+                if using_fresh_full_resend:
+                    request_state.previous_response_id = None
+                    request_state.proxy_injected_previous_response_id = False
+                    request_state.request_text = request_text
+                request_text, forwarded_service_tier = _http_bridge_text_with_account_service_tier(
+                    request_text,
+                    session.account,
+                    api_key=request_state.api_key,
+                )
+                if forwarded_service_tier is not None:
+                    request_state.service_tier = forwarded_service_tier
+                    request_state.requested_service_tier = forwarded_service_tier
+                request_state.request_text = request_text
+                await session.upstream.send_text(request_text)
+                sent_at = time.monotonic()
+                request_state.http_bridge_send_completed_at = sent_at
+                session.last_used_at = sent_at
             return True
         except Exception:
             logger.warning("HTTP bridge pre-created retry failed", exc_info=True)

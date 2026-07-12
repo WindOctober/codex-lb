@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from typing import Protocol
 
@@ -69,9 +70,15 @@ class _HTTPBridgeUpstreamEventsService(Protocol):
         pending_lock: anyio.Lock,
         proxy_request_budget_seconds: float,
         stream_idle_timeout_seconds: float,
+        response_created_timeout_seconds: float | None = None,
     ) -> _WebSocketReceiveTimeout | None: ...
 
-    async def _retry_http_bridge_precreated_request(self, session: _HTTPBridgeSession) -> bool: ...
+    async def _retry_http_bridge_precreated_request(
+        self,
+        session: _HTTPBridgeSession,
+        *,
+        expected_request_tokens: frozenset[tuple[str, float]] | None = None,
+    ) -> bool: ...
 
     async def _retry_http_bridge_terminal_failure(
         self,
@@ -106,6 +113,16 @@ class _HTTPBridgeUpstreamEventsService(Protocol):
         *,
         error_message: str,
     ) -> None: ...
+
+    async def _fail_response_created_timeout_requests(
+        self,
+        session: _HTTPBridgeSession,
+        *,
+        request_ids: frozenset[str],
+        timeout_seconds: float,
+        error_code: str,
+        error_message: str,
+    ) -> tuple[_WebSocketRequestState, ...]: ...
 
     async def _register_http_bridge_previous_response_id(
         self,
@@ -152,6 +169,9 @@ class _HTTPBridgeUpstreamEventsMixin:
                     pending_lock=session.pending_lock,
                     proxy_request_budget_seconds=runtime_settings.proxy_request_budget_seconds,
                     stream_idle_timeout_seconds=runtime_settings.stream_idle_timeout_seconds,
+                    response_created_timeout_seconds=(
+                        runtime_settings.http_responses_session_bridge_response_created_timeout_seconds
+                    ),
                 )
                 try:
                     if receive_timeout is None:
@@ -166,6 +186,51 @@ class _HTTPBridgeUpstreamEventsMixin:
                 except asyncio.TimeoutError:
                     if receive_timeout is None:
                         raise
+                    terminal_error_code = receive_timeout.error_code
+                    terminal_error_message = receive_timeout.error_message
+                    if receive_timeout.response_created_request_ids:
+                        async with session.lifecycle_lock:
+                            retried = await self._retry_http_bridge_precreated_request(
+                                session,
+                                expected_request_tokens=receive_timeout.response_created_request_tokens,
+                            )
+                            if retried:
+                                continue
+                            expired_requests = await self._fail_response_created_timeout_requests(
+                                session,
+                                request_ids=receive_timeout.response_created_request_ids,
+                                timeout_seconds=(
+                                    runtime_settings.http_responses_session_bridge_response_created_timeout_seconds
+                                ),
+                                error_code=receive_timeout.error_code,
+                                error_message=receive_timeout.error_message,
+                            )
+                            if not expired_requests:
+                                continue
+                            session.closed = True
+                            async with session.pending_lock:
+                                if session.pending_requests:
+                                    terminal_error_code = "stream_incomplete"
+                                    terminal_error_message = (
+                                        "Upstream bridge retired after another request timed out "
+                                        "before response.created"
+                                    )
+                                session.queued_request_count = 0
+                            await self._fail_pending_websocket_requests(
+                                account_id_value=session.account.id,
+                                pending_requests=session.pending_requests,
+                                pending_lock=session.pending_lock,
+                                error_code=terminal_error_code,
+                                error_message=terminal_error_message,
+                                api_key=None,
+                                response_create_gate=session.response_create_gate,
+                            )
+                            await self._evict_http_bridge_session_after_upstream_disconnect(
+                                session,
+                                error_message=terminal_error_message,
+                            )
+                        break
+
                     retried = await self._retry_http_bridge_precreated_request(session)
                     if retried:
                         continue
@@ -177,14 +242,14 @@ class _HTTPBridgeUpstreamEventsMixin:
                             account_id_value=session.account.id,
                             pending_requests=session.pending_requests,
                             pending_lock=session.pending_lock,
-                            error_code=receive_timeout.error_code,
-                            error_message=receive_timeout.error_message,
+                            error_code=terminal_error_code,
+                            error_message=terminal_error_message,
                             api_key=None,
                             response_create_gate=session.response_create_gate,
                         )
                         await self._evict_http_bridge_session_after_upstream_disconnect(
                             session,
-                            error_message=receive_timeout.error_message,
+                            error_message=terminal_error_message,
                         )
                     break
 
@@ -258,6 +323,61 @@ class _HTTPBridgeUpstreamEventsMixin:
                 )
         finally:
             session.closed = True
+
+    async def _fail_response_created_timeout_requests(
+        self: _HTTPBridgeUpstreamEventsService,
+        session: _HTTPBridgeSession,
+        *,
+        request_ids: frozenset[str],
+        timeout_seconds: float,
+        error_code: str,
+        error_message: str,
+    ) -> tuple[_WebSocketRequestState, ...]:
+        now = time.monotonic()
+        async with session.pending_lock:
+            expired_requests = tuple(
+                request_state
+                for request_state in session.pending_requests
+                if request_state.request_id in request_ids
+                and request_state.http_bridge_send_completed_at is not None
+                and request_state.response_id is None
+                and request_state.awaiting_response_created
+                and now >= request_state.http_bridge_send_completed_at + timeout_seconds
+            )
+            for request_state in expired_requests:
+                session.pending_requests.remove(request_state)
+            session.queued_request_count = max(0, session.queued_request_count - len(expired_requests))
+
+        for request_state in expired_requests:
+            sent_at = request_state.http_bridge_send_completed_at
+            age_ms = int((now - sent_at) * 1000) if sent_at is not None else None
+            _log_http_bridge_event(
+                "response_created_timeout",
+                session.key,
+                account_id=session.account.id,
+                model=session.request_model,
+                pending_count=len(session.pending_requests),
+                detail=(
+                    f"request_id={request_state.request_id}, age_ms={age_ms}, "
+                    f"first_event_type={request_state.http_bridge_upstream_first_event_type}, "
+                    f"has_previous_response_id={request_state.previous_response_id is not None}, "
+                    f"proxy_injected={request_state.proxy_injected_previous_response_id}, "
+                    f"retry_safe={request_state.fresh_upstream_request_is_retry_safe}"
+                ),
+                cache_key_family=session.key.affinity_kind,
+                model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            )
+        if expired_requests:
+            await self._fail_pending_websocket_requests(
+                account_id_value=session.account.id,
+                pending_requests=deque(expired_requests),
+                pending_lock=anyio.Lock(),
+                error_code=error_code,
+                error_message=error_message,
+                api_key=None,
+                response_create_gate=session.response_create_gate,
+            )
+        return expired_requests
 
     async def _process_http_bridge_upstream_text(
         self: _HTTPBridgeUpstreamEventsService,

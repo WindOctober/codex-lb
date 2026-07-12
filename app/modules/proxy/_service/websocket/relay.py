@@ -708,14 +708,46 @@ class _WebSocketRelayMixin:
         pending_lock: anyio.Lock,
         proxy_request_budget_seconds: float,
         stream_idle_timeout_seconds: float,
+        response_created_timeout_seconds: float | None = None,
     ) -> _WebSocketReceiveTimeout | None:
         async with pending_lock:
             requests = list(pending_requests)
-        return _websocket_receive_timeout_for_pending_requests(
+            response_created_deadlines = [
+                (
+                    request_state.http_bridge_send_completed_at + response_created_timeout_seconds,
+                    request_state.request_id,
+                    request_state.http_bridge_send_completed_at,
+                )
+                for request_state in pending_requests
+                if response_created_timeout_seconds is not None
+                and request_state.http_bridge_send_completed_at is not None
+                and request_state.response_id is None
+                and request_state.awaiting_response_created
+            ]
+        receive_timeout = _websocket_receive_timeout_for_pending_requests(
             requests,
             proxy_request_budget_seconds=proxy_request_budget_seconds,
             stream_idle_timeout_seconds=stream_idle_timeout_seconds,
         )
+        if not response_created_deadlines:
+            return receive_timeout
+
+        next_deadline = min(deadline for deadline, _request_id, _sent_at in response_created_deadlines)
+        selected_requests = tuple(
+            (request_id, sent_at)
+            for deadline, request_id, sent_at in response_created_deadlines
+            if deadline == next_deadline
+        )
+        startup_timeout = _WebSocketReceiveTimeout(
+            timeout_seconds=max(0.0, next_deadline - time.monotonic()),
+            error_code="response_created_timeout",
+            error_message="Upstream did not create a response within the startup window",
+            response_created_request_ids=frozenset(request_id for request_id, _sent_at in selected_requests),
+            response_created_request_tokens=frozenset(selected_requests),
+        )
+        if receive_timeout is None or startup_timeout.timeout_seconds < receive_timeout.timeout_seconds:
+            return startup_timeout
+        return receive_timeout
 
     async def _downstream_websocket_is_idle(
         self: _WebSocketRelayService,
@@ -1059,6 +1091,7 @@ class _WebSocketRelayMixin:
                 requested_service_tier=request_state.requested_service_tier,
                 actual_service_tier=request_state.actual_service_tier,
                 latency_first_token_ms=request_state.latency_first_token_ms,
+                session_id=request_state.session_id,
             )
 
     async def _emit_websocket_terminal_error(

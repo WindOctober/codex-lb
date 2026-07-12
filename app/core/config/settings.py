@@ -174,6 +174,7 @@ class Settings(BaseSettings):
     http_responses_session_bridge_idle_ttl_seconds: float = Field(default=120.0, gt=0)
     http_responses_session_bridge_codex_idle_ttl_seconds: float = Field(default=900.0, gt=0)
     http_responses_session_bridge_codex_prewarm_enabled: bool = False
+    http_responses_session_bridge_response_created_timeout_seconds: float = Field(default=120.0, gt=0)
     http_responses_session_bridge_max_sessions: int = Field(default=0, ge=0)
     http_responses_session_bridge_queue_limit: int = Field(default=0, ge=0)
     http_responses_session_bridge_soft_shard_pending_limit: int = Field(default=1, ge=1)
