@@ -58,3 +58,32 @@ Prompting cue (use when writing docs):
 - Verify before archive: `/opsx:verify <change>`
 - Sync delta specs → main specs: `/opsx:sync <change>`
 - Archive: `/opsx:archive <change>`
+
+## Local codex-lb Change Safety
+
+The local Caddy gateway is fixed at `2455 -> 2456` for normal development. Do not start, stop, replace, or retarget Caddy for ordinary app/backend changes.
+
+When modifying codex-lb, validate the change on a separate local codex-lb backend before touching the primary backend:
+
+1) Start an isolated backend-only codex-lb instance on a non-primary port and verify `/health/live`, the dashboard API, and the changed behavior directly against that backend port. Do not use 2455 or 2456 for this preflight.
+2) Keep the existing 2455 Caddy gateway and 2456 backend running while the isolated backend is being validated.
+3) Stop the isolated backend by its explicit non-primary port/PID only. Do not use Caddy switch scripts for ordinary preflight cleanup.
+4) After validation passes, restart only the codex-lb backend on port 2456. Do not restart the 2455 Caddy gateway unless gateway/Caddy configuration changed.
+5) Re-check `http://127.0.0.1:2455/health/live` and `http://127.0.0.1:2456/health/live` after the backend restart.
+
+Suggested backend-only preflight shape:
+
+```bash
+CODEX_LB_PORT=3456 CODEX_LB_HOST=127.0.0.1 ./restart-codex-lb.sh
+curl -fsS http://127.0.0.1:3456/health/live
+curl -fsS http://127.0.0.1:3456/api/dashboard/bridge-runtime
+CODEX_LB_PORT=3456 CODEX_LB_HOST=127.0.0.1 ./restart-codex-lb.sh --stop-only
+```
+
+Suggested backend restart target after validation:
+
+```bash
+CODEX_LB_PORT=2456 CODEX_LB_HOST=127.0.0.1 ./restart-codex-lb.sh
+```
+
+Use `switch-codex-lb-caddy.sh` only for intentional gateway/Caddy work. It is guarded by explicit confirmation environment variables because accidental Caddy stops can interrupt active Codex sessions.

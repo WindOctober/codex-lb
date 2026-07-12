@@ -1,0 +1,25 @@
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+http://:{$CODEX_LB_GATEWAY_PORT:2455} {
+	bind {$CODEX_LB_CADDY_BIND_ADDR:127.0.0.1}
+
+	log {
+		output file {$CODEX_LB_CADDY_ACCESS_LOG:var/log/caddy/access.log}
+		format console
+	}
+
+	reverse_proxy {$CODEX_LB_BACKEND_UPSTREAM:127.0.0.1:2456} {
+		lb_try_duration {$CODEX_LB_CADDY_LB_TRY_DURATION:60s}
+		lb_try_interval {$CODEX_LB_CADDY_LB_TRY_INTERVAL:500ms}
+		flush_interval -1
+
+		transport http {
+			dial_timeout {$CODEX_LB_CADDY_DIAL_TIMEOUT:2s}
+			response_header_timeout {$CODEX_LB_CADDY_RESPONSE_HEADER_TIMEOUT:300s}
+		}
+	}
+}
