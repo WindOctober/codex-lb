@@ -8,29 +8,51 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/co
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { cn } from "@/lib/utils";
 
-const NAV_ITEMS = [
-  { to: "/news", label: "News" },
-  { to: "/scholar", label: "Scholar" },
+type OptionalFeature = "news" | "scholar";
+
+type NavItem = {
+  to: string;
+  label: string;
+  feature?: OptionalFeature;
+};
+
+const NAV_ITEMS: readonly NavItem[] = [
+  { to: "/news", label: "News", feature: "news" },
+  { to: "/scholar", label: "Scholar", feature: "scholar" },
   { to: "/dashboard", label: "Dashboard" },
+  { to: "/reset-odds", label: "Reset Odds" },
+  { to: "/processes", label: "Processes" },
   { to: "/accounts", label: "Accounts" },
+  { to: "/mail", label: "Mail" },
   { to: "/settings", label: "Settings" },
 ] as const;
+
+function isFeatureVisible(feature: OptionalFeature | undefined, newsEnabled: boolean, scholarEnabled: boolean) {
+  if (feature === "news") return newsEnabled;
+  if (feature === "scholar") return scholarEnabled;
+  return true;
+}
 
 export type AppHeaderProps = {
   onLogout: () => void;
   showLogout?: boolean;
+  newsEnabled?: boolean;
+  scholarEnabled?: boolean;
   className?: string;
 };
 
 export function AppHeader({
   onLogout,
   showLogout = true,
+  newsEnabled = false,
+  scholarEnabled = false,
   className,
 }: AppHeaderProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const blurred = usePrivacyStore((s) => s.blurred);
   const togglePrivacy = usePrivacyStore((s) => s.toggle);
   const PrivacyIcon = blurred ? EyeOff : Eye;
+  const navItems = NAV_ITEMS.filter((item) => isFeatureVisible(item.feature, newsEnabled, scholarEnabled));
 
   return (
     <header
@@ -52,7 +74,7 @@ export function AppHeader({
 
         {/* Desktop nav pills */}
         <nav className="hidden items-center rounded-lg border border-border/50 bg-muted/40 p-0.5 sm:flex">
-          {NAV_ITEMS.map((item) => (
+          {navItems.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -112,7 +134,7 @@ export function AppHeader({
                 </SheetTitle>
               </SheetHeader>
               <nav className="flex flex-col gap-0.5 px-4 pt-2">
-                {NAV_ITEMS.map((item) => (
+                {navItems.map((item) => (
                   <NavLink key={item.to} to={item.to} onClick={() => setMobileOpen(false)}>
                     {({ isActive }) => (
                       <span

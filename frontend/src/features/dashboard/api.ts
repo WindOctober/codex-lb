@@ -1,6 +1,7 @@
 import { get } from "@/lib/api-client";
 
 import {
+  BridgeRuntimeSchema,
   DEFAULT_OVERVIEW_TIMEFRAME,
   DashboardOverviewSchema,
   RequestLogFilterOptionsSchema,
@@ -48,6 +49,12 @@ export function getDashboardOverview(params: DashboardOverviewParams = {}) {
   const query = new URLSearchParams();
   query.set("timeframe", params.timeframe ?? DEFAULT_OVERVIEW_TIMEFRAME);
   return get(`${DASHBOARD_PATH}/overview?${query.toString()}`, DashboardOverviewSchema);
+}
+
+export function getBridgeRuntime(limit = 100) {
+  const query = new URLSearchParams();
+  query.set("limit", String(limit));
+  return get(`${DASHBOARD_PATH}/bridge-runtime?${query.toString()}`, BridgeRuntimeSchema);
 }
 
 export function getRequestLogs(params: RequestLogsListFilters = {}) {

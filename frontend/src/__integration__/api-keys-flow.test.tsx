@@ -72,11 +72,13 @@ describe("api keys flow integration", () => {
     renderWithProviders(<App />);
 
     expect(await screen.findByRole("columnheader", { name: "Name" })).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "Prefix" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Key" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Models" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Usage" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Limit" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Expiry" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Status" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Actions" })).toBeInTheDocument();
 
     const defaultKeyRow = getParentRow(screen.getByText("Default key"));
     expect(within(defaultKeyRow).getByText("sk-test")).toBeInTheDocument();

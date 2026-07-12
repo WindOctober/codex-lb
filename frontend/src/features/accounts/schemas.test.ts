@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AccountFastServiceTierBulkUpdateResponseSchema,
   AccountSummarySchema,
   ImportStateSchema,
   OAuthStateSchema,
@@ -15,6 +16,8 @@ describe("AccountSummarySchema", () => {
       email: "user@example.com",
       displayName: "User",
       planType: "pro",
+      fastServiceTierEnabled: true,
+      subscriptionRenewsAt: ISO,
       status: "active",
       usage: {
         primaryRemainingPercent: 85,
@@ -45,9 +48,23 @@ describe("AccountSummarySchema", () => {
     });
 
     expect(parsed.accountId).toBe("acc-1");
+    expect(parsed.fastServiceTierEnabled).toBe(true);
+    expect(parsed.subscriptionRenewsAt).toBe(ISO);
     expect(parsed.usage?.primaryRemainingPercent).toBe(85);
     expect(parsed.windowMinutesSecondary).toBe(10080);
     expect(parsed.requestUsage?.totalCostUsd).toBe(0.02);
+  });
+});
+
+describe("AccountFastServiceTierBulkUpdateResponseSchema", () => {
+  it("parses bulk update responses", () => {
+    const parsed = AccountFastServiceTierBulkUpdateResponseSchema.parse({
+      enabled: false,
+      updatedCount: 9,
+    });
+
+    expect(parsed.enabled).toBe(false);
+    expect(parsed.updatedCount).toBe(9);
   });
 });
 

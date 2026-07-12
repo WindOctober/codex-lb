@@ -5,25 +5,49 @@ import { usePrivacyStore } from "@/hooks/use-privacy";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import type { AccountSummary } from "@/features/accounts/schemas";
-import { normalizeStatus, quotaBarColor, quotaBarTrack } from "@/utils/account-status";
+import {
+  normalizeStatus,
+  quotaBarColor,
+  quotaBarTrack,
+} from "@/utils/account-status";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
 import { formatSlug } from "@/utils/formatters";
-import { Crown, KeyRound, ShieldCheck, Sparkles, type LucideIcon } from "lucide-react";
+import {
+  Crown,
+  KeyRound,
+  RotateCcw,
+  ShieldCheck,
+  Sparkles,
+  Star,
+  type LucideIcon,
+} from "lucide-react";
 
 export type AccountListItemProps = {
   account: AccountSummary;
   selected: boolean;
+  resetCreditCount?: number;
   showAccountId?: boolean;
   onSelect: (accountId: string) => void;
 };
 
 function MiniQuotaBar({ percent }: { percent: number | null }) {
   if (percent === null) {
-    return <div data-testid="mini-quota-track" className="h-1 flex-1 overflow-hidden rounded-full bg-muted" />;
+    return (
+      <div
+        data-testid="mini-quota-track"
+        className="h-1 flex-1 overflow-hidden rounded-full bg-muted"
+      />
+    );
   }
   const clamped = Math.max(0, Math.min(100, percent));
   return (
-    <div data-testid="mini-quota-track" className={cn("h-1 flex-1 overflow-hidden rounded-full", quotaBarTrack(clamped))}>
+    <div
+      data-testid="mini-quota-track"
+      className={cn(
+        "h-1 flex-1 overflow-hidden rounded-full",
+        quotaBarTrack(clamped),
+      )}
+    >
       <div
         data-testid="mini-quota-fill"
         className={cn("h-full rounded-full", quotaBarColor(clamped))}
@@ -133,19 +157,33 @@ function accountListVisual(account: AccountSummary): AccountListVisual {
   };
 }
 
-export function AccountListItem({ account, selected, showAccountId = false, onSelect }: AccountListItemProps) {
+export function AccountListItem({
+  account,
+  selected,
+  resetCreditCount = 0,
+  showAccountId = false,
+  onSelect,
+}: AccountListItemProps) {
   const blurred = usePrivacyStore((s) => s.blurred);
   const status = normalizeStatus(account.status);
   const title = account.displayName || account.email;
   const titleIsEmail = isEmailLabel(title, account.email);
-  const emailSubtitle = account.displayName && account.displayName !== account.email
-    ? account.email
-    : null;
-  const idSuffix = showAccountId ? ` | ID ${formatCompactAccountId(account.accountId)}` : "";
+  const emailSubtitle =
+    account.displayName && account.displayName !== account.email
+      ? account.email
+      : null;
+  const idSuffix = showAccountId
+    ? ` | ID ${formatCompactAccountId(account.accountId)}`
+    : "";
   const secondary = account.usage?.secondaryRemainingPercent ?? null;
   const visual = accountListVisual(account);
   const VisualIcon = visual.icon;
-  const groupSummary = account.groups?.length ? `Groups ${account.groups.slice(0, 3).join(" / ")}` : null;
+  const groupSummary = account.groups?.length
+    ? `Groups ${account.groups.slice(0, 3).join(" / ")}`
+    : null;
+  const drainPriorityEnabled =
+    account.primaryDrainPriorityEnabled ?? false;
+  const hasResetCredits = resetCreditCount > 0;
   const detailText = emailSubtitle
     ? `${emailSubtitle}${idSuffix}`
     : showAccountId
@@ -160,7 +198,9 @@ export function AccountListItem({ account, selected, showAccountId = false, onSe
         "group relative isolate w-full overflow-hidden rounded-xl border px-3 py-2.5 text-left transition-all duration-200",
         "before:absolute before:inset-y-2 before:left-0 before:w-1 before:rounded-r-full before:bg-gradient-to-b before:opacity-75 before:transition-opacity",
         visual.rowClassName,
-        selected ? visual.selectedClassName : "shadow-none hover:translate-x-0.5",
+        selected
+          ? visual.selectedClassName
+          : "shadow-none hover:translate-x-0.5",
         visual.railClassName,
       )}
     >
@@ -173,27 +213,74 @@ export function AccountListItem({ account, selected, showAccountId = false, onSe
         )}
       />
       <div className="relative flex items-center gap-2.5">
-        <span className={cn("inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border", visual.iconClassName)}>
+        <span
+          className={cn(
+            "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border",
+            visual.iconClassName,
+          )}
+        >
           <VisualIcon className="h-4 w-4" strokeWidth={2.25} />
         </span>
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium">
-            <KycAccountName kyc={account.kycEnabled} blurred={titleIsEmail && blurred} className={visual.titleClassName}>
+            <KycAccountName
+              kyc={account.kycEnabled}
+              blurred={titleIsEmail && blurred}
+              className={visual.titleClassName}
+            >
               {title}
             </KycAccountName>
           </p>
           <div className="mt-0.5 flex min-w-0 items-center gap-1.5">
-            <Badge variant="outline" className={cn("h-5 rounded-full px-2 text-[10px] font-semibold uppercase tracking-[0.12em]", visual.badgeClassName)}>
+            <Badge
+              variant="outline"
+              className={cn(
+                "h-5 rounded-full px-2 text-[10px] font-semibold uppercase tracking-[0.12em]",
+                visual.badgeClassName,
+              )}
+            >
               {visual.label}
             </Badge>
             {detailText ? (
-              <p className="min-w-0 truncate text-xs text-muted-foreground" title={showAccountId ? `Account ID ${account.accountId}` : undefined}>
-                {emailSubtitle ? <><span className={blurred ? "privacy-blur" : undefined}>{emailSubtitle}</span>{idSuffix}</> : detailText}
+              <p
+                className="min-w-0 truncate text-xs text-muted-foreground"
+                title={
+                  showAccountId ? `Account ID ${account.accountId}` : undefined
+                }
+              >
+                {emailSubtitle ? (
+                  <>
+                    <span className={blurred ? "privacy-blur" : undefined}>
+                      {emailSubtitle}
+                    </span>
+                    {idSuffix}
+                  </>
+                ) : (
+                  detailText
+                )}
               </p>
             ) : null}
           </div>
         </div>
-        <StatusBadge status={status} />
+        <div className="flex shrink-0 items-center gap-1.5">
+          {hasResetCredits ? (
+            <span
+              className="inline-flex h-5 shrink-0 items-center gap-1 rounded-full border border-emerald-300/45 bg-emerald-400/12 px-1.5 text-[10px] font-semibold text-emerald-100 shadow-[0_0_18px_rgba(16,185,129,0.22)]"
+              aria-label={`${resetCreditCount} rate-limit reset ${resetCreditCount === 1 ? "credit" : "credits"}`}
+              title={`${resetCreditCount} rate-limit reset ${resetCreditCount === 1 ? "credit" : "credits"}`}
+            >
+              <RotateCcw className="h-3 w-3" />
+              {resetCreditCount}
+            </span>
+          ) : null}
+          {drainPriorityEnabled ? (
+            <Star
+              className="h-3.5 w-3.5 fill-amber-300 text-amber-300"
+              aria-label="Starred routing priority"
+            />
+          ) : null}
+          <StatusBadge status={status} />
+        </div>
       </div>
       <p className="relative mt-1.5 truncate pl-10 text-[10px] uppercase tracking-[0.16em] text-muted-foreground/60">
         {visual.subtitle}

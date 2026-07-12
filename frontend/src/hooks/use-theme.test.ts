@@ -118,6 +118,49 @@ describe("useThemeStore", () => {
     expect(useThemeStore.getState().theme).toBe("light");
   });
 
+  it("initializes when localStorage reads are blocked", () => {
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        ...localStorageMock,
+        getItem: vi.fn(() => {
+          throw new Error("blocked");
+        }),
+        setItem: vi.fn(() => {
+          throw new Error("blocked");
+        }),
+      },
+    });
+
+    useThemeStore.getState().initializeTheme();
+
+    expect(useThemeStore.getState().preference).toBe("auto");
+    expect(useThemeStore.getState().theme).toBe("light");
+    expect(useThemeStore.getState().initialized).toBe(true);
+  });
+
+  it("supports legacy media query listeners", () => {
+    const addListener = vi.fn();
+    const removeListener = vi.fn();
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: vi.fn().mockImplementation(() => ({
+        matches: false,
+        media: "(prefers-color-scheme: dark)",
+        onchange: null,
+        addListener,
+        removeListener,
+        dispatchEvent: vi.fn(),
+      })),
+    });
+
+    useThemeStore.getState().setTheme("auto");
+    useThemeStore.getState().setTheme("light");
+
+    expect(addListener).toHaveBeenCalledTimes(1);
+    expect(removeListener).toHaveBeenCalledTimes(1);
+  });
+
   it("syncs html dark class", () => {
     useThemeStore.getState().setTheme("dark");
     expect(document.documentElement.classList.contains("dark")).toBe(true);

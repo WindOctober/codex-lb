@@ -3,7 +3,12 @@ import { del, get, patch, post } from "@/lib/api-client";
 import {
   AccountActionResponseSchema,
   AccountAvailabilityResponseSchema,
+  AccountFastServiceTierBulkUpdateRequestSchema,
+  AccountFastServiceTierBulkUpdateResponseSchema,
   AccountImportResponseSchema,
+  AccountRateLimitResetConsumeRequestSchema,
+  AccountRateLimitResetConsumeResponseSchema,
+  AccountRateLimitResetCreditsResponseSchema,
   AccountSummarySchema,
   AccountUpdateRequestSchema,
   AccountsResponseSchema,
@@ -38,19 +43,47 @@ export function importAccount(file: File) {
 
 export function createApiProvider(payload: ApiProviderCreateRequest) {
   const validated = ApiProviderCreateRequestSchema.parse(payload);
-  return post(`${ACCOUNTS_BASE_PATH}/providers`, ApiProviderCreateResponseSchema, {
-    body: validated,
-  });
+  return post(
+    `${ACCOUNTS_BASE_PATH}/providers`,
+    ApiProviderCreateResponseSchema,
+    {
+      body: validated,
+    },
+  );
 }
 
 export function updateAccountRouting(
   accountId: string,
-  payload: { configuredPriority: number; kycEnabled?: boolean; groups?: string[] },
+  payload: {
+    configuredPriority: number;
+    kycEnabled?: boolean;
+    fastServiceTierEnabled?: boolean;
+    primaryDrainPriorityEnabled?: boolean;
+    subscriptionRenewsAt?: string | null;
+    groups?: string[];
+  },
 ) {
   const validated = AccountUpdateRequestSchema.parse(payload);
-  return patch(`${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`, AccountSummarySchema, {
-    body: validated,
+  return patch(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`,
+    AccountSummarySchema,
+    {
+      body: validated,
+    },
+  );
+}
+
+export function updateAllAccountsFastServiceTier(enabled: boolean) {
+  const validated = AccountFastServiceTierBulkUpdateRequestSchema.parse({
+    enabled,
   });
+  return post(
+    `${ACCOUNTS_BASE_PATH}/fast-service-tier`,
+    AccountFastServiceTierBulkUpdateResponseSchema,
+    {
+      body: validated,
+    },
+  );
 }
 
 export function testAccountAvailability(accountId: string) {
@@ -81,6 +114,27 @@ export function getAccountTrends(accountId: string) {
   );
 }
 
+export function getAccountRateLimitResetCredits(accountId: string) {
+  return get(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/rate-limit-reset-credits`,
+    AccountRateLimitResetCreditsResponseSchema,
+  );
+}
+
+export function consumeAccountRateLimitResetCredit(
+  accountId: string,
+  idempotencyKey?: string,
+) {
+  const validated = AccountRateLimitResetConsumeRequestSchema.parse(
+    idempotencyKey ? { idempotencyKey } : {},
+  );
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/rate-limit-reset-credits/consume`,
+    AccountRateLimitResetConsumeResponseSchema,
+    { body: validated },
+  );
+}
+
 export function deleteAccount(accountId: string) {
   return del(
     `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`,
@@ -107,11 +161,18 @@ export function completeOauth(payload?: unknown) {
 }
 export function submitManualOauthCallback(payload: unknown) {
   const validated = ManualOauthCallbackRequestSchema.parse(payload);
-  return post(`${OAUTH_BASE_PATH}/manual-callback`, ManualOauthCallbackResponseSchema, {
-    body: validated,
-  });
+  return post(
+    `${OAUTH_BASE_PATH}/manual-callback`,
+    ManualOauthCallbackResponseSchema,
+    {
+      body: validated,
+    },
+  );
 }
 
 export function getRuntimeConnectAddress() {
-  return get("/api/settings/runtime/connect-address", RuntimeConnectAddressResponseSchema);
+  return get(
+    "/api/settings/runtime/connect-address",
+    RuntimeConnectAddressResponseSchema,
+  );
 }

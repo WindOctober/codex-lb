@@ -1,4 +1,13 @@
-import { ChevronDown, ChevronUp, KeyRound, Plus, Search, Upload } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronUp,
+  KeyRound,
+  Plus,
+  Search,
+  Upload,
+  Zap,
+  ZapOff,
+} from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -16,24 +25,37 @@ import type { AccountSummary } from "@/features/accounts/schemas";
 import { buildDuplicateAccountIdSet } from "@/utils/account-identifiers";
 import { formatSlug } from "@/utils/formatters";
 
-const STATUS_FILTER_OPTIONS = ["all", "active", "paused", "rate_limited", "quota_exceeded", "deactivated"];
+const STATUS_FILTER_OPTIONS = [
+  "all",
+  "active",
+  "paused",
+  "rate_limited",
+  "quota_exceeded",
+  "deactivated",
+];
 
 export type AccountListProps = {
   accounts: AccountSummary[];
+  resetCreditsByAccount?: Record<string, number>;
   selectedAccountId: string | null;
   onSelect: (accountId: string) => void;
   onOpenImport: () => void;
   onOpenOauth: () => void;
   onOpenProvider?: () => void;
+  onSetAllFastServiceTier: (enabled: boolean) => void;
+  fastServiceTierBusy?: boolean;
 };
 
 export function AccountList({
   accounts,
+  resetCreditsByAccount = {},
   selectedAccountId,
   onSelect,
   onOpenImport,
   onOpenOauth,
   onOpenProvider = () => undefined,
+  onSetAllFastServiceTier,
+  fastServiceTierBusy = false,
 }: AccountListProps) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("active");
@@ -56,13 +78,25 @@ export function AccountList({
     });
   }, [accounts, search, statusFilter]);
 
-  const duplicateAccountIds = useMemo(() => buildDuplicateAccountIdSet(accounts), [accounts]);
+  const duplicateAccountIds = useMemo(
+    () => buildDuplicateAccountIdSet(accounts),
+    [accounts],
+  );
+  const allFastServiceTierEnabled =
+    accounts.length > 0 &&
+    accounts.every((account) => account.fastServiceTierEnabled);
+  const allFastServiceTierDisabled =
+    accounts.length > 0 &&
+    accounts.every((account) => !account.fastServiceTierEnabled);
 
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2">
         <div className="relative min-w-0 flex-1">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60" aria-hidden />
+          <Search
+            className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60"
+            aria-hidden
+          />
           <Input
             placeholder="Search accounts..."
             value={search}
@@ -85,17 +119,69 @@ export function AccountList({
       </div>
 
       <div className="grid grid-cols-3 gap-2">
-        <Button type="button" size="sm" variant="outline" onClick={onOpenImport} className="h-8 flex-1 gap-1.5 text-xs">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={onOpenImport}
+          className="h-8 flex-1 gap-1.5 text-xs"
+        >
           <Upload className="h-3.5 w-3.5" />
           Import
         </Button>
-        <Button type="button" size="sm" onClick={onOpenOauth} className="h-8 flex-1 gap-1.5 text-xs">
+        <Button
+          type="button"
+          size="sm"
+          onClick={onOpenOauth}
+          className="h-8 flex-1 gap-1.5 text-xs"
+        >
           <Plus className="h-3.5 w-3.5" />
           OAuth
         </Button>
-        <Button type="button" size="sm" variant="outline" onClick={onOpenProvider} className="h-8 flex-1 gap-1.5 text-xs">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={onOpenProvider}
+          className="h-8 flex-1 gap-1.5 text-xs"
+        >
           <KeyRound className="h-3.5 w-3.5" />
           Provider
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant={allFastServiceTierEnabled ? "default" : "outline"}
+          disabled={
+            fastServiceTierBusy ||
+            accounts.length === 0 ||
+            allFastServiceTierEnabled
+          }
+          onClick={() => onSetAllFastServiceTier(true)}
+          className="h-8 gap-1.5 text-xs"
+          aria-label="Enable fast mode for all accounts"
+        >
+          <Zap className="h-3.5 w-3.5" />
+          Fast On
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant={allFastServiceTierDisabled ? "default" : "outline"}
+          disabled={
+            fastServiceTierBusy ||
+            accounts.length === 0 ||
+            allFastServiceTierDisabled
+          }
+          onClick={() => onSetAllFastServiceTier(false)}
+          className="h-8 gap-1.5 text-xs"
+          aria-label="Disable fast mode for all accounts"
+        >
+          <ZapOff className="h-3.5 w-3.5" />
+          Fast Off
         </Button>
       </div>
 
@@ -108,7 +194,11 @@ export function AccountList({
           onClick={() => setHelpOpen((current) => !current)}
         >
           Need help?
-          {helpOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          {helpOpen ? (
+            <ChevronUp className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronDown className="h-3.5 w-3.5" />
+          )}
         </Button>
       </div>
 
@@ -117,14 +207,19 @@ export function AccountList({
       <div className="max-h-[calc(100vh-16rem)] space-y-1 overflow-y-auto p-1">
         {filtered.length === 0 ? (
           <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed p-6 text-center">
-            <p className="text-sm font-medium text-muted-foreground">No matching accounts</p>
-            <p className="text-xs text-muted-foreground/70">Try adjusting your filters.</p>
+            <p className="text-sm font-medium text-muted-foreground">
+              No matching accounts
+            </p>
+            <p className="text-xs text-muted-foreground/70">
+              Try adjusting your filters.
+            </p>
           </div>
         ) : (
           filtered.map((account) => (
             <AccountListItem
               key={account.accountId}
               account={account}
+              resetCreditCount={resetCreditsByAccount[account.accountId] ?? 0}
               selected={account.accountId === selectedAccountId}
               showAccountId={duplicateAccountIds.has(account.accountId)}
               onSelect={onSelect}

@@ -176,7 +176,6 @@ export function ApiKeyCreateDialog({ open, busy, onOpenChange, onSubmit }: ApiKe
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="none">None</SelectItem>
-                      <SelectItem value="auto">Auto</SelectItem>
                       <SelectItem value="default">Default</SelectItem>
                       <SelectItem value="priority">Priority</SelectItem>
                       <SelectItem value="flex">Flex</SelectItem>

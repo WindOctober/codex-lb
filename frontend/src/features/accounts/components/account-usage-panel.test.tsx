@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AccountUsagePanel } from "@/features/accounts/components/account-usage-panel";
-import { createAccountSummary } from "@/test/mocks/factories";
+import { createAccountSummary, createAccountTrends } from "@/test/mocks/factories";
 
 describe("AccountUsagePanel", () => {
   beforeEach(() => {
@@ -69,6 +69,28 @@ describe("AccountUsagePanel", () => {
     expect(screen.getByText("GPT-5.3-Codex-Spark")).toBeInTheDocument();
     expect(screen.getByText(/35% used/)).toBeInTheDocument();
     expect(screen.getByText("Resets in 6d 13h")).toBeInTheDocument();
+  });
+
+  it("replaces the known gated quota row with quota timeline when available", () => {
+    const account = createAccountSummary({
+      additionalQuotas: [
+        {
+          limitName: "codex_spark",
+          meteredFeature: "codex_bengalfox",
+          primaryWindow: {
+            usedPercent: 35,
+            resetAt: Math.floor(new Date("2026-01-07T13:00:00.000Z").getTime() / 1000),
+            windowMinutes: 300,
+          },
+          secondaryWindow: null,
+        },
+      ],
+    });
+
+    render(<AccountUsagePanel account={account} trends={createAccountTrends(account.accountId)} />);
+
+    expect(screen.getByText("Quota timeline")).toBeInTheDocument();
+    expect(screen.queryByText("GPT-5.3-Codex-Spark")).not.toBeInTheDocument();
   });
 
   it("renders request log usage summary when available", () => {

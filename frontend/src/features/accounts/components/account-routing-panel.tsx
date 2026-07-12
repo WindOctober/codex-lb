@@ -1,5 +1,5 @@
 import { Activity, Save } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -23,7 +23,9 @@ export type AccountRoutingPanelProps = {
     accountId: string,
     configuredPriority: number,
     kycEnabled?: boolean,
+    fastServiceTierEnabled?: boolean,
     groups?: string[],
+    primaryDrainPriorityEnabled?: boolean,
   ) => Promise<void>;
   onTestAvailability: (accountId: string) => Promise<void>;
 };
@@ -54,15 +56,12 @@ export function AccountRoutingPanel({
   const savedGroups = (account.groups ?? []).filter((group) => !isReservedGroup(group));
   const [groupsText, setGroupsText] = useState(savedGroups.join(", "));
 
-  useEffect(() => {
-    setPriority(String(configuredPriority));
-    setGroupsText(savedGroups.join(", "));
-  }, [account.accountId, configuredPriority, savedGroups.join(", ")]);
-
   const parsedPriority = Number.parseInt(priority, 10);
   const priorityChanged =
     Number.isInteger(parsedPriority) && parsedPriority !== configuredPriority && parsedPriority >= 0;
   const kycEnabled = account.kycEnabled ?? false;
+  const fastServiceTierEnabled = account.fastServiceTierEnabled ?? false;
+  const primaryDrainPriorityEnabled = account.primaryDrainPriorityEnabled ?? false;
   const parsedGroups = parseGroups(groupsText);
   const groupsChanged = parsedGroups.join(",") !== savedGroups.join(",");
 
@@ -95,7 +94,16 @@ export function AccountRoutingPanel({
           size="sm"
           className="h-9 gap-1.5"
           disabled={busy || !priorityChanged}
-          onClick={() => void onUpdateRouting(account.accountId, parsedPriority, kycEnabled, parsedGroups)}
+          onClick={() =>
+            void onUpdateRouting(
+              account.accountId,
+              parsedPriority,
+              kycEnabled,
+              fastServiceTierEnabled,
+              parsedGroups,
+              primaryDrainPriorityEnabled,
+            )
+          }
         >
           <Save className="h-3.5 w-3.5" />
           Save Priority
@@ -133,7 +141,16 @@ export function AccountRoutingPanel({
             size="sm"
             className="h-9"
             disabled={busy || !groupsChanged}
-            onClick={() => void onUpdateRouting(account.accountId, configuredPriority, kycEnabled, parsedGroups)}
+            onClick={() =>
+              void onUpdateRouting(
+                account.accountId,
+                configuredPriority,
+                kycEnabled,
+                fastServiceTierEnabled,
+                parsedGroups,
+                primaryDrainPriorityEnabled,
+              )
+            }
           >
             Save Groups
           </Button>
@@ -155,7 +172,39 @@ export function AccountRoutingPanel({
         <Switch
           checked={kycEnabled}
           disabled={busy}
-          onCheckedChange={(checked) => void onUpdateRouting(account.accountId, configuredPriority, checked, parsedGroups)}
+          onCheckedChange={(checked) =>
+            void onUpdateRouting(
+              account.accountId,
+              configuredPriority,
+              checked,
+              fastServiceTierEnabled,
+              parsedGroups,
+              primaryDrainPriorityEnabled,
+            )
+          }
+        />
+      </div>
+
+      <div className="mt-3 flex items-center justify-between gap-4 rounded-lg border bg-background/60 px-3 py-2">
+        <div>
+          <p className="text-sm font-medium">Fast mode</p>
+          <p className="text-xs text-muted-foreground">
+            Requests routed to this account use the priority service tier unless a key enforces another tier.
+          </p>
+        </div>
+        <Switch
+          checked={fastServiceTierEnabled}
+          disabled={busy}
+          onCheckedChange={(checked) =>
+            void onUpdateRouting(
+              account.accountId,
+              configuredPriority,
+              kycEnabled,
+              checked,
+              parsedGroups,
+              primaryDrainPriorityEnabled,
+            )
+          }
         />
       </div>
     </section>

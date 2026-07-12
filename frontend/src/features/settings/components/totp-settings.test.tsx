@@ -28,6 +28,8 @@ const baseSettings = {
   totpRequiredOnLogin: false,
   totpConfigured: false,
   apiKeyAuthEnabled: true,
+  newsRefreshEnabled: false,
+  scholarRefreshEnabled: false,
 };
 
 function renderWithClient(ui: React.ReactElement) {

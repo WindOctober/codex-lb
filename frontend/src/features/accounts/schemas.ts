@@ -10,6 +10,16 @@ export const AccountUsageTrendSchema = z.object({
   secondary: z.array(UsageTrendPointSchema),
 });
 
+export const AccountQuotaTimelineBucketSchema = z.object({
+  startAt: z.string().datetime({ offset: true }),
+  endAt: z.string().datetime({ offset: true }),
+  primaryUsedPercent: z.number(),
+  primaryUsedCredits: z.number().nullable().optional(),
+  secondaryRemainingPercent: z.number().nullable().optional(),
+  secondaryReset: z.boolean().default(false),
+  secondaryResetAt: z.string().datetime({ offset: true }).nullable().optional(),
+});
+
 export const AccountUsageSchema = z.object({
   primaryRemainingPercent: z.number().nullable(),
   secondaryRemainingPercent: z.number().nullable(),
@@ -71,6 +81,9 @@ export const AccountSummarySchema = z.object({
   routingPriority: z.number().int().optional(),
   configuredPriority: z.number().int().optional(),
   kycEnabled: z.boolean().optional(),
+  fastServiceTierEnabled: z.boolean().optional(),
+  primaryDrainPriorityEnabled: z.boolean().optional(),
+  subscriptionRenewsAt: z.string().datetime({ offset: true }).nullable().optional(),
   groups: z.array(z.string()).optional(),
   status: z.string(),
   usage: AccountUsageSchema.nullable().optional(),
@@ -88,10 +101,20 @@ export const AccountTrendsResponseSchema = z.object({
   accountId: z.string(),
   primary: z.array(UsageTrendPointSchema),
   secondary: z.array(UsageTrendPointSchema),
+  quotaTimeline: z.array(AccountQuotaTimelineBucketSchema).default([]),
 });
 
 export const AccountsResponseSchema = z.object({
   accounts: z.array(AccountSummarySchema),
+});
+
+export const AccountFastServiceTierBulkUpdateRequestSchema = z.object({
+  enabled: z.boolean(),
+});
+
+export const AccountFastServiceTierBulkUpdateResponseSchema = z.object({
+  enabled: z.boolean(),
+  updatedCount: z.number().int().nonnegative(),
 });
 
 export const AccountImportResponseSchema = z.object({
@@ -108,16 +131,20 @@ export const ApiProviderCreateRequestSchema = z.object({
   priority: z.number().int().min(0).max(100000).default(100),
 });
 
-export const ApiProviderCreateResponseSchema = AccountImportResponseSchema.extend({
-  baseUrl: z.string(),
-  wireApi: z.string(),
-  priority: z.number().int(),
-  supportedModels: z.array(z.string()).default([]),
-});
+export const ApiProviderCreateResponseSchema =
+  AccountImportResponseSchema.extend({
+    baseUrl: z.string(),
+    wireApi: z.string(),
+    priority: z.number().int(),
+    supportedModels: z.array(z.string()).default([]),
+  });
 
 export const AccountUpdateRequestSchema = z.object({
   configuredPriority: z.number().int().min(0).max(100000),
   kycEnabled: z.boolean().optional(),
+  fastServiceTierEnabled: z.boolean().optional(),
+  primaryDrainPriorityEnabled: z.boolean().optional(),
+  subscriptionRenewsAt: z.string().datetime({ offset: true }).nullable().optional(),
   groups: z.array(z.string()).optional(),
 });
 
@@ -133,12 +160,34 @@ export const AccountAvailabilityResponseSchema = z.object({
   failedAccountIds: z.array(z.string()).default([]),
 });
 
+export const AccountRateLimitResetCreditsResponseSchema = z.object({
+  accountId: z.string(),
+  availableCount: z.number().int().nonnegative(),
+});
+
+export const AccountRateLimitResetConsumeRequestSchema = z.object({
+  idempotencyKey: z.string().min(1).max(128).optional(),
+});
+
+export const AccountRateLimitResetConsumeResponseSchema = z.object({
+  accountId: z.string(),
+  outcome: z.enum([
+    "reset",
+    "nothing_to_reset",
+    "no_credit",
+    "already_redeemed",
+  ]),
+  availableCount: z.number().int().nonnegative().nullable().optional(),
+  windowsReset: z.number().int().nonnegative(),
+});
+
 export const AccountActionResponseSchema = z.object({
   status: z.string(),
 });
 
 export const OauthStartRequestSchema = z.object({
   forceMethod: z.string().optional(),
+  targetAccountId: z.string().optional(),
 });
 
 export const OauthStartResponseSchema = z.object({
@@ -198,17 +247,41 @@ export const ImportStateSchema = z.object({
 });
 
 export type UsageTrendPoint = z.infer<typeof UsageTrendPointSchema>;
+export type AccountQuotaTimelineBucket = z.infer<
+  typeof AccountQuotaTimelineBucketSchema
+>;
 export type AccountUsageTrend = z.infer<typeof AccountUsageTrendSchema>;
 export type AccountSummary = z.infer<typeof AccountSummarySchema>;
-export type AccountAdditionalWindow = z.infer<typeof AccountAdditionalWindowSchema>;
-export type AccountAdditionalQuota = z.infer<typeof AccountAdditionalQuotaSchema>;
+export type AccountAdditionalWindow = z.infer<
+  typeof AccountAdditionalWindowSchema
+>;
+export type AccountAdditionalQuota = z.infer<
+  typeof AccountAdditionalQuotaSchema
+>;
 export type AccountTrendsResponse = z.infer<typeof AccountTrendsResponseSchema>;
-export type ApiProviderCreateRequest = z.infer<typeof ApiProviderCreateRequestSchema>;
-export type ApiProviderCreateResponse = z.infer<typeof ApiProviderCreateResponseSchema>;
-export type AccountAvailabilityResponse = z.infer<typeof AccountAvailabilityResponseSchema>;
+export type AccountFastServiceTierBulkUpdateResponse = z.infer<
+  typeof AccountFastServiceTierBulkUpdateResponseSchema
+>;
+export type ApiProviderCreateRequest = z.infer<
+  typeof ApiProviderCreateRequestSchema
+>;
+export type ApiProviderCreateResponse = z.infer<
+  typeof ApiProviderCreateResponseSchema
+>;
+export type AccountAvailabilityResponse = z.infer<
+  typeof AccountAvailabilityResponseSchema
+>;
+export type AccountRateLimitResetCreditsResponse = z.infer<
+  typeof AccountRateLimitResetCreditsResponseSchema
+>;
+export type AccountRateLimitResetConsumeResponse = z.infer<
+  typeof AccountRateLimitResetConsumeResponseSchema
+>;
 export type OauthStartResponse = z.infer<typeof OauthStartResponseSchema>;
 export type OauthStatusResponse = z.infer<typeof OauthStatusResponseSchema>;
-export type ManualOauthCallbackResponse = z.infer<typeof ManualOauthCallbackResponseSchema>;
+export type ManualOauthCallbackResponse = z.infer<
+  typeof ManualOauthCallbackResponseSchema
+>;
 export type RuntimeConnectAddressResponse = z.infer<
   typeof RuntimeConnectAddressResponseSchema
 >;

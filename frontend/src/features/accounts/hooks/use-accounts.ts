@@ -1,9 +1,17 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import {
+  consumeAccountRateLimitResetCredit,
   createApiProvider,
   deleteAccount,
+  getAccountRateLimitResetCredits,
   getAccountTrends,
   importAccount,
   listAccounts,
@@ -11,10 +19,16 @@ import {
   reactivateAccount,
   testAccountAvailability,
   updateAccountRouting,
+  updateAllAccountsFastServiceTier,
 } from "@/features/accounts/api";
-import type { ApiProviderCreateRequest } from "@/features/accounts/schemas";
+import type {
+  AccountSummary,
+  ApiProviderCreateRequest,
+} from "@/features/accounts/schemas";
 
-function invalidateAccountRelatedQueries(queryClient: ReturnType<typeof useQueryClient>) {
+function invalidateAccountRelatedQueries(
+  queryClient: ReturnType<typeof useQueryClient>,
+) {
   void queryClient.invalidateQueries({ queryKey: ["accounts", "list"] });
   void queryClient.invalidateQueries({ queryKey: ["dashboard", "overview"] });
 }
@@ -39,7 +53,8 @@ export function useAccountMutations() {
   });
 
   const createProviderMutation = useMutation({
-    mutationFn: (payload: ApiProviderCreateRequest) => createApiProvider(payload),
+    mutationFn: (payload: ApiProviderCreateRequest) =>
+      createApiProvider(payload),
     onSuccess: () => {
       toast.success("Provider added");
       invalidateAccountRelatedQueries(queryClient);
@@ -54,19 +69,46 @@ export function useAccountMutations() {
       accountId,
       configuredPriority,
       kycEnabled,
+      fastServiceTierEnabled,
+      primaryDrainPriorityEnabled,
+      subscriptionRenewsAt,
       groups,
     }: {
       accountId: string;
       configuredPriority: number;
       kycEnabled?: boolean;
+      fastServiceTierEnabled?: boolean;
+      primaryDrainPriorityEnabled?: boolean;
+      subscriptionRenewsAt?: string | null;
       groups?: string[];
-    }) => updateAccountRouting(accountId, { configuredPriority, kycEnabled, groups }),
+    }) =>
+      updateAccountRouting(accountId, {
+        configuredPriority,
+        kycEnabled,
+        fastServiceTierEnabled,
+        primaryDrainPriorityEnabled,
+        subscriptionRenewsAt,
+        groups,
+      }),
     onSuccess: () => {
       toast.success("Routing settings updated");
       invalidateAccountRelatedQueries(queryClient);
     },
     onError: (error: Error) => {
       toast.error(error.message || "Priority update failed");
+    },
+  });
+
+  const updateAllFastServiceTierMutation = useMutation({
+    mutationFn: updateAllAccountsFastServiceTier,
+    onSuccess: (result) => {
+      toast.success(
+        `Fast mode ${result.enabled ? "enabled" : "disabled"} for ${result.updatedCount} accounts`,
+      );
+      invalidateAccountRelatedQueries(queryClient);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Fast mode update failed");
     },
   });
 
@@ -77,7 +119,9 @@ export function useAccountMutations() {
       if (result.status === "active") {
         toast.success(`Availability check passed (${detail})`);
       } else {
-        toast.warning(`Availability check returned ${result.status} (${detail})`);
+        toast.warning(
+          `Availability check returned ${result.status} (${detail})`,
+        );
       }
       invalidateAccountRelatedQueries(queryClient);
     },
@@ -119,14 +163,46 @@ export function useAccountMutations() {
     },
   });
 
+  const resetCreditMutation = useMutation({
+    mutationFn: ({
+      accountId,
+      idempotencyKey,
+    }: {
+      accountId: string;
+      idempotencyKey?: string;
+    }) => consumeAccountRateLimitResetCredit(accountId, idempotencyKey),
+    onSuccess: (result) => {
+      if (result.outcome === "reset" || result.outcome === "already_redeemed") {
+        const suffix =
+          result.windowsReset > 0
+            ? ` (${result.windowsReset} window${result.windowsReset === 1 ? "" : "s"})`
+            : "";
+        toast.success(`Rate-limit reset applied${suffix}`);
+      } else if (result.outcome === "no_credit") {
+        toast.warning("No reset credits are available for this account");
+      } else {
+        toast.warning("No eligible usage window needs a reset");
+      }
+      invalidateAccountRelatedQueries(queryClient);
+      void queryClient.invalidateQueries({
+        queryKey: ["accounts", "reset-credits", result.accountId],
+      });
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Rate-limit reset failed");
+    },
+  });
+
   return {
     importMutation,
     createProviderMutation,
     updatePriorityMutation,
+    updateAllFastServiceTierMutation,
     availabilityMutation,
     pauseMutation,
     resumeMutation,
     deleteMutation,
+    resetCreditMutation,
   };
 }
 
@@ -139,6 +215,49 @@ export function useAccountTrends(accountId: string | null) {
     refetchInterval: 5 * 60_000,
     refetchIntervalInBackground: false,
   });
+}
+
+export function useAccountResetCredits(
+  accountId: string | null,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["accounts", "reset-credits", accountId],
+    queryFn: () => getAccountRateLimitResetCredits(accountId!),
+    enabled: Boolean(accountId) && enabled,
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+    refetchIntervalInBackground: false,
+    retry: 1,
+  });
+}
+
+export function useAccountResetCreditMap(accounts: AccountSummary[]) {
+  const oauthAccounts = useMemo(
+    () => accounts.filter((account) => account.providerKind !== "api_key"),
+    [accounts],
+  );
+  const results = useQueries({
+    queries: oauthAccounts.map((account) => ({
+      queryKey: ["accounts", "reset-credits", account.accountId],
+      queryFn: () => getAccountRateLimitResetCredits(account.accountId),
+      staleTime: 60_000,
+      refetchInterval: 60_000,
+      refetchIntervalInBackground: false,
+      retry: 1,
+    })),
+  });
+
+  return useMemo(() => {
+    const counts: Record<string, number> = {};
+    results.forEach((result, index) => {
+      const account = oauthAccounts[index];
+      if (account && result.data) {
+        counts[account.accountId] = result.data.availableCount;
+      }
+    });
+    return counts;
+  }, [oauthAccounts, results]);
 }
 
 export function useAccounts() {

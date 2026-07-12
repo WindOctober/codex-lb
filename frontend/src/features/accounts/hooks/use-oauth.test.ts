@@ -63,7 +63,35 @@ describe("useOauth", () => {
       await result.current.start("browser");
     });
 
+    expect(startOauthMock).toHaveBeenCalledWith({
+      forceMethod: "browser",
+      targetAccountId: undefined,
+    });
     expect(completeOauthMock).not.toHaveBeenCalled();
+  });
+
+  it("passes target account id when starting targeted re-auth", async () => {
+    startOauthMock.mockResolvedValue({
+      method: "browser",
+      authorizationUrl: "https://auth.example.com/authorize",
+      callbackUrl: "http://127.0.0.1:1455/auth/callback",
+      verificationUrl: null,
+      userCode: null,
+      deviceAuthId: null,
+      intervalSeconds: null,
+      expiresInSeconds: null,
+    });
+
+    const { result } = renderHook(() => useOauth());
+
+    await act(async () => {
+      await result.current.start("browser", "acc_primary");
+    });
+
+    expect(startOauthMock).toHaveBeenCalledWith({
+      forceMethod: "browser",
+      targetAccountId: "acc_primary",
+    });
   });
 
   it("updates state to success after a successful manual callback", async () => {

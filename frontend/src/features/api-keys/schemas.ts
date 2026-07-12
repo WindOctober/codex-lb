@@ -35,7 +35,7 @@ export const GroupPreferenceSchema = z.object({
   priority: z.number().int().min(0).max(100000).default(100),
 });
 
-export const SERVICE_TIERS = ["auto", "default", "priority", "flex"] as const;
+export const SERVICE_TIERS = ["default", "priority", "flex"] as const;
 export type ServiceTierType = (typeof SERVICE_TIERS)[number];
 
 export const ApiKeySchema = z.object({

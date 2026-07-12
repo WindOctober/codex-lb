@@ -7,9 +7,22 @@ import { DEFAULT_OVERVIEW_TIMEFRAME } from "@/features/dashboard/schemas";
 import { getSettings } from "@/features/settings/api";
 import { formatTimeLong } from "@/utils/formatters";
 
-function getRoutingLabel(strategy: "usage_weighted" | "round_robin" | "capacity_weighted", sticky: boolean, preferEarlier: boolean): string {
-  if (strategy === "round_robin") {
-    return sticky ? "Round robin + Sticky threads" : "Round robin";
+function getRoutingLabel(
+  strategy: "high_waterline" | "primary_drain" | "usage_weighted" | "capacity_weighted",
+  sticky: boolean,
+  preferEarlier: boolean,
+): string {
+  if (strategy === "high_waterline") {
+    if (sticky && preferEarlier) return "High waterline + Sticky + Early reset";
+    if (sticky) return "High waterline + Sticky threads";
+    if (preferEarlier) return "High waterline + Early reset";
+    return "High waterline";
+  }
+  if (strategy === "primary_drain") {
+    if (sticky && preferEarlier) return "Primary drain + Sticky + Early reset";
+    if (sticky) return "Primary drain + Sticky threads";
+    if (preferEarlier) return "Primary drain + Early reset";
+    return "Primary drain";
   }
   if (strategy === "capacity_weighted") {
     if (sticky && preferEarlier) return "Capacity weighted + Sticky + Early reset";

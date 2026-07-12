@@ -20,8 +20,9 @@ export const ERROR_LABELS = {
 } as const;
 
 export const ROUTING_LABELS = {
+  high_waterline: "high waterline",
+  primary_drain: "primary drain",
   usage_weighted: "usage weighted",
-  round_robin: "round robin",
   capacity_weighted: "capacity weighted",
   sticky: "sticky",
 } as const;

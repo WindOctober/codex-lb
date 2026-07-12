@@ -72,13 +72,13 @@ export function useOauth() {
     }
   }, []);
 
-  const start = useCallback(async (forceMethod?: "browser" | "device") => {
+  const start = useCallback(async (forceMethod?: "browser" | "device", targetAccountId?: string) => {
     clearPollTimer();
     clearCountdownTimer();
     setState((prev) => ({ ...prev, status: "starting", errorMessage: null }));
 
     try {
-      const response = await startOauth({ forceMethod });
+      const response = await startOauth({ forceMethod, targetAccountId });
       const nextState = OAuthStateSchema.parse({
         status: "pending",
         method: response.method === "device" ? "device" : "browser",

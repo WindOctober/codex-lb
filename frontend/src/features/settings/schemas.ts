@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-export const RoutingStrategySchema = z.enum(["usage_weighted", "round_robin", "capacity_weighted"]);
+export const RoutingStrategySchema = z.enum([
+  "high_waterline",
+  "primary_drain",
+  "capacity_weighted",
+  "usage_weighted",
+]);
 export const UpstreamStreamTransportSchema = z.enum(["default", "auto", "http", "websocket"]);
 
 export const DashboardSettingsSchema = z.object({
@@ -14,6 +19,8 @@ export const DashboardSettingsSchema = z.object({
   totpRequiredOnLogin: z.boolean(),
   totpConfigured: z.boolean(),
   apiKeyAuthEnabled: z.boolean(),
+  newsRefreshEnabled: z.boolean().optional().default(false),
+  scholarRefreshEnabled: z.boolean().optional().default(false),
 });
 
 export const SettingsUpdateRequestSchema = z.object({

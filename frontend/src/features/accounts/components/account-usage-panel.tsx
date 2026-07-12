@@ -1,6 +1,7 @@
 import { Clock } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { AccountQuotaTimelineChart } from "@/features/accounts/components/account-quota-timeline-chart";
 import { AccountTrendChart } from "@/features/accounts/components/account-trend-chart";
 import type { AccountSummary, AccountTrendsResponse } from "@/features/accounts/schemas";
 import { quotaBarColor, quotaBarTrack } from "@/utils/account-status";
@@ -68,6 +69,16 @@ const ADDITIONAL_LIMIT_LABELS: Record<string, string> = {
   "gpt-5.3-codex-spark": "GPT-5.3-Codex-Spark",
 };
 
+const TIMELINE_REPLACED_QUOTA_KEYS = new Set(Object.keys(ADDITIONAL_LIMIT_LABELS));
+
+function isTimelineReplacedQuota(limitName: string, quotaKey?: string | null): boolean {
+  const normalizedQuotaKey = quotaKey?.trim().toLowerCase();
+  if (normalizedQuotaKey && TIMELINE_REPLACED_QUOTA_KEYS.has(normalizedQuotaKey)) {
+    return true;
+  }
+  return TIMELINE_REPLACED_QUOTA_KEYS.has(limitName.trim().toLowerCase());
+}
+
 function formatAdditionalLimitName(limitName: string, quotaKey?: string | null): string {
   const normalizedQuotaKey = quotaKey?.trim().toLowerCase();
   if (normalizedQuotaKey && ADDITIONAL_LIMIT_LABELS[normalizedQuotaKey]) {
@@ -128,7 +139,11 @@ export function AccountUsagePanel({ account, trends }: AccountUsagePanelProps) {
   const requestUsage = account.requestUsage ?? null;
   const hasRequestUsage = (requestUsage?.requestCount ?? 0) > 0;
   const weeklyOnly = account.windowMinutesPrimary == null && account.windowMinutesSecondary != null;
+  const hasQuotaTimeline = (trends?.quotaTimeline.length ?? 0) > 0;
   const hasTrends = trends && (trends.primary.length > 0 || trends.secondary.length > 0);
+  const visibleAdditionalQuotas = hasQuotaTimeline
+    ? account.additionalQuotas.filter((quota) => !isTimelineReplacedQuota(quota.limitName, quota.quotaKey))
+    : account.additionalQuotas;
 
   return (
     <div className="space-y-4 rounded-lg border bg-muted/30 p-4">
@@ -148,12 +163,12 @@ export function AccountUsagePanel({ account, trends }: AccountUsagePanelProps) {
           <p className="mt-1 text-xs text-muted-foreground">No request usage yet.</p>
         )}
       </div>
-      {account.additionalQuotas.length > 0 ? (
+      {visibleAdditionalQuotas.length > 0 ? (
         <div className="space-y-3">
           <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             Additional Quotas
           </p>
-          {account.additionalQuotas.map((quota) => (
+          {visibleAdditionalQuotas.map((quota) => (
             <div key={quota.quotaKey ?? quota.limitName} className="rounded-md border bg-background/60 px-3 py-2 space-y-2">
               <p className="text-xs font-medium">
                 {quota.displayLabel ?? formatAdditionalLimitName(quota.limitName, quota.quotaKey)}
@@ -176,7 +191,28 @@ export function AccountUsagePanel({ account, trends }: AccountUsagePanelProps) {
           ))}
         </div>
       ) : null}
-      {hasTrends && (
+      {hasQuotaTimeline ? (
+        <div className="pt-3">
+          <div className="mb-2 flex items-center justify-between">
+            <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Quota timeline</h4>
+            <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2 w-2 rounded-sm bg-chart-1" />
+                5h used
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2 w-2 rounded-full bg-chart-2" />
+                Weekly left
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2 w-2 rounded-full bg-chart-3" />
+                7d reset
+              </span>
+            </div>
+          </div>
+          <AccountQuotaTimelineChart buckets={trends?.quotaTimeline ?? []} />
+        </div>
+      ) : hasTrends && (
         <div className="pt-3">
           <div className="mb-2 flex items-center justify-between">
             <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">7-day trend</h4>

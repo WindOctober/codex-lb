@@ -16,6 +16,8 @@ const BASE_SETTINGS: DashboardSettings = {
   totpRequiredOnLogin: false,
   totpConfigured: false,
   apiKeyAuthEnabled: true,
+  newsRefreshEnabled: false,
+  scholarRefreshEnabled: false,
 };
 
 describe("RoutingSettings", () => {

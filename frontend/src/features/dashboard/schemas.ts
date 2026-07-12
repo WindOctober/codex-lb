@@ -138,6 +138,136 @@ export const RequestLogFilterOptionsSchema = z.object({
   statuses: z.array(z.string()),
 });
 
+export const BridgeRuntimeConfigSchema = z.object({
+  enabled: z.boolean(),
+  maxSessions: z.number().int().nonnegative(),
+  queueLimit: z.number().int().nonnegative(),
+  accountModelSessionLimit: z.number().int().nonnegative(),
+  softShardPendingLimit: z.number().int().nonnegative(),
+  softShardMaxShards: z.number().int().nonnegative(),
+  idleTtlSeconds: z.number(),
+  codexIdleTtlSeconds: z.number(),
+  promptCacheIdleTtlSeconds: z.number(),
+  gatewaySafeMode: z.boolean(),
+});
+
+export const BridgeRuntimeGroupSchema = z.object({
+  key: z.string(),
+  label: z.string(),
+  sessions: z.number().int().nonnegative(),
+  pendingRequests: z.number().int().nonnegative(),
+  queuedRequests: z.number().int().nonnegative(),
+  busySessions: z.number().int().nonnegative(),
+  codexSessions: z.number().int().nonnegative(),
+  reconnectRequestedSessions: z.number().int().nonnegative(),
+});
+
+export const BridgeRuntimeShardFamilySchema = z.object({
+  familyHash: z.string(),
+  affinityKind: z.string(),
+  sessions: z.number().int().nonnegative(),
+  pendingRequests: z.number().int().nonnegative(),
+  queuedRequests: z.number().int().nonnegative(),
+  busySessions: z.number().int().nonnegative(),
+  codexSessions: z.number().int().nonnegative(),
+  shardSessions: z.number().int().nonnegative(),
+  parallelSessions: z.number().int().nonnegative(),
+  accounts: z.array(z.string()),
+  models: z.array(z.string()),
+});
+
+export const BridgeRuntimeSessionSchema = z.object({
+  affinityKind: z.string(),
+  affinityKeyHash: z.string().nullable(),
+  keyStrength: z.string(),
+  shardIndex: z.number().int().nonnegative(),
+  parallelIndex: z.number().int().nonnegative(),
+  accountId: z.string().nullable(),
+  accountLabel: z.string().nullable(),
+  accountStatus: z.string().nullable(),
+  model: z.string().nullable(),
+  codexSession: z.boolean(),
+  closed: z.boolean(),
+  pendingRequestCount: z.number().int().nonnegative(),
+  queuedRequestCount: z.number().int().nonnegative(),
+  lastUsedAgoMs: z.number().int().nonnegative().nullable(),
+  idleTtlSeconds: z.number(),
+  reconnectRequested: z.boolean(),
+  prewarmed: z.boolean(),
+  previousResponseCount: z.number().int().nonnegative(),
+  turnStateAliasCount: z.number().int().nonnegative(),
+  upstreamReconnectCount: z.number().int().nonnegative(),
+  hasLastCompletedResponse: z.boolean(),
+});
+
+export const BridgeRuntimeHealthHistoryBucketSchema = z.object({
+  bucketStart: z.string().datetime({ offset: true }),
+  latencyFirstTokenP50Ms: z.number().int().nonnegative().nullable(),
+  latencyFirstTokenP95Ms: z.number().int().nonnegative().nullable(),
+  successCount: z.number().int().nonnegative(),
+  errorCount: z.number().int().nonnegative(),
+  status: z.enum(["ok", "warning", "critical", "empty"]),
+});
+
+export const BridgeRuntimeHealthSchema = z.object({
+  anchorAt: z.string().datetime({ offset: true }).nullable(),
+  latencyFirstTokenP50Ms: z.number().int().nonnegative().nullable(),
+  latencyFirstTokenP95Ms: z.number().int().nonnegative().nullable(),
+  latencyFirstTokenP99Ms: z.number().int().nonnegative().nullable(),
+  endpointPingMs: z.number().int().nonnegative().nullable(),
+  successRatePercent: z.number().nullable(),
+  successCount: z.number().int().nonnegative(),
+  requestCount: z.number().int().nonnegative(),
+  nextUpdateSeconds: z.number().int().nonnegative(),
+  status: z.enum(["ok", "warning", "critical", "unknown"]),
+  history: z.array(BridgeRuntimeHealthHistoryBucketSchema),
+});
+
+export const UpstreamEgressRuntimeSchema = z.object({
+  mode: z.string(),
+  selectedRoute: z.string(),
+  proxyConfigured: z.boolean(),
+  directOk: z.boolean().nullable(),
+  proxyOk: z.boolean().nullable(),
+  directLatencyMs: z.number().int().nonnegative().nullable(),
+  proxyLatencyMs: z.number().int().nonnegative().nullable(),
+  directFailureStreak: z.number().int().nonnegative(),
+  directSuccessStreak: z.number().int().nonnegative(),
+  lastProbeAgoMs: z.number().int().nonnegative().nullable(),
+  lastSwitchAgoMs: z.number().int().nonnegative().nullable(),
+});
+
+export const BridgeRuntimeSchema = z.object({
+  config: BridgeRuntimeConfigSchema,
+  totalSessions: z.number().int().nonnegative(),
+  activeSessions: z.number().int().nonnegative(),
+  closedSessions: z.number().int().nonnegative(),
+  inflightSessionCreations: z.number().int().nonnegative(),
+  pendingRequests: z.number().int().nonnegative(),
+  queuedRequests: z.number().int().nonnegative(),
+  busySessions: z.number().int().nonnegative(),
+  codexSessions: z.number().int().nonnegative(),
+  promptCacheSessions: z.number().int().nonnegative(),
+  hardSessions: z.number().int().nonnegative(),
+  softSessions: z.number().int().nonnegative(),
+  softShardSessions: z.number().int().nonnegative(),
+  busyParallelSessions: z.number().int().nonnegative(),
+  reconnectRequestedSessions: z.number().int().nonnegative(),
+  prewarmedSessions: z.number().int().nonnegative(),
+  capacityUsedPercent: z.number(),
+  availableParallelCapacity: z.number().int().nonnegative().nullable(),
+  freeAccountModelSessionSlots: z.number().int().nonnegative().nullable(),
+  reclaimableIdleSessions: z.number().int().nonnegative(),
+  accountModelSessionCapacity: z.number().int().nonnegative().nullable(),
+  health: BridgeRuntimeHealthSchema,
+  upstreamEgress: UpstreamEgressRuntimeSchema,
+  byAccount: z.array(BridgeRuntimeGroupSchema),
+  byAffinityKind: z.array(BridgeRuntimeGroupSchema),
+  byModel: z.array(BridgeRuntimeGroupSchema),
+  shardFamilies: z.array(BridgeRuntimeShardFamilySchema),
+  sessions: z.array(BridgeRuntimeSessionSchema),
+});
+
 export const FilterStateSchema = z.object({
   search: z.string(),
   timeframe: z.enum(["all", "1h", "24h", "7d"]),
@@ -157,5 +287,12 @@ export type UsageWindow = z.infer<typeof UsageWindowSchema>;
 export type RequestLog = z.infer<typeof RequestLogSchema>;
 export type RequestLogsResponse = z.infer<typeof RequestLogsResponseSchema>;
 export type RequestLogFilterOptions = z.infer<typeof RequestLogFilterOptionsSchema>;
+export type BridgeRuntime = z.infer<typeof BridgeRuntimeSchema>;
+export type BridgeRuntimeHealth = z.infer<typeof BridgeRuntimeHealthSchema>;
+export type BridgeRuntimeHealthHistoryBucket = z.infer<typeof BridgeRuntimeHealthHistoryBucketSchema>;
+export type UpstreamEgressRuntime = z.infer<typeof UpstreamEgressRuntimeSchema>;
+export type BridgeRuntimeGroup = z.infer<typeof BridgeRuntimeGroupSchema>;
+export type BridgeRuntimeShardFamily = z.infer<typeof BridgeRuntimeShardFamilySchema>;
+export type BridgeRuntimeSession = z.infer<typeof BridgeRuntimeSessionSchema>;
 export type FilterState = z.infer<typeof FilterStateSchema>;
 export type Depletion = z.infer<typeof DepletionSchema>;

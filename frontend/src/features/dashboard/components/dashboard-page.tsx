@@ -6,13 +6,14 @@ import { RefreshCw } from "lucide-react";
 import { AlertMessage } from "@/components/alert-message";
 import { useAccountMutations } from "@/features/accounts/hooks/use-accounts";
 import { AccountCards } from "@/features/dashboard/components/account-cards";
+import { BridgeRuntimePanel } from "@/features/dashboard/components/bridge-runtime-panel";
 import { DashboardSkeleton } from "@/features/dashboard/components/dashboard-skeleton";
 import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters/overview-timeframe-select";
 import { RequestFilters } from "@/features/dashboard/components/filters/request-filters";
 import { RecentRequestsTable } from "@/features/dashboard/components/recent-requests-table";
 import { StatsGrid } from "@/features/dashboard/components/stats-grid";
 import { UsageDonuts } from "@/features/dashboard/components/usage-donuts";
-import { useDashboard } from "@/features/dashboard/hooks/use-dashboard";
+import { useBridgeRuntime, useDashboard } from "@/features/dashboard/hooks/use-dashboard";
 import { useRequestLogs } from "@/features/dashboard/hooks/use-request-logs";
 import { buildDashboardView } from "@/features/dashboard/utils";
 import {
@@ -101,10 +102,11 @@ export function DashboardPage() {
     [searchParams],
   );
   const dashboardQuery = useDashboard(overviewTimeframe);
+  const bridgeRuntimeQuery = useBridgeRuntime();
   const { filters, logsQuery, optionsQuery, updateFilters } = useRequestLogs();
   const { resumeMutation } = useAccountMutations();
 
-  const isRefreshing = dashboardQuery.isFetching || logsQuery.isFetching;
+  const isRefreshing = dashboardQuery.isFetching || bridgeRuntimeQuery.isFetching || logsQuery.isFetching;
 
   const handleRefresh = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
@@ -194,6 +196,7 @@ export function DashboardPage() {
 
   const errorMessage =
     (dashboardQuery.error instanceof Error && dashboardQuery.error.message) ||
+    (bridgeRuntimeQuery.error instanceof Error && bridgeRuntimeQuery.error.message) ||
     (logsQuery.error instanceof Error && logsQuery.error.message) ||
     (optionsQuery.error instanceof Error && optionsQuery.error.message) ||
     null;
@@ -243,6 +246,14 @@ export function DashboardPage() {
               safeLinePrimary={view.safeLinePrimary}
               safeLineSecondary={view.safeLineSecondary}
             />
+
+          <section className="space-y-4">
+            <div className="flex items-center gap-3">
+              <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">HTTP Bridge</h2>
+              <div className="h-px flex-1 bg-border" />
+            </div>
+            <BridgeRuntimePanel runtime={bridgeRuntimeQuery.data} isLoading={bridgeRuntimeQuery.isLoading} />
+          </section>
 
           <section className="space-y-4">
             <div className="flex items-center gap-3">

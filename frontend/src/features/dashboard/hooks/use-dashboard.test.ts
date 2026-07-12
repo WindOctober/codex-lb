@@ -4,7 +4,7 @@ import { HttpResponse, http } from "msw";
 import { createElement, type PropsWithChildren } from "react";
 import { describe, expect, it } from "vitest";
 
-import { useDashboard } from "@/features/dashboard/hooks/use-dashboard";
+import { useBridgeRuntime, useDashboard } from "@/features/dashboard/hooks/use-dashboard";
 import { server } from "@/test/mocks/server";
 
 function createTestQueryClient(): QueryClient {
@@ -102,5 +102,22 @@ describe("useDashboard", () => {
     });
 
     await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+});
+
+describe("useBridgeRuntime", () => {
+  it("loads bridge runtime and configures 60s refetch", async () => {
+    const queryClient = createTestQueryClient();
+    const { result } = renderHook(() => useBridgeRuntime(), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.health.endpointPingMs).toBe(121);
+
+    const query = queryClient.getQueryCache().find({ queryKey: ["dashboard", "bridgeRuntime"] });
+    const refetchInterval = (query?.options as { refetchInterval?: unknown } | undefined)
+      ?.refetchInterval;
+    expect(refetchInterval).toBe(60_000);
   });
 });

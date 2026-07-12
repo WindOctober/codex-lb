@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   AccountSummarySchema,
   AccountAdditionalQuotaSchema,
+  BridgeRuntimeSchema,
   DEFAULT_OVERVIEW_TIMEFRAME,
   DashboardOverviewSchema,
   DepletionSchema,
@@ -156,6 +157,132 @@ describe("RequestLogsResponseSchema", () => {
     expect(parsed.requests[0]?.apiKeyName).toBe("Key A");
     expect(parsed.requests[0]?.planType).toBe("plus");
     expect(parsed.requests[0]?.transport).toBe("websocket");
+  });
+});
+
+describe("BridgeRuntimeSchema", () => {
+  it("parses bridge runtime metrics", () => {
+    const parsed = BridgeRuntimeSchema.parse({
+      config: {
+        enabled: true,
+        maxSessions: 0,
+        queueLimit: 0,
+        accountModelSessionLimit: 20,
+        softShardPendingLimit: 1,
+        softShardMaxShards: 64,
+        idleTtlSeconds: 120,
+        codexIdleTtlSeconds: 900,
+        promptCacheIdleTtlSeconds: 3600,
+        gatewaySafeMode: false,
+      },
+      totalSessions: 2,
+      activeSessions: 2,
+      closedSessions: 0,
+      inflightSessionCreations: 0,
+      pendingRequests: 1,
+      queuedRequests: 1,
+      busySessions: 1,
+      codexSessions: 1,
+      promptCacheSessions: 2,
+      hardSessions: 0,
+      softSessions: 2,
+      softShardSessions: 1,
+      busyParallelSessions: 0,
+      reconnectRequestedSessions: 0,
+      prewarmedSessions: 0,
+      capacityUsedPercent: 0.78,
+      availableParallelCapacity: 39,
+      freeAccountModelSessionSlots: 38,
+      reclaimableIdleSessions: 1,
+      accountModelSessionCapacity: 40,
+      health: {
+        anchorAt: "2026-01-01T00:00:00Z",
+        latencyFirstTokenP50Ms: 2233,
+        latencyFirstTokenP95Ms: 5200,
+        latencyFirstTokenP99Ms: 8800,
+        endpointPingMs: 121,
+        successRatePercent: 97,
+        successCount: 9779,
+        requestCount: 10081,
+        nextUpdateSeconds: 60,
+        status: "ok",
+        history: [{
+          bucketStart: "2026-01-01T00:00:00Z",
+          latencyFirstTokenP50Ms: 2233,
+          latencyFirstTokenP95Ms: 5200,
+          successCount: 10,
+          errorCount: 0,
+          status: "ok",
+        }],
+      },
+      upstreamEgress: {
+        mode: "auto",
+        selectedRoute: "direct",
+        proxyConfigured: true,
+        directOk: true,
+        proxyOk: false,
+        directLatencyMs: 121,
+        proxyLatencyMs: 4001,
+        directFailureStreak: 0,
+        directSuccessStreak: 2,
+        lastProbeAgoMs: 1000,
+        lastSwitchAgoMs: null,
+      },
+      byAccount: [{
+        key: "acc-1",
+        label: "user@example.com",
+        sessions: 2,
+        pendingRequests: 1,
+        queuedRequests: 1,
+        busySessions: 1,
+        codexSessions: 1,
+        reconnectRequestedSessions: 0,
+      }],
+      byAffinityKind: [],
+      byModel: [],
+      shardFamilies: [{
+        familyHash: "sha256:abc",
+        affinityKind: "prompt_cache",
+        sessions: 2,
+        pendingRequests: 1,
+        queuedRequests: 1,
+        busySessions: 1,
+        codexSessions: 1,
+        shardSessions: 1,
+        parallelSessions: 0,
+        accounts: ["acc-1"],
+        models: ["gpt-5.5"],
+      }],
+      sessions: [{
+        affinityKind: "prompt_cache",
+        affinityKeyHash: "sha256:abc",
+        keyStrength: "soft",
+        shardIndex: 1,
+        parallelIndex: 0,
+        accountId: "acc-1",
+        accountLabel: "user@example.com",
+        accountStatus: "active",
+        model: "gpt-5.5",
+        codexSession: true,
+        closed: false,
+        pendingRequestCount: 1,
+        queuedRequestCount: 1,
+        lastUsedAgoMs: 1000,
+        idleTtlSeconds: 900,
+        reconnectRequested: false,
+        prewarmed: false,
+        previousResponseCount: 1,
+        turnStateAliasCount: 1,
+        upstreamReconnectCount: 0,
+        hasLastCompletedResponse: true,
+      }],
+    });
+
+    expect(parsed.codexSessions).toBe(1);
+    expect(parsed.availableParallelCapacity).toBe(39);
+    expect(parsed.health.latencyFirstTokenP50Ms).toBe(2233);
+    expect(parsed.upstreamEgress.directLatencyMs).toBe(121);
+    expect(parsed.sessions[0]?.shardIndex).toBe(1);
   });
 });
 

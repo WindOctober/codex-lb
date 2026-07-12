@@ -33,6 +33,7 @@ describe("AccountList", () => {
         onSelect={onSelect}
         onOpenImport={() => {}}
         onOpenOauth={() => {}}
+        onSetAllFastServiceTier={() => {}}
       />,
     );
 
@@ -67,6 +68,7 @@ describe("AccountList", () => {
         onSelect={() => {}}
         onOpenImport={() => {}}
         onOpenOauth={() => {}}
+        onSetAllFastServiceTier={() => {}}
       />,
     );
 
@@ -107,6 +109,7 @@ describe("AccountList", () => {
         onSelect={() => {}}
         onOpenImport={() => {}}
         onOpenOauth={() => {}}
+        onSetAllFastServiceTier={() => {}}
       />,
     );
 
@@ -114,5 +117,36 @@ describe("AccountList", () => {
     expect(screen.getByText((_content, el) => el?.tagName === "P" && !!el.textContent?.match(/dup@example\.com \| ID 7f9de2ad\.\.\.a95cee/))).toBeInTheDocument();
     expect(screen.getByText("unique@example.com")).toBeInTheDocument();
     expect(screen.queryByText((_content, el) => el?.tagName === "P" && !!el.textContent?.match(/unique@example\.com \| ID/))).not.toBeInTheDocument();
+  });
+
+  it("calls bulk fast mode handlers", async () => {
+    const user = userEvent.setup();
+    const onSetAllFastServiceTier = vi.fn();
+
+    render(
+      <AccountList
+        accounts={[
+          {
+            accountId: "acc-1",
+            email: "primary@example.com",
+            displayName: "Primary",
+            planType: "plus",
+            status: "active",
+            fastServiceTierEnabled: false,
+            additionalQuotas: [],
+          },
+        ]}
+        selectedAccountId="acc-1"
+        onSelect={() => {}}
+        onOpenImport={() => {}}
+        onOpenOauth={() => {}}
+        onSetAllFastServiceTier={onSetAllFastServiceTier}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Enable fast mode for all accounts" }));
+    expect(onSetAllFastServiceTier).toHaveBeenCalledWith(true);
+
+    expect(screen.getByRole("button", { name: "Disable fast mode for all accounts" })).toBeDisabled();
   });
 });
