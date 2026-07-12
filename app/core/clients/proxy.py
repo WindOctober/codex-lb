@@ -98,6 +98,20 @@ _SSE_EVENT_TYPE_ALIASES = {
 
 _SSE_READ_CHUNK_SIZE = 1 * 1024
 _IMAGE_INLINE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _aiohttp_proxy_kwargs(proxy_url: str | None) -> dict[str, str]:
+    if proxy_url is None:
+        return {}
+    return {"proxy": proxy_url}
+
+
+def _upstream_websocket_proxy_kwargs(proxy_url: str | None) -> dict[str, str]:
+    if proxy_url is None:
+        return {}
+    return {"proxy_url": proxy_url}
+
+
 _IMAGE_INLINE_CHUNK_SIZE = 64 * 1024
 _IMAGE_INLINE_TIMEOUT_SECONDS = 8.0
 _BLOCKED_LITERAL_HOSTS = {"localhost", "localhost.localdomain"}
@@ -1129,7 +1143,7 @@ async def _open_upstream_websocket(
                 autoping=True,
                 autoclose=True,
                 max_msg_size=max_msg_size,
-                proxy=proxy_url,
+                **_aiohttp_proxy_kwargs(proxy_url),
             )
             websocket = await asyncio.wait_for(websocket_cm.__aenter__(), timeout=connect_timeout_seconds)
             if hold_half_open_probe and is_probe and circuit_breaker is not None:
@@ -1160,7 +1174,7 @@ async def _open_upstream_websocket(
                 headers=request_headers,
                 timeout=timeout,
                 read_until_eof=False,
-                proxy=proxy_url,
+                **_aiohttp_proxy_kwargs(proxy_url),
             )
         except Exception as exc:
             if circuit_breaker is not None:
@@ -1356,7 +1370,7 @@ async def _stream_responses_via_websocket(
         max_msg_size=max_event_bytes,
         account_id=account_id,
         hold_half_open_probe=True,
-        proxy_url=proxy_url,
+        **_upstream_websocket_proxy_kwargs(proxy_url),
     )
 
     try:
@@ -1804,7 +1818,7 @@ async def stream_responses(
                 json=payload_dict,
                 headers=current_headers,
                 timeout=current_timeout,
-                proxy=upstream_proxy_url,
+                **_aiohttp_proxy_kwargs(upstream_proxy_url),
             ),
             settings=settings,
             account_id=account_id,
@@ -2226,7 +2240,7 @@ class _CompactCommandTransport:
                     json=payload_dict,
                     headers=upstream_headers,
                     timeout=timeout,
-                    proxy=self.proxy_url,
+                    **_aiohttp_proxy_kwargs(self.proxy_url),
                 ),
                 settings=settings,
                 account_id=self.account_id,
@@ -2430,7 +2444,7 @@ async def transcribe_audio(
                 data=form,
                 headers=upstream_headers,
                 timeout=timeout,
-                proxy=upstream_proxy_url,
+                **_aiohttp_proxy_kwargs(upstream_proxy_url),
             ),
             settings=settings,
             account_id=account_id,

@@ -172,7 +172,7 @@ def _load_sqlite_backup_creator() -> _SqliteBackupCreator:
 
 
 def init_background_db(url: str | None = None) -> None:
-    """Initialize separate DB pool for background tasks (smaller pool).
+    """Initialize a separate configured DB pool for background tasks.
 
     Args:
         url: Database URL. If None, uses settings.database_url.
