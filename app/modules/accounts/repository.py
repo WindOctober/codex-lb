@@ -16,6 +16,7 @@ from app.core.usage.pricing import (
     calculate_cost_from_usage,
     get_pricing_for_model,
 )
+from app.core.utils.time import utcnow
 from app.db.models import (
     ACCOUNT_PROVIDER_API_KEY,
     ACCOUNT_PROVIDER_OPENAI_OAUTH,
@@ -113,13 +114,14 @@ class AccountsRepository:
         self,
         account_ids: list[str] | None = None,
     ) -> dict[str, AccountRequestUsageSummary]:
-        since_7d = datetime.utcnow() - timedelta(days=7)
+        since_7d = utcnow() - timedelta(days=7)
         accounts_stmt = select(Account)
         if account_ids:
             accounts_stmt = accounts_stmt.where(Account.id.in_(account_ids))
         accounts_result = await self._session.execute(accounts_stmt)
         accounts_by_id = {account.id: account for account in accounts_result.scalars().all()}
         output_tokens_expr = func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)
+        missing_cost_expr = RequestLog.cost_usd.is_(None)
         stmt = select(
             RequestLog.account_id,
             RequestLog.model,
@@ -128,6 +130,20 @@ class AccountsRepository:
             func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
             func.coalesce(func.sum(output_tokens_expr), 0).label("output_tokens"),
             func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
+            func.count(RequestLog.cost_usd).label("persisted_cost_count"),
+            func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("persisted_cost_usd"),
+            func.coalesce(
+                func.sum(case((missing_cost_expr, func.coalesce(RequestLog.input_tokens, 0)), else_=0)),
+                0,
+            ).label("legacy_input_tokens"),
+            func.coalesce(
+                func.sum(case((missing_cost_expr, func.coalesce(output_tokens_expr, 0)), else_=0)),
+                0,
+            ).label("legacy_output_tokens"),
+            func.coalesce(
+                func.sum(case((missing_cost_expr, func.coalesce(RequestLog.cached_input_tokens, 0)), else_=0)),
+                0,
+            ).label("legacy_cached_input_tokens"),
             func.coalesce(
                 func.sum(
                     case(
@@ -154,6 +170,11 @@ class AccountsRepository:
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            persisted_cost_count,
+            persisted_cost_usd,
+            legacy_input_tokens,
+            legacy_output_tokens,
+            legacy_cached_input_tokens,
             tokens_7d,
         ) in result.all():
             if not account_id:
@@ -186,28 +207,49 @@ class AccountsRepository:
                 output_tokens=float(output_sum),
                 cached_input_tokens=float(cached_sum),
             )
-            resolved = get_pricing_for_model(model or "", None, None)
-            if resolved is None:
-                continue
-            _, price = resolved
-            cost_usd = calculate_cost_from_usage(
-                usage,
-                price,
-                service_tier=service_tier,
+            legacy_input_sum = int(legacy_input_tokens or 0)
+            legacy_output_sum = int(legacy_output_tokens or 0)
+            legacy_cached_sum = max(
+                0,
+                min(int(legacy_cached_input_tokens or 0), legacy_input_sum),
             )
-            if cost_usd is not None:
-                entry["total_cost_usd"] = float(entry["total_cost_usd"] or 0.0) + cost_usd
+            legacy_usage = UsageTokens(
+                input_tokens=float(legacy_input_sum),
+                output_tokens=float(legacy_output_sum),
+                cached_input_tokens=float(legacy_cached_sum),
+            )
+            group_cost_usd = float(persisted_cost_usd or 0.0)
+            resolved = get_pricing_for_model(model or "", None, None)
+            legacy_cost_usd: float | None = None
+            if resolved is not None and (legacy_input_sum > 0 or legacy_output_sum > 0):
+                _, price = resolved
+                legacy_cost_usd = calculate_cost_from_usage(
+                    legacy_usage,
+                    price,
+                    service_tier=service_tier,
+                )
+                if legacy_cost_usd is not None:
+                    group_cost_usd += legacy_cost_usd
+            entry["total_cost_usd"] = float(entry["total_cost_usd"] or 0.0) + group_cost_usd
 
             account = accounts_by_id.get(account_id)
             if account is None:
                 continue
-            estimated_cost, currency = _calculate_display_cost(
-                account=account,
-                usage=usage,
-                price=price,
-                service_tier=service_tier,
-                fallback_usd=cost_usd,
-            )
+            if _is_duckcoding_account(account):
+                if resolved is None:
+                    continue
+                _, price = resolved
+                estimated_cost, currency = _calculate_display_cost(
+                    account=account,
+                    usage=usage,
+                    price=price,
+                    service_tier=service_tier,
+                    fallback_usd=None,
+                )
+            elif int(persisted_cost_count or 0) > 0 or legacy_cost_usd is not None:
+                estimated_cost, currency = group_cost_usd, "USD"
+            else:
+                continue
             if estimated_cost is None:
                 continue
             if entry["estimated_total_cost_currency"] is None:
@@ -297,14 +339,10 @@ class AccountsRepository:
 
         same_email = await self._openai_accounts_by_normalized_email(account.email)
         same_identity = [
-            existing
-            for existing in same_email
-            if existing.chatgpt_account_id == account.chatgpt_account_id
+            existing for existing in same_email if existing.chatgpt_account_id == account.chatgpt_account_id
         ]
         conflicting_identity = [
-            existing
-            for existing in same_email
-            if existing.chatgpt_account_id != account.chatgpt_account_id
+            existing for existing in same_email if existing.chatgpt_account_id != account.chatgpt_account_id
         ]
         if conflicting_identity:
             raise AccountIdentityConflictError(account.email)
@@ -837,8 +875,7 @@ def _choose_openai_reauth_target(accounts: list[Account], *, incoming_account_id
 def _merge_local_account_metadata(target: Account, source: Account) -> None:
     target.kyc_enabled = bool(getattr(target, "kyc_enabled", False) or getattr(source, "kyc_enabled", False))
     target.fast_service_tier_enabled = bool(
-        getattr(target, "fast_service_tier_enabled", False)
-        or getattr(source, "fast_service_tier_enabled", False)
+        getattr(target, "fast_service_tier_enabled", False) or getattr(source, "fast_service_tier_enabled", False)
     )
     if target.upstream_priority == 100 and source.upstream_priority != 100:
         target.upstream_priority = source.upstream_priority
