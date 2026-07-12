@@ -187,7 +187,7 @@ def _account_supports_http_bridge_request_model(
         return True
     registry = model_registry if model_registry is not None else get_model_registry()
     allowed_plans = registry.plan_types_for_model(request_model)
-    return allowed_plans is not None and plan_type in allowed_plans
+    return allowed_plans is None or plan_type in allowed_plans
 
 
 def _supported_models_for_account(account: Account) -> set[str] | None:

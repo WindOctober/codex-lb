@@ -79,7 +79,7 @@ from app.modules.proxy.work_admission import AdmissionLease, WorkAdmissionContro
 logger = logging.getLogger("app.modules.proxy.service")
 
 _STREAM_MAX_ACCOUNT_ATTEMPTS = 3
-_TRANSIENT_RETRY_CODES = frozenset({"server_error", "server_is_overloaded"})
+_TRANSIENT_RETRY_CODES = frozenset({"server_error"})
 _TEXT_DELTA_EVENT_TYPES = frozenset({"response.output_text.delta", "response.refusal.delta"})
 _TEXT_DONE_CONTENT_PART_TYPES = frozenset({"output_text", "refusal"})
 
@@ -1082,6 +1082,8 @@ class _StreamingMixin:
                     error_code = code
                     error_message = error.message if error else None
                     settlement.account_health_error = _should_penalize_stream_error(code)
+                    if allow_transient_retry and code in _TRANSIENT_RETRY_CODES:
+                        raise _TransientStreamError(code, settlement.error)
                     if allow_retry and (
                         _should_retry_stream_error(code)
                         or _should_failover_first_event_failure(
@@ -1091,8 +1093,6 @@ class _StreamingMixin:
                         )
                     ):
                         raise _RetryableStreamError(code, settlement.error)
-                    if allow_transient_retry and code in _TRANSIENT_RETRY_CODES:
-                        raise _TransientStreamError(code, settlement.error)
                 terminal_stream_error = _TerminalStreamError(
                     error_code or code,
                     settlement.error,

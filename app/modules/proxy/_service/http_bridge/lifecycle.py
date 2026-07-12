@@ -101,6 +101,8 @@ class _HTTPBridgeLifecycleService(Protocol):
 
     async def _settle_durable_http_bridge_session_refresh(self, session: _HTTPBridgeSession) -> None: ...
 
+    async def _release_durable_http_bridge_session_ownership(self, session: _HTTPBridgeSession) -> None: ...
+
     def _defer_next_durable_http_bridge_session_refresh(
         self,
         session: _HTTPBridgeSession,
@@ -140,7 +142,6 @@ class _HTTPBridgeLifecycleMixin:
         if background_close_tasks:
             await asyncio.gather(*background_close_tasks, return_exceptions=True)
 
-
     async def mark_http_bridge_draining(self: _HTTPBridgeLifecycleService) -> None:
         try:
             await self._durable_bridge.mark_instance_draining(
@@ -148,7 +149,6 @@ class _HTTPBridgeLifecycleMixin:
             )
         except Exception:
             logger.warning("Failed to mark durable HTTP bridge sessions draining", exc_info=True)
-
 
     async def _prune_http_bridge_sessions_locked(self: _HTTPBridgeLifecycleService) -> None:
         now = time.monotonic()
@@ -176,7 +176,6 @@ class _HTTPBridgeLifecycleMixin:
                 )
                 await self._close_http_bridge_session(session, turn_state_lock_held=True)
 
-
     async def _detach_http_bridge_session_for_background_close(
         self: _HTTPBridgeLifecycleService,
         session: "_HTTPBridgeSession",
@@ -188,7 +187,29 @@ class _HTTPBridgeLifecycleMixin:
             session_lease.release()
         await self._unregister_http_bridge_turn_states(session)
         await self._unregister_http_bridge_previous_response_ids(session)
+        await self._release_durable_http_bridge_session_ownership(session)
 
+    async def _release_durable_http_bridge_session_ownership(
+        self: _HTTPBridgeLifecycleService,
+        session: "_HTTPBridgeSession",
+    ) -> None:
+        session_id = session.durable_session_id
+        owner_epoch = session.durable_owner_epoch
+        if session_id is None or owner_epoch is None:
+            return
+        await self._settle_durable_http_bridge_session_refresh(session)
+        try:
+            await self._durable_bridge.release_live_session(
+                session_id=session_id,
+                instance_id=self._http_bridge_runtime_settings().http_responses_session_bridge_instance_id,
+                owner_epoch=owner_epoch,
+                draining=shutdown_state.is_bridge_drain_active(),
+            )
+        except Exception:
+            logger.warning("Failed to release durable HTTP bridge session", exc_info=True)
+            return
+        session.durable_session_id = None
+        session.durable_owner_epoch = None
 
     def _schedule_http_bridge_session_close(
         self: _HTTPBridgeLifecycleService,
@@ -220,7 +241,6 @@ class _HTTPBridgeLifecycleMixin:
         task = asyncio.create_task(close_session())
         self._http_bridge_background_close_tasks.add(task)
         task.add_done_callback(self._http_bridge_background_close_tasks.discard)
-
 
     async def _close_http_bridge_session(
         self: _HTTPBridgeLifecycleService,
@@ -261,17 +281,7 @@ class _HTTPBridgeLifecycleMixin:
                 api_key=None,
                 response_create_gate=response_create_gate,
             )
-        if session.durable_session_id is not None and session.durable_owner_epoch is not None:
-            await self._settle_durable_http_bridge_session_refresh(session)
-            try:
-                await self._durable_bridge.release_live_session(
-                    session_id=session.durable_session_id,
-                instance_id=self._http_bridge_runtime_settings().http_responses_session_bridge_instance_id,
-                    owner_epoch=session.durable_owner_epoch,
-                    draining=shutdown_state.is_bridge_drain_active(),
-                )
-            except Exception:
-                logger.warning("Failed to release durable HTTP bridge session", exc_info=True)
+        await self._release_durable_http_bridge_session_ownership(session)
         _log_http_bridge_event(
             "close",
             session.key,
@@ -280,7 +290,6 @@ class _HTTPBridgeLifecycleMixin:
             cache_key_family=session.key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
-
 
     async def _evict_http_bridge_session_after_upstream_disconnect(
         self: _HTTPBridgeLifecycleService,
@@ -302,7 +311,6 @@ class _HTTPBridgeLifecycleMixin:
         )
         await self._close_http_bridge_session(session, skip_reader_task=True)
 
-
     async def _register_http_bridge_turn_state(
         self: _HTTPBridgeLifecycleService,
         session: _HTTPBridgeSession,
@@ -323,7 +331,7 @@ class _HTTPBridgeLifecycleMixin:
                 await self._durable_bridge.register_turn_state(
                     session_id=session.durable_session_id,
                     api_key_id=session.key.api_key_id,
-                instance_id=self._http_bridge_runtime_settings().http_responses_session_bridge_instance_id,
+                    instance_id=self._http_bridge_runtime_settings().http_responses_session_bridge_instance_id,
                     owner_epoch=session.durable_owner_epoch,
                     turn_state=turn_state,
                     lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
@@ -331,7 +339,6 @@ class _HTTPBridgeLifecycleMixin:
                 self._defer_next_durable_http_bridge_session_refresh(session)
             except Exception:
                 logger.warning("Failed to persist durable HTTP bridge turn-state alias", exc_info=True)
-
 
     async def _register_http_bridge_previous_response_id(
         self: _HTTPBridgeLifecycleService,
@@ -355,7 +362,7 @@ class _HTTPBridgeLifecycleMixin:
                 await self._durable_bridge.register_previous_response_id(
                     session_id=session.durable_session_id,
                     api_key_id=session.key.api_key_id,
-                instance_id=self._http_bridge_runtime_settings().http_responses_session_bridge_instance_id,
+                    instance_id=self._http_bridge_runtime_settings().http_responses_session_bridge_instance_id,
                     owner_epoch=session.durable_owner_epoch,
                     response_id=stripped_response_id,
                     lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
@@ -366,7 +373,6 @@ class _HTTPBridgeLifecycleMixin:
             except Exception:
                 logger.warning("Failed to persist durable HTTP bridge previous_response_id alias", exc_info=True)
 
-
     async def _unregister_http_bridge_turn_states(
         self: _HTTPBridgeLifecycleService,
         session: _HTTPBridgeSession,
@@ -374,14 +380,12 @@ class _HTTPBridgeLifecycleMixin:
         async with self._http_bridge_lock:
             self._unregister_http_bridge_turn_states_locked(session)
 
-
     async def _unregister_http_bridge_previous_response_ids(
         self: _HTTPBridgeLifecycleService,
         session: _HTTPBridgeSession,
     ) -> None:
         async with self._http_bridge_lock:
             self._unregister_http_bridge_previous_response_ids_locked(session)
-
 
     def _unregister_http_bridge_turn_states_locked(
         self: _HTTPBridgeLifecycleService,
@@ -395,7 +399,6 @@ class _HTTPBridgeLifecycleMixin:
             )
         session.downstream_turn_state_aliases.clear()
 
-
     def _unregister_http_bridge_previous_response_ids_locked(
         self: _HTTPBridgeLifecycleService,
         session: _HTTPBridgeSession,
@@ -407,7 +410,6 @@ class _HTTPBridgeLifecycleMixin:
                 None,
             )
         session.previous_response_ids.clear()
-
 
     def _promote_http_bridge_session_to_codex_affinity(
         self: _HTTPBridgeLifecycleService,
@@ -425,7 +427,6 @@ class _HTTPBridgeLifecycleMixin:
             float(settings.http_responses_session_bridge_codex_idle_ttl_seconds),
         )
         session.headers = _headers_with_turn_state(session.headers, turn_state)
-
 
     async def _claim_durable_http_bridge_session(
         self: _HTTPBridgeLifecycleService,
@@ -502,7 +503,6 @@ class _HTTPBridgeLifecycleMixin:
                 return
             raise
 
-
     async def _refresh_durable_http_bridge_session(
         self: _HTTPBridgeLifecycleService,
         session: "_HTTPBridgeSession",
@@ -530,7 +530,6 @@ class _HTTPBridgeLifecycleMixin:
         except Exception:
             logger.warning("Failed to renew durable HTTP bridge session lease", exc_info=True)
 
-
     def _defer_next_durable_http_bridge_session_refresh(
         self: _HTTPBridgeLifecycleService,
         session: "_HTTPBridgeSession",
@@ -539,7 +538,6 @@ class _HTTPBridgeLifecycleMixin:
     ) -> None:
         current = time.monotonic() if now is None else now
         session.durable_renew_after = current + _http_bridge_durable_renew_interval_seconds()
-
 
     def _schedule_durable_http_bridge_session_refresh(
         self: _HTTPBridgeLifecycleService,
@@ -572,7 +570,6 @@ class _HTTPBridgeLifecycleMixin:
                 session.durable_renew_task = None
 
         task.add_done_callback(clear_completed_task)
-
 
     async def _settle_durable_http_bridge_session_refresh(
         self: _HTTPBridgeLifecycleService,

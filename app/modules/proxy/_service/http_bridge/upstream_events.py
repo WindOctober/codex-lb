@@ -259,7 +259,6 @@ class _HTTPBridgeUpstreamEventsMixin:
         finally:
             session.closed = True
 
-
     async def _process_http_bridge_upstream_text(
         self: _HTTPBridgeUpstreamEventsService,
         session: _HTTPBridgeSession,
@@ -448,18 +447,21 @@ class _HTTPBridgeUpstreamEventsMixin:
                 ) = _build_stream_incomplete_terminal_event_for_request(grouped_request_state)
                 if grouped_request_state.event_queue is not None:
                     await grouped_request_state.event_queue.put(grouped_event_block)
-                    await grouped_request_state.event_queue.put(None)
-                await self._finalize_websocket_request_state(
-                    grouped_request_state,
-                    account=session.account,
-                    account_id_value=session.account.id,
-                    event=grouped_event,
-                    event_type=grouped_event_type,
-                    payload=grouped_payload,
-                    api_key=grouped_request_state.api_key,
-                    upstream_control=session.upstream_control,
-                    response_create_gate=session.response_create_gate,
-                )
+                try:
+                    await self._finalize_websocket_request_state(
+                        grouped_request_state,
+                        account=session.account,
+                        account_id_value=session.account.id,
+                        event=grouped_event,
+                        event_type=grouped_event_type,
+                        payload=grouped_payload,
+                        api_key=grouped_request_state.api_key,
+                        upstream_control=session.upstream_control,
+                        response_create_gate=session.response_create_gate,
+                    )
+                finally:
+                    if grouped_request_state.event_queue is not None:
+                        await grouped_request_state.event_queue.put(None)
             return
 
         if len(grouped_previous_response_request_states) == 1 and terminal_request_state is None:
@@ -544,8 +546,6 @@ class _HTTPBridgeUpstreamEventsMixin:
             _log_http_bridge_latency_breakdown(session, terminal_request_state, event_type=event_type)
         if terminal_request_state is not matched_request_state and terminal_request_state.event_queue is not None:
             await terminal_request_state.event_queue.put(event_block)
-        if terminal_request_state.event_queue is not None:
-            await terminal_request_state.event_queue.put(None)
 
         if event_type in {"response.failed", "response.incomplete", "error"}:
             error_code = None
@@ -566,14 +566,18 @@ class _HTTPBridgeUpstreamEventsMixin:
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
             )
 
-        await self._finalize_websocket_request_state(
-            terminal_request_state,
-            account=session.account,
-            account_id_value=session.account.id,
-            event=event,
-            event_type=event_type,
-            payload=payload,
-            api_key=terminal_request_state.api_key,
-            upstream_control=session.upstream_control,
-            response_create_gate=session.response_create_gate,
-        )
+        try:
+            await self._finalize_websocket_request_state(
+                terminal_request_state,
+                account=session.account,
+                account_id_value=session.account.id,
+                event=event,
+                event_type=event_type,
+                payload=payload,
+                api_key=terminal_request_state.api_key,
+                upstream_control=session.upstream_control,
+                response_create_gate=session.response_create_gate,
+            )
+        finally:
+            if terminal_request_state.event_queue is not None:
+                await terminal_request_state.event_queue.put(None)
