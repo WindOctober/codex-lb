@@ -509,9 +509,7 @@ class LoadBalancer:
             return set()
 
         budget_safe_states = [
-            state
-            for state in selectable_states
-            if not _state_above_budget_threshold(state, budget_threshold_pct)
+            state for state in selectable_states if not _state_above_budget_threshold(state, budget_threshold_pct)
         ]
         return {state.account_id for state in budget_safe_states or selectable_states}
 
@@ -1508,9 +1506,7 @@ def _usage_recorded_epoch(entry: UsageHistory) -> float:
     if entry.recorded_at is None:
         return 0.0
     recorded_time = (
-        entry.recorded_at
-        if entry.recorded_at.tzinfo is not None
-        else entry.recorded_at.replace(tzinfo=timezone.utc)
+        entry.recorded_at if entry.recorded_at.tzinfo is not None else entry.recorded_at.replace(tzinfo=timezone.utc)
     )
     return recorded_time.timestamp()
 

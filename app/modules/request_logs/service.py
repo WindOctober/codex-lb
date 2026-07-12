@@ -81,8 +81,7 @@ class RequestLogsService:
                 log_error_code=log.error_code,
                 observed_state="completed_logged",
                 state_detail=(
-                    "Persisted request log exists, but no related live HTTP bridge session "
-                    "is currently tracked."
+                    "Persisted request log exists, but no related live HTTP bridge session is currently tracked."
                 ),
                 live=False,
                 account_id=log.account_id,

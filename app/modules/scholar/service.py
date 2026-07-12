@@ -190,7 +190,9 @@ class ScholarService:
 
         async def run_job(name: str, prompt: str) -> dict[str, Any]:
             async with semaphore:
-                return await self._run_codex_job(api_key=api_key, job_name=name, schema=PAPER_LIST_SCHEMA, prompt=prompt)
+                return await self._run_codex_job(
+                    api_key=api_key, job_name=name, schema=PAPER_LIST_SCHEMA, prompt=prompt
+                )
 
         tasks: list[tuple[dict[str, Any], asyncio.Task[dict[str, Any]], asyncio.Task[dict[str, Any]]]] = []
         for topic in topic_config:
@@ -432,7 +434,9 @@ class ScholarService:
             self._snapshot["status"] = "ready"
         else:
             self._snapshot["status"] = "ready" if self._snapshot.get("topics") else "error"
-            self._snapshot["last_error"] = self._snapshot.get("last_error") or "上一次 Scholar 刷新在进程重启或中断后未完成。"
+            self._snapshot["last_error"] = (
+                self._snapshot.get("last_error") or "上一次 Scholar 刷新在进程重启或中断后未完成。"
+            )
 
     def _ensure_bootstrap_content(self) -> None:
         if self._snapshot.get("topics"):
@@ -581,7 +585,9 @@ def build_scholar_service() -> ScholarService:
     else:
         project_root = Path.cwd().resolve()
     module_dir = Path(__file__).resolve().parent
-    cache_file = Path(os.getenv("CODEX_LB_SCHOLAR_CACHE_FILE", project_root / "var" / "scholar-cache.json")).expanduser()
+    cache_file = Path(
+        os.getenv("CODEX_LB_SCHOLAR_CACHE_FILE", project_root / "var" / "scholar-cache.json")
+    ).expanduser()
     topic_cache_file = Path(
         os.getenv("CODEX_LB_SCHOLAR_TOPIC_CACHE_FILE", module_dir / "ccf_topic_cache.json")
     ).expanduser()

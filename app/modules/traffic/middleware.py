@@ -132,8 +132,7 @@ class TrafficMetricsMiddleware:
             if message["type"] == "http.response.start":
                 status_code = int(message["status"])
                 response_headers = {
-                    key.decode("latin1").lower(): value.decode("latin1")
-                    for key, value in message.get("headers", [])
+                    key.decode("latin1").lower(): value.decode("latin1") for key, value in message.get("headers", [])
                 }
                 content_type = response_headers.get("content-type", "")
                 if "text/event-stream" in content_type.lower():

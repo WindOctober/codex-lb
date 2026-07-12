@@ -474,9 +474,7 @@ def _usage_history_recorded_epoch(entry: UsageHistory) -> float:
     if entry.recorded_at is None:
         return 0.0
     recorded_at = (
-        entry.recorded_at
-        if entry.recorded_at.tzinfo is not None
-        else entry.recorded_at.replace(tzinfo=timezone.utc)
+        entry.recorded_at if entry.recorded_at.tzinfo is not None else entry.recorded_at.replace(tzinfo=timezone.utc)
     )
     return recorded_at.timestamp()
 

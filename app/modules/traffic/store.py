@@ -307,8 +307,10 @@ class TrafficStore:
 
 
 def _is_error(record: TrafficRequestRecord) -> bool:
-    return record.state == "errored" or record.error_type is not None or (
-        record.status_code is not None and record.status_code >= 400
+    return (
+        record.state == "errored"
+        or record.error_type is not None
+        or (record.status_code is not None and record.status_code >= 400)
     )
 
 

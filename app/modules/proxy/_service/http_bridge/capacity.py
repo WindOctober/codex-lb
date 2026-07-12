@@ -225,14 +225,12 @@ class _HTTPBridgeCapacityMixin:
         async with session.pending_lock:
             return max(len(session.pending_requests), session.queued_request_count)
 
-
     async def _http_bridge_replacement_busy_count(
         self: _HTTPBridgeCapacityService,
         session: _HTTPBridgeSession,
     ) -> int:
         pending_count = await self._http_bridge_pending_count(session)
         return max(pending_count, session.submit_lease_count)
-
 
     def _acquire_http_bridge_submit_lease_locked(
         self: _HTTPBridgeCapacityService,
@@ -241,14 +239,12 @@ class _HTTPBridgeCapacityMixin:
         session.submit_lease_count += 1
         return session
 
-
     async def _release_http_bridge_submit_lease(
         self: _HTTPBridgeCapacityService,
         session: _HTTPBridgeSession,
     ) -> None:
         async with self._http_bridge_lock:
             session.submit_lease_count = max(0, session.submit_lease_count - 1)
-
 
     async def _restore_http_bridge_session_after_reconnect(
         self: _HTTPBridgeCapacityService,
@@ -307,7 +303,6 @@ class _HTTPBridgeCapacityMixin:
             await self._close_http_bridge_session(old_session)
         return None
 
-
     async def _evict_http_bridge_idle_session_for_account_model_capacity(
         self: _HTTPBridgeCapacityService,
         *,
@@ -352,7 +347,6 @@ class _HTTPBridgeCapacityMixin:
             )
         await self._close_http_bridge_session(removed)
         return True
-
 
     async def _resolve_http_bridge_pressure_capacity_hint(
         self: _HTTPBridgeCapacityService,
@@ -401,7 +395,6 @@ class _HTTPBridgeCapacityMixin:
             account_ids=frozenset(account_ids),
         )
 
-
     def _http_bridge_pressure_capacity_locked(
         self: _HTTPBridgeCapacityService,
         *,
@@ -427,7 +420,6 @@ class _HTTPBridgeCapacityMixin:
             return 0
         return len(account_ids) * per_account_limit
 
-
     def _http_bridge_pressure_current_count_locked(
         self: _HTTPBridgeCapacityService,
         *,
@@ -440,7 +432,6 @@ class _HTTPBridgeCapacityMixin:
                 if not session.closed and session.account.id in capacity_hint.account_ids
             )
         return len(self._http_bridge_sessions) + len(self._http_bridge_inflight_sessions)
-
 
     async def _evict_http_bridge_pressure(
         self: _HTTPBridgeCapacityService,
@@ -470,7 +461,6 @@ class _HTTPBridgeCapacityMixin:
         for stale_session in sessions_to_close:
             await self._close_http_bridge_session(stale_session)
         return sessions_to_close
-
 
     async def _evict_http_bridge_parallel_prompt_cache_pressure_locked(
         self: _HTTPBridgeCapacityService,
@@ -571,7 +561,6 @@ class _HTTPBridgeCapacityMixin:
             evicted_sessions.append(removed)
         return evicted_sessions
 
-
     async def _select_http_bridge_soft_shard_key_locked(
         self: _HTTPBridgeCapacityService,
         base_key: "_HTTPBridgeSessionKey",
@@ -614,7 +603,6 @@ class _HTTPBridgeCapacityMixin:
         if reusable_over_limit:
             return min(reusable_over_limit, key=lambda item: (item[0], item[1]))[2]
         return base_key
-
 
     def _select_http_bridge_busy_parallel_key_locked(
         self: _HTTPBridgeCapacityService,

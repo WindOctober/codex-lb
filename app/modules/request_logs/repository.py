@@ -623,9 +623,7 @@ def _build_latency_history(
     for bucket_start in starts:
         items = grouped.get(bucket_start, [])
         success_latencies = sorted(
-            int(latency_ms)
-            for latency_ms, status in items
-            if status == "success" and isinstance(latency_ms, int)
+            int(latency_ms) for latency_ms, status in items if status == "success" and isinstance(latency_ms, int)
         )
         success_count = sum(1 for _latency_ms, status in items if status == "success")
         error_count = len(items) - success_count

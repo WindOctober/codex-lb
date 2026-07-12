@@ -377,9 +377,7 @@ def _select_starred_account(available: list[AccountState]) -> AccountState | Non
     if not priority_pool:
         return None
     priority_full_primary_pool = [
-        state
-        for state in priority_pool
-        if state.used_percent is not None and state.used_percent >= 100.0
+        state for state in priority_pool if state.used_percent is not None and state.used_percent >= 100.0
     ]
     candidate_pool = _min_group_source_candidates(priority_full_primary_pool or priority_pool)
     return min(

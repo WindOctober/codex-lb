@@ -35,6 +35,7 @@ router = APIRouter(
     dependencies=[Depends(validate_dashboard_session), Depends(set_dashboard_error_format)],
 )
 
+
 def _account_response(account: MailAccount) -> MailAccountResponse:
     return MailAccountResponse(
         id=account.id,

@@ -515,9 +515,7 @@ class AccountsService:
         }
         if "subscription_renews_at" in payload.model_fields_set:
             update_kwargs["subscription_renews_at"] = (
-                to_utc_naive(payload.subscription_renews_at)
-                if payload.subscription_renews_at is not None
-                else None
+                to_utc_naive(payload.subscription_renews_at) if payload.subscription_renews_at is not None else None
             )
         updated = await self._repo.update_routing_settings(account_id, **update_kwargs)
         if updated is None:

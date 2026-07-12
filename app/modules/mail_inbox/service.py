@@ -227,6 +227,7 @@ class MailInboxService:
             limit=limit,
         )
 
+
 def _coerce_provider(value: str) -> MailAccountProvider:
     try:
         return MailAccountProvider(value)

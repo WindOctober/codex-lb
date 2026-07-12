@@ -192,9 +192,7 @@ class HTTPResponsesWebSocket:
     async def _enqueue_error_event(self, payload: OpenAIErrorEnvelope) -> None:
         if self._closed:
             return
-        await self._queue.put(
-            UpstreamWebSocketMessage(kind="text", text=_serialize_error_event_payload(payload))
-        )
+        await self._queue.put(UpstreamWebSocketMessage(kind="text", text=_serialize_error_event_payload(payload)))
 
     async def _enqueue_close(self) -> None:
         if self._close_enqueued:

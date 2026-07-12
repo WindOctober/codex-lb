@@ -36,8 +36,7 @@ class AccountModelConcurrencyLease:
         if self._limiter is not None:
             self._limiter._release(self.account_id, self.model_key)
             logger.warning(
-                "AccountModelConcurrencyLease was garbage-collected without release() "
-                "account_id=%s model=%s",
+                "AccountModelConcurrencyLease was garbage-collected without release() account_id=%s model=%s",
                 self.account_id,
                 self.model_key or "<unknown>",
             )

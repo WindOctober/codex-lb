@@ -15,9 +15,7 @@ PROCESS_POLL_INTERVAL_SECONDS: Final = 10
 ENDED_TREE_RETENTION_SECONDS: Final = 5 * 60
 DOCKER_LINEAGE_CACHE_SECONDS: Final = 5
 PROC_ROOT: Final = Path("/proc")
-DOCKER_CONTAINER_ID_PATTERN: Final = re.compile(
-    r"(?:docker[-/]|cri-containerd-)?([0-9a-f]{64})(?:\.scope)?"
-)
+DOCKER_CONTAINER_ID_PATTERN: Final = re.compile(r"(?:docker[-/]|cri-containerd-)?([0-9a-f]{64})(?:\.scope)?")
 DOCKER_LAUNCHER_PID_PATTERN: Final = re.compile(r"-(?P<pid>[1-9][0-9]*)-[^-]+$")
 
 STATE_LABELS: Final = {
@@ -88,11 +86,7 @@ class ProcessTreeService:
         docker_lineage_by_container_id = _docker_lineage_by_container_id(snapshots, collected_at)
         children_by_parent = _build_child_index(snapshots, docker_lineage_by_container_id)
         root_pids = _find_codex_root_pids(snapshots, docker_lineage_by_container_id)
-        trees = [
-            _build_node(pid, snapshots, children_by_parent)
-            for pid in root_pids
-            if pid in snapshots
-        ]
+        trees = [_build_node(pid, snapshots, children_by_parent) for pid in root_pids if pid in snapshots]
         trees = _merge_retained_trees(trees, collected_at)
         total_processes = sum(_count_nodes(tree) for tree in trees)
         return ProcessTreesResponse(
@@ -267,7 +261,7 @@ def _parse_stat(pid: int, stat_text: str) -> _StatFields:
     command_end = stat_text.rfind(")")
     if command_end < len(prefix):
         raise ValueError("unexpected stat command")
-    command_name = stat_text[len(prefix):command_end]
+    command_name = stat_text[len(prefix) : command_end]
     fields = stat_text[command_end + 2 :].split()
     if len(fields) <= 19:
         raise ValueError("stat payload is too short")
@@ -512,9 +506,7 @@ def _live_docker_run_pid(
     snapshots: dict[int, ProcessSnapshot],
 ) -> int | None:
     matching_pids = [
-        process.pid
-        for process in snapshots.values()
-        if _is_docker_run_for_container(process, lineage.name)
+        process.pid for process in snapshots.values() if _is_docker_run_for_container(process, lineage.name)
     ]
     return min(matching_pids) if matching_pids else None
 
@@ -561,9 +553,7 @@ def _is_ancestor_boundary(process: ProcessSnapshot, snapshots: dict[int, Process
     if not _is_shell_boundary_candidate(process):
         return False
     parent = snapshots.get(process.ppid)
-    return parent is not None and (
-        _is_sshd_boundary(parent) or _is_vscode_remote_boundary(parent)
-    )
+    return parent is not None and (_is_sshd_boundary(parent) or _is_vscode_remote_boundary(parent))
 
 
 def _is_sshd_boundary(process: ProcessSnapshot) -> bool:
@@ -578,9 +568,7 @@ def _is_vscode_remote_boundary(process: ProcessSnapshot) -> bool:
     if command_name.startswith("code-") and "command-shell" in joined:
         return True
     return ".vscode-server" in joined and (
-        "bootstrap-fork" in joined
-        or "command-shell" in joined
-        or "server-main.js" in joined
+        "bootstrap-fork" in joined or "command-shell" in joined or "server-main.js" in joined
     )
 
 

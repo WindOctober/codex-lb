@@ -974,18 +974,14 @@ def _worker_failure_summary(detail: str) -> str:
             "Reset forecast worker response was interrupted by a content filter. "
             "The previous successful cache remains in use."
         )
-    if (
-        "timed out handshaking with mcp server" in normalized
-        or "failed to initialize mcp client" in normalized
-    ):
+    if "timed out handshaking with mcp server" in normalized or "failed to initialize mcp client" in normalized:
         return (
             "Reset forecast worker failed while starting the X MCP client. "
             "The previous successful cache remains in use."
         )
     if "stream disconnected before completion" in normalized:
         return (
-            "Reset forecast worker stream disconnected before completion. "
-            "The previous successful cache remains in use."
+            "Reset forecast worker stream disconnected before completion. The previous successful cache remains in use."
         )
     return "Reset forecast worker failed while running Codex. Check backend logs for details."
 
