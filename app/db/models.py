@@ -48,6 +48,25 @@ class StickySessionKind(str, Enum):
     PROMPT_CACHE = "prompt_cache"
 
 
+class MailAccountProvider(str, Enum):
+    GMAIL = "gmail"
+    OUTLOOK = "outlook"
+    IMAP = "imap"
+
+
+class MailSyncStatus(str, Enum):
+    NEVER_SYNCED = "never_synced"
+    SYNCED = "synced"
+    ERROR = "error"
+    DISABLED = "disabled"
+
+
+class MailFocusRuleKind(str, Enum):
+    SENDER_EMAIL = "sender_email"
+    SENDER_DOMAIN = "sender_domain"
+    KEYWORD = "keyword"
+
+
 ACCOUNT_PROVIDER_OPENAI_OAUTH = "openai_oauth"
 ACCOUNT_PROVIDER_API_KEY = "api_key"
 
@@ -70,6 +89,19 @@ class Account(Base):
     upstream_priority: Mapped[int] = mapped_column(Integer, default=100, server_default=text("100"), nullable=False)
     supported_models_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     kyc_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    fast_service_tier_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        nullable=False,
+    )
+    primary_drain_priority_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        nullable=False,
+    )
+    subscription_renews_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     access_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     refresh_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
@@ -189,6 +221,115 @@ class NewsItem(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
+class MailAccount(Base):
+    __tablename__ = "mail_accounts"
+    __table_args__ = (UniqueConstraint("provider", "address", name="uq_mail_accounts_provider_address"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    provider: Mapped[MailAccountProvider] = mapped_column(
+        SqlEnum(
+            MailAccountProvider,
+            name="mail_account_provider",
+            native_enum=False,
+            validate_strings=True,
+            values_callable=_enum_values,
+        ),
+        nullable=False,
+    )
+    address: Mapped[str] = mapped_column(String, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true(), nullable=False)
+    sync_status: Mapped[MailSyncStatus] = mapped_column(
+        SqlEnum(
+            MailSyncStatus,
+            name="mail_sync_status",
+            native_enum=False,
+            validate_strings=True,
+            values_callable=_enum_values,
+        ),
+        default=MailSyncStatus.NEVER_SYNCED,
+        server_default=text("'never_synced'"),
+        nullable=False,
+    )
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    imap_host: Mapped[str | None] = mapped_column(String, nullable=True)
+    imap_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    imap_username: Mapped[str | None] = mapped_column(String, nullable=True)
+    credential_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    messages: Mapped[list["MailMessage"]] = relationship(
+        "MailMessage",
+        back_populates="account",
+        cascade="all, delete-orphan",
+    )
+
+
+class MailMessage(Base):
+    __tablename__ = "mail_messages"
+    __table_args__ = (
+        UniqueConstraint("account_id", "provider_message_id", name="uq_mail_messages_account_provider_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    account_id: Mapped[str] = mapped_column(String, ForeignKey("mail_accounts.id", ondelete="CASCADE"), nullable=False)
+    provider_message_id: Mapped[str] = mapped_column(String, nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    sender_email: Mapped[str] = mapped_column(String, nullable=False)
+    sender_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    recipients_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default=text("'[]'"))
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    snippet: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    received_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    unread: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    starred: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    has_attachments: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    focused: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    focus_label: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    account: Mapped[MailAccount] = relationship("MailAccount", back_populates="messages")
+
+
+class MailFocusRule(Base):
+    __tablename__ = "mail_focus_rules"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    kind: Mapped[MailFocusRuleKind] = mapped_column(
+        SqlEnum(
+            MailFocusRuleKind,
+            name="mail_focus_rule_kind",
+            native_enum=False,
+            validate_strings=True,
+            values_callable=_enum_values,
+        ),
+        nullable=False,
+    )
+    value: Mapped[str] = mapped_column(String, nullable=False)
+    label: Mapped[str | None] = mapped_column(String, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
@@ -251,8 +392,8 @@ class DashboardSettings(Base):
     )
     routing_strategy: Mapped[str] = mapped_column(
         String,
-        default="capacity_weighted",
-        server_default=text("'capacity_weighted'"),
+        default="high_waterline",
+        server_default=text("'high_waterline'"),
         nullable=False,
     )
     openai_cache_affinity_max_age_seconds: Mapped[int] = mapped_column(
@@ -611,6 +752,8 @@ class HttpBridgeSessionRecord(Base):
     service_tier: Mapped[str | None] = mapped_column(String, nullable=True)
     latest_turn_state: Mapped[str | None] = mapped_column(Text, nullable=True)
     latest_response_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latest_input_item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latest_input_full_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -752,6 +895,12 @@ Index(
 Index("idx_news_items_section_recorded_at", NewsItem.section, NewsItem.recorded_at.desc())
 Index("idx_news_items_section_generated_at", NewsItem.section, NewsItem.generated_at.desc())
 Index("idx_news_items_recorded_at", NewsItem.recorded_at.desc())
+Index("idx_mail_accounts_provider_address", MailAccount.provider, MailAccount.address)
+Index("idx_mail_messages_account_received", MailMessage.account_id, MailMessage.received_at.desc())
+Index("idx_mail_messages_received", MailMessage.received_at.desc())
+Index("idx_mail_messages_focused_received", MailMessage.focused, MailMessage.received_at.desc())
+Index("idx_mail_messages_unread_received", MailMessage.unread, MailMessage.received_at.desc())
+Index("idx_mail_focus_rules_kind_value", MailFocusRule.kind, MailFocusRule.value)
 Index("idx_sticky_account", StickySession.account_id)
 Index("idx_sticky_kind_updated_at", StickySession.kind, StickySession.updated_at.desc())
 Index("idx_api_keys_hash", ApiKey.key_hash)

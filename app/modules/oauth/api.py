@@ -33,7 +33,7 @@ async def start_oauth(
         return await context.service.start_oauth(request)
     except OAuthError as exc:
         return JSONResponse(
-            status_code=502,
+            status_code=exc.status_code or 502,
             content=dashboard_error(exc.code, exc.message),
         )
     except NotImplementedError:

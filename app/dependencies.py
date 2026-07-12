@@ -25,6 +25,8 @@ from app.modules.dashboard_auth.service import (
 )
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
+from app.modules.mail_inbox.repository import MailInboxRepository
+from app.modules.mail_inbox.service import MailInboxService
 from app.modules.oauth.service import OauthService
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.service import ProxyService
@@ -117,6 +119,13 @@ class StickySessionsContext:
     repository: StickySessionsRepository
     settings_repository: SettingsRepository
     service: StickySessionsService
+
+
+@dataclass(slots=True)
+class MailInboxContext:
+    session: AsyncSession
+    repository: MailInboxRepository
+    service: MailInboxService
 
 
 def get_accounts_context(
@@ -232,7 +241,7 @@ def get_settings_context(
     session: AsyncSession = Depends(get_session),
 ) -> SettingsContext:
     repository = SettingsRepository(session)
-    service = SettingsService(repository)
+    service = SettingsService(repository, AccountsRepository(session))
     return SettingsContext(session=session, repository=repository, service=service)
 
 
@@ -264,3 +273,11 @@ def get_sticky_sessions_context(
         settings_repository=settings_repository,
         service=service,
     )
+
+
+def get_mail_inbox_context(
+    session: AsyncSession = Depends(get_session),
+) -> MailInboxContext:
+    repository = MailInboxRepository(session)
+    service = MailInboxService(repository)
+    return MailInboxContext(session=session, repository=repository, service=service)

@@ -49,7 +49,7 @@ class RefreshAdmissionLeasePort(Protocol):
 logger = logging.getLogger(__name__)
 
 
-_RefreshSingleflightKey: TypeAlias = tuple[str, str]
+_RefreshSingleflightKey: TypeAlias = tuple[str, str, bool]
 
 
 class _RefreshSingleflight:
@@ -140,15 +140,33 @@ class AuthManager:
         self._encryptor = TokenEncryptor()
         self._acquire_refresh_admission = acquire_refresh_admission
 
-    async def ensure_fresh(self, account: Account, *, force: bool = False) -> Account:
+    async def ensure_fresh(
+        self,
+        account: Account,
+        *,
+        force: bool = False,
+        deactivate_on_permanent_error: bool = True,
+    ) -> Account:
         if force or should_refresh(account.last_refresh):
             account = await _REFRESH_SINGLEFLIGHT.run(
-                _refresh_singleflight_key(self._encryptor, account),
-                lambda: self.refresh_account(account),
+                _refresh_singleflight_key(
+                    self._encryptor,
+                    account,
+                    deactivate_on_permanent_error=deactivate_on_permanent_error,
+                ),
+                lambda: self.refresh_account(
+                    account,
+                    deactivate_on_permanent_error=deactivate_on_permanent_error,
+                ),
             )
         return await self._ensure_chatgpt_account_id(account)
 
-    async def refresh_account(self, account: Account) -> Account:
+    async def refresh_account(
+        self,
+        account: Account,
+        *,
+        deactivate_on_permanent_error: bool = True,
+    ) -> Account:
         refresh_token = self._encryptor.decrypt(account.refresh_token_encrypted)
         try:
             result = await self._refresh_tokens(refresh_token)
@@ -161,6 +179,8 @@ class AuthManager:
                     account.refresh_token_encrypted,
                 ):
                     return latest
+                if not deactivate_on_permanent_error:
+                    raise
                 reason = PERMANENT_FAILURE_CODES.get(exc.code, exc.message)
                 await self._repo.update_status(account.id, AccountStatus.DEACTIVATED, reason)
                 account.status = AccountStatus.DEACTIVATED
@@ -234,8 +254,17 @@ def _chatgpt_account_id_from_id_token(id_token: str) -> str | None:
     return auth_claims.chatgpt_account_id or claims.chatgpt_account_id
 
 
-def _refresh_singleflight_key(encryptor: TokenEncryptor, account: Account) -> _RefreshSingleflightKey:
-    return (account.id, _refresh_token_material_fingerprint(encryptor, account.refresh_token_encrypted))
+def _refresh_singleflight_key(
+    encryptor: TokenEncryptor,
+    account: Account,
+    *,
+    deactivate_on_permanent_error: bool,
+) -> _RefreshSingleflightKey:
+    return (
+        account.id,
+        _refresh_token_material_fingerprint(encryptor, account.refresh_token_encrypted),
+        deactivate_on_permanent_error,
+    )
 
 
 def _refresh_token_material_changed(

@@ -21,6 +21,7 @@ from app.core.bootstrap import ensure_auto_bootstrap_token, log_bootstrap_token
 from app.core.clients.http import close_http_client, init_http_client
 from app.core.config.settings import _bridge_advertise_hostname_is_replica_specific, get_settings
 from app.core.config.settings_cache import get_settings_cache
+from app.core.egress import close_upstream_egress_runtime, init_upstream_egress_runtime
 from app.core.handlers import add_exception_handlers
 from app.core.metrics.middleware import MetricsMiddleware
 from app.core.metrics.prometheus import MULTIPROCESS_MODE, PROMETHEUS_AVAILABLE, make_scrape_registry, mark_process_dead
@@ -41,13 +42,17 @@ from app.db.session import SessionLocal, close_db, init_background_db, init_db
 from app.modules.accounts import api as accounts_api
 from app.modules.api_keys import api as api_keys_api
 from app.modules.audit import api as audit_api
+from app.modules.codex_reset_forecast import api as codex_reset_forecast_api
+from app.modules.codex_reset_forecast.service import build_codex_reset_forecast_service
 from app.modules.dashboard import api as dashboard_api
 from app.modules.dashboard_auth import api as dashboard_auth_api
 from app.modules.firewall import api as firewall_api
 from app.modules.health import api as health_api
+from app.modules.mail_inbox import api as mail_inbox_api
 from app.modules.news import api as news_api
 from app.modules.news.service import build_news_service
 from app.modules.oauth import api as oauth_api
+from app.modules.processes import api as processes_api
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy.durable_bridge_repository import missing_durable_bridge_tables
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
@@ -128,6 +133,7 @@ async def lifespan(app: FastAPI):
     if _auto_bootstrap_token:
         log_bootstrap_token(logger, _auto_bootstrap_token)
     await init_http_client()
+    await init_upstream_egress_runtime()
     bridge_durable_schema_ready = await _ensure_bridge_durable_schema_ready(settings)
     if bridge_durable_schema_ready:
         startup_module.mark_bridge_durable_schema_ready()
@@ -149,13 +155,16 @@ async def lifespan(app: FastAPI):
     usage_scheduler = build_usage_refresh_scheduler()
     model_scheduler = build_model_refresh_scheduler()
     sticky_session_cleanup_scheduler = build_sticky_session_cleanup_scheduler()
+    codex_reset_forecast_service = build_codex_reset_forecast_service()
     news_service = build_news_service()
     scholar_service = build_scholar_service()
+    app.state.codex_reset_forecast_service = codex_reset_forecast_service
     app.state.news_service = news_service
     app.state.scholar_service = scholar_service
     await usage_scheduler.start()
     await model_scheduler.start()
     await sticky_session_cleanup_scheduler.start()
+    await codex_reset_forecast_service.start()
     await news_service.start()
     await scholar_service.start()
     if settings.metrics_enabled and PROMETHEUS_AVAILABLE:
@@ -314,23 +323,25 @@ async def lifespan(app: FastAPI):
         await cache_poller.stop()
         await scholar_service.stop()
         await news_service.stop()
+        await codex_reset_forecast_service.stop()
         await sticky_session_cleanup_scheduler.stop()
         await model_scheduler.stop()
         await usage_scheduler.stop()
         try:
-            await close_http_client()
+            await close_upstream_egress_runtime()
         finally:
-            try:
-                if metrics_server_task is not None:
-                    await asyncio.wait_for(metrics_server_task, timeout=5)
-            except TimeoutError:
-                logger.warning("Timed out waiting for metrics server shutdown")
-            except Exception:
-                logger.exception("Metrics server stopped with an error")
-            finally:
-                shutdown_state.reset()
-                mark_process_dead()
-                await close_db()
+            await close_http_client()
+        try:
+            if metrics_server_task is not None:
+                await asyncio.wait_for(metrics_server_task, timeout=5)
+        except TimeoutError:
+            logger.warning("Timed out waiting for metrics server shutdown")
+        except Exception:
+            logger.exception("Metrics server stopped with an error")
+        finally:
+            shutdown_state.reset()
+            mark_process_dead()
+            await close_db()
 
 
 def create_app() -> FastAPI:
@@ -397,8 +408,11 @@ def create_app() -> FastAPI:
     app.include_router(firewall_api.router)
     app.include_router(sticky_sessions_api.router)
     app.include_router(api_keys_api.router)
+    app.include_router(codex_reset_forecast_api.router)
     app.include_router(news_api.router)
     app.include_router(scholar_api.router)
+    app.include_router(mail_inbox_api.router)
+    app.include_router(processes_api.router)
     app.include_router(traffic_api.router)
     app.include_router(health_api.router)
 
@@ -407,6 +421,8 @@ def create_app() -> FastAPI:
     static_root = static_dir.resolve()
     frontend_build_hint = "Frontend assets are missing. Run `cd frontend && bun run build`."
     excluded_prefixes = ("api/", "v1/", "backend-api/", "health", "__traffic/")
+    immutable_asset_headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+    static_file_headers = {"Cache-Control": "no-cache"}
 
     def _is_static_asset_path(path: str) -> bool:
         if path.startswith("assets/"):
@@ -426,14 +442,19 @@ def create_app() -> FastAPI:
         if normalized:
             candidate = (static_dir / normalized).resolve()
             if candidate.is_relative_to(static_root) and candidate.is_file():
-                return FileResponse(candidate)
+                headers = immutable_asset_headers if normalized.startswith("assets/") else static_file_headers
+                return FileResponse(candidate, headers=headers)
             if _is_static_asset_path(normalized):
                 raise HTTPException(status_code=404, detail="Not Found")
 
         if not index_html.is_file():
             raise HTTPException(status_code=503, detail=frontend_build_hint)
 
-        return FileResponse(index_html, media_type="text/html")
+        return FileResponse(
+            index_html,
+            media_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
 
     return app
 

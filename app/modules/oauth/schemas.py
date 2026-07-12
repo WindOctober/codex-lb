@@ -5,6 +5,7 @@ from app.modules.shared.schemas import DashboardModel
 
 class OauthStartRequest(DashboardModel):
     force_method: str | None = None
+    target_account_id: str | None = None
 
 
 class OauthStartResponse(DashboardModel):

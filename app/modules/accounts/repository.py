@@ -8,6 +8,7 @@ from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.usage.pricing import (
     UsageTokens,
@@ -21,7 +22,11 @@ from app.db.models import (
     Account,
     AccountGroupMembership,
     AccountStatus,
+    AdditionalUsageHistory,
+    ApiKeyAccountAssignment,
+    Base,
     DashboardSettings,
+    HttpBridgeSessionRecord,
     RequestLog,
     StickySession,
     UsageHistory,
@@ -45,13 +50,32 @@ class AccountRequestUsageSummary:
     estimated_total_cost_currency: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AccountMergeResult:
+    source_account_id: str
+    target_account_id: str
+    usage_history_rows: int
+    additional_usage_history_rows: int
+    request_log_rows: int
+    sticky_session_rows: int
+    http_bridge_session_rows: int
+    api_key_assignment_rows: int
+    duplicate_api_key_assignment_rows: int
+    account_group_rows: int
+    duplicate_account_group_rows: int
+
+
 class AccountIdentityConflictError(Exception):
     def __init__(self, email: str) -> None:
         self.email = email
         super().__init__(
-            f"Cannot overwrite account for email '{email}' because multiple matching accounts exist. "
-            "Remove duplicates or enable import without overwrite."
+            f"Cannot automatically merge account for email '{email}' because matching accounts have "
+            "different identities. Merge them manually if they represent the same user."
         )
+
+
+class AccountReauthTargetError(Exception):
+    pass
 
 
 class AccountsRepository:
@@ -72,9 +96,7 @@ class AccountsRepository:
 
     async def list_openai_accounts(self) -> list[Account]:
         result = await self._session.execute(
-            select(Account)
-            .where(Account.provider_kind == ACCOUNT_PROVIDER_OPENAI_OAUTH)
-            .order_by(Account.email)
+            select(Account).where(Account.provider_kind == ACCOUNT_PROVIDER_OPENAI_OAUTH).order_by(Account.email)
         )
         return list(result.scalars().all())
 
@@ -263,6 +285,80 @@ class AccountsRepository:
         await self._session.refresh(account)
         return account
 
+    async def upsert_openai_reauth(self, account: Account) -> Account:
+        if account.provider_kind != ACCOUNT_PROVIDER_OPENAI_OAUTH:
+            raise ValueError("upsert_openai_reauth only supports OpenAI OAuth accounts")
+
+        dialect_name = self._dialect_name()
+        if dialect_name == "sqlite":
+            await self._acquire_sqlite_merge_lock()
+        elif dialect_name == "postgresql":
+            await self._acquire_postgresql_merge_lock(_normalize_email(account.email))
+
+        same_email = await self._openai_accounts_by_normalized_email(account.email)
+        same_identity = [
+            existing
+            for existing in same_email
+            if existing.chatgpt_account_id == account.chatgpt_account_id
+        ]
+        conflicting_identity = [
+            existing
+            for existing in same_email
+            if existing.chatgpt_account_id != account.chatgpt_account_id
+        ]
+        if conflicting_identity:
+            raise AccountIdentityConflictError(account.email)
+
+        if not same_identity:
+            existing_by_id = await self._session.get(Account, account.id)
+            if existing_by_id is not None:
+                raise AccountIdentityConflictError(account.email)
+            self._session.add(account)
+            await self._session.commit()
+            await self._session.refresh(account)
+            return account
+
+        target = _choose_openai_reauth_target(same_identity, incoming_account_id=account.id)
+        for source in same_identity:
+            if source.id == target.id:
+                continue
+            _merge_local_account_metadata(target, source)
+            await self._merge_account_data_unlocked(source.id, target.id)
+
+        _apply_openai_reauth_updates(target, account)
+        await self._session.commit()
+        await self._session.refresh(target)
+        return target
+
+    async def update_openai_reauth_target(self, target_account_id: str, account: Account) -> Account:
+        if account.provider_kind != ACCOUNT_PROVIDER_OPENAI_OAUTH:
+            raise ValueError("update_openai_reauth_target only supports OpenAI OAuth accounts")
+
+        dialect_name = self._dialect_name()
+        if dialect_name == "sqlite":
+            await self._acquire_sqlite_merge_lock()
+        elif dialect_name == "postgresql":
+            for account_id in sorted({target_account_id, account.id}):
+                await self._acquire_postgresql_identity_lock(account_id)
+
+        target = await self._session.get(Account, target_account_id)
+        if target is None:
+            raise AccountReauthTargetError(f"Account not found: {target_account_id}")
+        if target.provider_kind != ACCOUNT_PROVIDER_OPENAI_OAUTH:
+            raise AccountReauthTargetError("Only OpenAI OAuth accounts can be re-authenticated")
+
+        existing_identity = await self._openai_account_by_chatgpt_account_id(account.chatgpt_account_id)
+        if existing_identity is not None and existing_identity.id != target.id:
+            raise AccountReauthTargetError(
+                "Incoming OpenAI identity already belongs to another local account. "
+                "Merge accounts manually before re-authenticating this target."
+            )
+
+        _apply_openai_reauth_updates(target, account)
+        await self._session.commit()
+        await self._session.refresh(target)
+        return target
+
     async def update_status(
         self,
         account_id: str,
@@ -334,16 +430,22 @@ class AccountsRepository:
         *,
         configured_priority: int,
         kyc_enabled: bool | None = None,
+        fast_service_tier_enabled: bool | None = None,
+        primary_drain_priority_enabled: bool | None = None,
+        subscription_renews_at: datetime | None | object = _UNSET,
         groups: list[str] | None = None,
     ) -> Account | None:
         values: dict[str, object] = {"upstream_priority": configured_priority}
         if kyc_enabled is not None:
             values["kyc_enabled"] = kyc_enabled
+        if fast_service_tier_enabled is not None:
+            values["fast_service_tier_enabled"] = fast_service_tier_enabled
+        if primary_drain_priority_enabled is not None:
+            values["primary_drain_priority_enabled"] = primary_drain_priority_enabled
+        if subscription_renews_at is not _UNSET:
+            values["subscription_renews_at"] = subscription_renews_at
         result = await self._session.execute(
-            update(Account)
-            .where(Account.id == account_id)
-            .values(**values)
-            .returning(Account.id)
+            update(Account).where(Account.id == account_id).values(**values).returning(Account.id)
         )
         updated_id = result.scalar_one_or_none()
         if updated_id is not None and groups is not None:
@@ -359,6 +461,119 @@ class AccountsRepository:
 
     async def update_priority(self, account_id: str, configured_priority: int) -> Account | None:
         return await self.update_routing_settings(account_id, configured_priority=configured_priority)
+
+    async def update_all_fast_service_tier(self, *, enabled: bool) -> int:
+        result = await self._session.execute(
+            update(Account).values(fast_service_tier_enabled=enabled).returning(Account.id)
+        )
+        updated_ids = result.scalars().all()
+        await self._session.commit()
+        return len(updated_ids)
+
+    async def clear_primary_drain_priority(self) -> int:
+        result = await self._session.execute(
+            update(Account)
+            .where(Account.primary_drain_priority_enabled.is_(True))
+            .values(primary_drain_priority_enabled=False)
+            .returning(Account.id)
+        )
+        updated_ids = result.scalars().all()
+        await self._session.commit()
+        return len(updated_ids)
+
+    async def merge_account_data(self, source_account_id: str, target_account_id: str) -> AccountMergeResult | None:
+        if source_account_id == target_account_id:
+            return None
+
+        dialect_name = self._dialect_name()
+        if dialect_name == "sqlite":
+            await self._acquire_sqlite_merge_lock()
+        elif dialect_name == "postgresql":
+            for account_id in sorted((source_account_id, target_account_id)):
+                await self._acquire_postgresql_identity_lock(account_id)
+
+        result = await self._merge_account_data_unlocked(source_account_id, target_account_id)
+        if result is None:
+            await self._session.rollback()
+            return None
+        await self._session.commit()
+
+        return result
+
+    async def _merge_account_data_unlocked(
+        self,
+        source_account_id: str,
+        target_account_id: str,
+    ) -> AccountMergeResult | None:
+        source = await self._session.get(Account, source_account_id)
+        target = await self._session.get(Account, target_account_id)
+        if source is None or target is None:
+            return None
+        usage_history_rows = await self._count_usage_history_rows(source_account_id)
+        additional_usage_history_rows = await self._count_additional_usage_history_rows(source_account_id)
+        request_log_rows = await self._count_request_log_rows(source_account_id)
+        sticky_session_rows = await self._count_sticky_session_rows(source_account_id)
+        http_bridge_session_rows = await self._count_http_bridge_session_rows(source_account_id)
+        api_key_assignment_rows = await self._count_api_key_assignment_rows(source_account_id)
+        account_group_rows = await self._count_account_group_rows(source_account_id)
+
+        duplicate_api_key_assignment_rows = await self._delete_duplicate_api_key_assignments(
+            source_account_id,
+            target_account_id,
+        )
+        duplicate_account_group_rows = await self._delete_duplicate_account_groups(
+            source_account_id,
+            target_account_id,
+        )
+
+        await self._session.execute(
+            update(UsageHistory)
+            .where(UsageHistory.account_id == source_account_id)
+            .values(account_id=target_account_id)
+        )
+        await self._session.execute(
+            update(AdditionalUsageHistory)
+            .where(AdditionalUsageHistory.account_id == source_account_id)
+            .values(account_id=target_account_id)
+        )
+        await self._session.execute(
+            update(RequestLog).where(RequestLog.account_id == source_account_id).values(account_id=target_account_id)
+        )
+        await self._session.execute(
+            update(StickySession)
+            .where(StickySession.account_id == source_account_id)
+            .values(account_id=target_account_id)
+        )
+        await self._session.execute(
+            update(HttpBridgeSessionRecord)
+            .where(HttpBridgeSessionRecord.account_id == source_account_id)
+            .values(account_id=target_account_id)
+        )
+        await self._session.execute(
+            update(ApiKeyAccountAssignment)
+            .where(ApiKeyAccountAssignment.account_id == source_account_id)
+            .values(account_id=target_account_id)
+        )
+        await self._session.execute(
+            update(AccountGroupMembership)
+            .where(AccountGroupMembership.account_id == source_account_id)
+            .values(account_id=target_account_id)
+        )
+        await self._session.execute(delete(Account).where(Account.id == source_account_id))
+
+        return AccountMergeResult(
+            source_account_id=source_account_id,
+            target_account_id=target_account_id,
+            usage_history_rows=usage_history_rows,
+            additional_usage_history_rows=additional_usage_history_rows,
+            request_log_rows=request_log_rows,
+            sticky_session_rows=sticky_session_rows,
+            http_bridge_session_rows=http_bridge_session_rows,
+            api_key_assignment_rows=api_key_assignment_rows,
+            duplicate_api_key_assignment_rows=duplicate_api_key_assignment_rows,
+            account_group_rows=account_group_rows,
+            duplicate_account_group_rows=duplicate_account_group_rows,
+        )
 
     async def delete(self, account_id: str) -> bool:
         await self._session.execute(delete(UsageHistory).where(UsageHistory.account_id == account_id))
@@ -422,6 +637,28 @@ class AccountsRepository:
             raise AccountIdentityConflictError(email)
         return matches[0]
 
+    async def _openai_accounts_by_normalized_email(self, email: str) -> list[Account]:
+        result = await self._session.execute(
+            select(Account)
+            .options(selectinload(Account.group_memberships))
+            .where(Account.provider_kind == ACCOUNT_PROVIDER_OPENAI_OAUTH)
+            .where(func.lower(Account.email) == _normalize_email(email))
+            .order_by(Account.created_at.asc(), Account.id.asc())
+        )
+        return list(result.scalars().all())
+
+    async def _openai_account_by_chatgpt_account_id(self, chatgpt_account_id: str | None) -> Account | None:
+        if not chatgpt_account_id:
+            return None
+        result = await self._session.execute(
+            select(Account)
+            .where(Account.provider_kind == ACCOUNT_PROVIDER_OPENAI_OAUTH)
+            .where(Account.chatgpt_account_id == chatgpt_account_id)
+            .order_by(Account.created_at.asc(), Account.id.asc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     def _dialect_name(self) -> str:
         return self._session.get_bind().dialect.name
 
@@ -449,6 +686,53 @@ class AccountsRepository:
             text("SELECT pg_advisory_xact_lock(:lock_key)"),
             {"lock_key": lock_key},
         )
+
+    async def _count_usage_history_rows(self, account_id: str) -> int:
+        return await self._count_rows(UsageHistory.account_id == account_id, UsageHistory)
+
+    async def _count_additional_usage_history_rows(self, account_id: str) -> int:
+        return await self._count_rows(AdditionalUsageHistory.account_id == account_id, AdditionalUsageHistory)
+
+    async def _count_request_log_rows(self, account_id: str) -> int:
+        return await self._count_rows(RequestLog.account_id == account_id, RequestLog)
+
+    async def _count_sticky_session_rows(self, account_id: str) -> int:
+        return await self._count_rows(StickySession.account_id == account_id, StickySession)
+
+    async def _count_http_bridge_session_rows(self, account_id: str) -> int:
+        return await self._count_rows(HttpBridgeSessionRecord.account_id == account_id, HttpBridgeSessionRecord)
+
+    async def _count_api_key_assignment_rows(self, account_id: str) -> int:
+        return await self._count_rows(ApiKeyAccountAssignment.account_id == account_id, ApiKeyAccountAssignment)
+
+    async def _count_account_group_rows(self, account_id: str) -> int:
+        return await self._count_rows(AccountGroupMembership.account_id == account_id, AccountGroupMembership)
+
+    async def _delete_duplicate_api_key_assignments(self, source_account_id: str, target_account_id: str) -> int:
+        target_api_key_ids = select(ApiKeyAccountAssignment.api_key_id).where(
+            ApiKeyAccountAssignment.account_id == target_account_id
+        )
+        result = await self._session.execute(
+            delete(ApiKeyAccountAssignment)
+            .where(ApiKeyAccountAssignment.account_id == source_account_id)
+            .where(ApiKeyAccountAssignment.api_key_id.in_(target_api_key_ids))
+        )
+        return _rowcount(result.rowcount)
+
+    async def _delete_duplicate_account_groups(self, source_account_id: str, target_account_id: str) -> int:
+        target_group_names = select(AccountGroupMembership.group_name).where(
+            AccountGroupMembership.account_id == target_account_id
+        )
+        result = await self._session.execute(
+            delete(AccountGroupMembership)
+            .where(AccountGroupMembership.account_id == source_account_id)
+            .where(AccountGroupMembership.group_name.in_(target_group_names))
+        )
+        return _rowcount(result.rowcount)
+
+    async def _count_rows(self, criterion: ColumnElement[bool], model: type[Base]) -> int:
+        result = await self._session.execute(select(func.count()).select_from(model).where(criterion))
+        return int(result.scalar_one() or 0)
 
 
 def _calculate_display_cost(
@@ -506,6 +790,9 @@ def _apply_account_updates(target: Account, source: Account) -> None:
         source.supported_models_json if source.supported_models_json is not None else target.supported_models_json
     )
     target.kyc_enabled = bool(getattr(source, "kyc_enabled", False))
+    target.fast_service_tier_enabled = bool(getattr(source, "fast_service_tier_enabled", False))
+    if getattr(source, "subscription_renews_at", None) is not None:
+        target.subscription_renews_at = source.subscription_renews_at
     target.access_token_encrypted = source.access_token_encrypted
     target.refresh_token_encrypted = source.refresh_token_encrypted
     target.id_token_encrypted = source.id_token_encrypted
@@ -516,6 +803,61 @@ def _apply_account_updates(target: Account, source: Account) -> None:
     target.blocked_at = source.blocked_at
 
 
+def _apply_openai_reauth_updates(target: Account, source: Account) -> None:
+    target.chatgpt_account_id = source.chatgpt_account_id
+    target.email = source.email
+    target.plan_type = source.plan_type
+    target.provider_kind = ACCOUNT_PROVIDER_OPENAI_OAUTH
+    target.access_token_encrypted = source.access_token_encrypted
+    target.refresh_token_encrypted = source.refresh_token_encrypted
+    target.id_token_encrypted = source.id_token_encrypted
+    target.last_refresh = source.last_refresh
+    target.status = source.status
+    target.deactivation_reason = source.deactivation_reason
+    target.reset_at = source.reset_at
+    target.blocked_at = source.blocked_at
+
+
+def _choose_openai_reauth_target(accounts: list[Account], *, incoming_account_id: str) -> Account:
+    exact_matches = [account for account in accounts if account.id == incoming_account_id]
+    if exact_matches:
+        return exact_matches[0]
+
+    active_accounts = [account for account in accounts if account.status == AccountStatus.ACTIVE]
+    if active_accounts:
+        return active_accounts[0]
+
+    non_copy_accounts = [account for account in accounts if _DUPLICATE_ACCOUNT_SUFFIX not in account.id]
+    if non_copy_accounts:
+        return non_copy_accounts[0]
+
+    return accounts[0]
+
+
+def _merge_local_account_metadata(target: Account, source: Account) -> None:
+    target.kyc_enabled = bool(getattr(target, "kyc_enabled", False) or getattr(source, "kyc_enabled", False))
+    target.fast_service_tier_enabled = bool(
+        getattr(target, "fast_service_tier_enabled", False)
+        or getattr(source, "fast_service_tier_enabled", False)
+    )
+    if target.upstream_priority == 100 and source.upstream_priority != 100:
+        target.upstream_priority = source.upstream_priority
+    if target.supported_models_json is None and source.supported_models_json is not None:
+        target.supported_models_json = source.supported_models_json
+    if target.subscription_renews_at is None and source.subscription_renews_at is not None:
+        target.subscription_renews_at = source.subscription_renews_at
+
+
+def _normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
 def _advisory_lock_key(scope: str, value: str) -> int:
     digest = hashlib.sha256(f"{scope}:{value}".encode("utf-8")).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+def _rowcount(value: int | None) -> int:
+    if value is None or value < 0:
+        return 0
+    return int(value)

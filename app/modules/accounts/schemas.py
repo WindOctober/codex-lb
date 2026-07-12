@@ -18,6 +18,16 @@ class AccountUsageTrend(DashboardModel):
     secondary: list[UsageTrendPoint] = Field(default_factory=list)
 
 
+class AccountQuotaTimelineBucket(DashboardModel):
+    start_at: datetime
+    end_at: datetime
+    primary_used_percent: float
+    primary_used_credits: float | None = None
+    secondary_remaining_percent: float | None = None
+    secondary_reset: bool = False
+    secondary_reset_at: datetime | None = None
+
+
 class AccountUsage(DashboardModel):
     primary_remaining_percent: float | None = None
     secondary_remaining_percent: float | None = None
@@ -79,6 +89,9 @@ class AccountSummary(DashboardModel):
     routing_priority: int = 0
     configured_priority: int = 0
     kyc_enabled: bool = False
+    fast_service_tier_enabled: bool = False
+    primary_drain_priority_enabled: bool = False
+    subscription_renews_at: datetime | None = None
     groups: list[str] = Field(default_factory=list)
     status: str
     usage: AccountUsage | None = None
@@ -100,6 +113,51 @@ class AccountSummary(DashboardModel):
 
 class AccountsResponse(DashboardModel):
     accounts: List[AccountSummary] = Field(default_factory=list)
+
+
+class AccountQuotaWindow(DashboardModel):
+    remaining_percent: float | None = None
+    reset_at: datetime | None = None
+    window_minutes: int | None = None
+    capacity_credits: float | None = None
+    remaining_credits: float | None = None
+
+
+class AccountRuntimeState(DashboardModel):
+    occupied: bool = False
+    sessions: int = 0
+    pending_requests: int = 0
+    queued_requests: int = 0
+    busy_sessions: int = 0
+    codex_sessions: int = 0
+    reconnect_requested_sessions: int = 0
+
+
+class AccountQuotaStatus(DashboardModel):
+    account_id: str
+    email: str
+    display_name: str
+    status: str
+    primary_window: AccountQuotaWindow
+    secondary_window: AccountQuotaWindow
+    runtime: AccountRuntimeState
+
+
+class AccountQuotaListResponse(DashboardModel):
+    accounts: list[AccountQuotaStatus] = Field(default_factory=list)
+
+
+class AccountQuotaResponse(DashboardModel):
+    account: AccountQuotaStatus
+
+
+class AccountFastServiceTierBulkUpdateRequest(DashboardModel):
+    enabled: bool
+
+
+class AccountFastServiceTierBulkUpdateResponse(DashboardModel):
+    enabled: bool
+    updated_count: int
 
 
 class AccountImportResponse(DashboardModel):
@@ -126,6 +184,9 @@ class ApiProviderCreateResponse(AccountImportResponse):
 class AccountUpdateRequest(DashboardModel):
     configured_priority: int = Field(ge=0, le=100000)
     kyc_enabled: bool | None = None
+    fast_service_tier_enabled: bool | None = None
+    primary_drain_priority_enabled: bool | None = None
+    subscription_renews_at: datetime | None = None
     groups: list[str] | None = None
 
 
@@ -139,6 +200,42 @@ class AccountReactivateResponse(DashboardModel):
 
 class AccountDeleteResponse(DashboardModel):
     status: str
+
+
+class AccountRateLimitResetCreditsResponse(DashboardModel):
+    account_id: str
+    available_count: int
+
+
+class AccountRateLimitResetConsumeRequest(DashboardModel):
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class AccountRateLimitResetConsumeResponse(DashboardModel):
+    account_id: str
+    outcome: str
+    available_count: int | None = None
+    windows_reset: int = 0
+
+
+class AccountMergeRequest(DashboardModel):
+    source_account_id: str = Field(min_length=1)
+    target_account_id: str = Field(min_length=1)
+
+
+class AccountMergeResponse(DashboardModel):
+    status: str
+    source_account_id: str
+    target_account_id: str
+    usage_history_rows: int = 0
+    additional_usage_history_rows: int = 0
+    request_log_rows: int = 0
+    sticky_session_rows: int = 0
+    http_bridge_session_rows: int = 0
+    api_key_assignment_rows: int = 0
+    duplicate_api_key_assignment_rows: int = 0
+    account_group_rows: int = 0
+    duplicate_account_group_rows: int = 0
 
 
 class AccountAvailabilityResponse(DashboardModel):
@@ -157,3 +254,4 @@ class AccountTrendsResponse(DashboardModel):
     account_id: str
     primary: list[UsageTrendPoint] = Field(default_factory=list)
     secondary: list[UsageTrendPoint] = Field(default_factory=list)
+    quota_timeline: list[AccountQuotaTimelineBucket] = Field(default_factory=list)

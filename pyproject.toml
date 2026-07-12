@@ -113,6 +113,7 @@ python-version = "3.13"
 
 [project.scripts]
 codex-lb = "app.cli:main"
+codex-lb-accounts = "app.modules.accounts.merge_cli:main"
 codex-lb-db = "app.db.migrate:main"
 
 [build-system]

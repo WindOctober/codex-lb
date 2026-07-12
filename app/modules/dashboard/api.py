@@ -4,8 +4,12 @@ from fastapi import APIRouter, Depends, Query
 
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
 from app.core.openai.model_registry import get_model_registry, is_public_model
-from app.dependencies import DashboardContext, get_dashboard_context
-from app.modules.dashboard.schemas import DashboardOverviewResponse, DashboardOverviewTimeframeKey
+from app.dependencies import DashboardContext, ProxyContext, get_dashboard_context, get_proxy_context
+from app.modules.dashboard.schemas import (
+    DashboardBridgeRuntimeResponse,
+    DashboardOverviewResponse,
+    DashboardOverviewTimeframeKey,
+)
 
 router = APIRouter(
     prefix="/api",
@@ -20,6 +24,15 @@ async def get_overview(
     context: DashboardContext = Depends(get_dashboard_context),
 ) -> DashboardOverviewResponse:
     return await context.service.get_overview(timeframe)
+
+
+@router.get("/dashboard/bridge-runtime", response_model=DashboardBridgeRuntimeResponse)
+async def get_bridge_runtime(
+    limit: int = Query(100, ge=1, le=500),
+    context: ProxyContext = Depends(get_proxy_context),
+) -> DashboardBridgeRuntimeResponse:
+    snapshot = await context.service.get_http_bridge_runtime_snapshot(session_sample_limit=limit)
+    return DashboardBridgeRuntimeResponse.model_validate(snapshot, from_attributes=True)
 
 
 @router.get("/models")

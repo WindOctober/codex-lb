@@ -30,8 +30,12 @@ from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
-from app.modules.accounts.repository import AccountIdentityConflictError, AccountsRepository
+from app.db.models import ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, AccountStatus
+from app.modules.accounts.repository import (
+    AccountIdentityConflictError,
+    AccountReauthTargetError,
+    AccountsRepository,
+)
 from app.modules.oauth.schemas import (
     ManualCallbackResponse,
     OauthCompleteRequest,
@@ -40,6 +44,7 @@ from app.modules.oauth.schemas import (
     OauthStartResponse,
     OauthStatusResponse,
 )
+from app.modules.proxy.account_cache import get_account_selection_cache
 
 _async_sleep = asyncio.sleep
 _SUCCESS_TEMPLATE = Path(__file__).resolve().parent / "templates" / "oauth_success.html"
@@ -58,6 +63,7 @@ class OAuthState:
     expires_at: float | None = None
     callback_server: "OAuthCallbackServer | None" = None
     poll_task: asyncio.Task[None] | None = None
+    target_account_id: str | None = None
 
 
 class OAuthStateStore:
@@ -130,8 +136,11 @@ class OauthService:
         self._repo_factory = repo_factory
 
     async def start_oauth(self, request: OauthStartRequest) -> OauthStartResponse:
+        if request.target_account_id:
+            await self._validate_reauth_target(request.target_account_id)
+
         force_method = (request.force_method or "").lower()
-        if not force_method:
+        if not force_method and not request.target_account_id:
             accounts = await self._accounts_repo.list_accounts()
             if accounts:
                 async with self._store.lock:
@@ -140,12 +149,12 @@ class OauthService:
                 return OauthStartResponse(method="browser")
 
         if force_method == "device":
-            return await self._start_device_flow()
+            return await self._start_device_flow(target_account_id=request.target_account_id)
 
         try:
-            return await self._start_browser_flow()
+            return await self._start_browser_flow(target_account_id=request.target_account_id)
         except OSError:
-            return await self._start_device_flow()
+            return await self._start_device_flow(target_account_id=request.target_account_id)
 
     async def oauth_status(self) -> OauthStatusResponse:
         async with self._store.lock:
@@ -183,7 +192,7 @@ class OauthService:
             state.poll_task = asyncio.create_task(self._poll_device_tokens(poll_context))
             return OauthCompleteResponse(status="pending")
 
-    async def _start_browser_flow(self) -> OauthStartResponse:
+    async def _start_browser_flow(self, *, target_account_id: str | None = None) -> OauthStartResponse:
         await self._store.reset()
         code_verifier, code_challenge = generate_pkce_pair()
         state_token = secrets.token_urlsafe(16)
@@ -197,6 +206,7 @@ class OauthService:
             state.state_token = state_token
             state.code_verifier = code_verifier
             state.error_message = None
+            state.target_account_id = target_account_id
 
         callback_server = OAuthCallbackServer(
             self._handle_callback,
@@ -259,12 +269,16 @@ class OauthService:
             message = str(exc)
             await self._set_error(message)
             return ManualCallbackResponse(status="error", error_message=message)
+        except AccountReauthTargetError as exc:
+            message = str(exc)
+            await self._set_error(message)
+            return ManualCallbackResponse(status="error", error_message=message)
         except Exception as exc:
             message = f"Unexpected error: {exc}"
             await self._set_error(message)
             return ManualCallbackResponse(status="error", error_message=message)
 
-    async def _start_device_flow(self) -> OauthStartResponse:
+    async def _start_device_flow(self, *, target_account_id: str | None = None) -> OauthStartResponse:
         await self._store.reset()
         try:
             device = await request_device_code()
@@ -281,6 +295,7 @@ class OauthService:
             state.interval_seconds = device.interval_seconds
             state.expires_at = time.time() + device.expires_in_seconds
             state.error_message = None
+            state.target_account_id = target_account_id
 
         return OauthStartResponse(
             method="device",
@@ -320,6 +335,9 @@ class OauthService:
         except AccountIdentityConflictError as exc:
             await self._set_error(str(exc))
             html = _error_html(str(exc))
+        except AccountReauthTargetError as exc:
+            await self._set_error(str(exc))
+            html = _error_html(str(exc))
 
         asyncio.create_task(self._stop_callback_server())
         return self._html_response(html)
@@ -340,6 +358,8 @@ class OauthService:
         except OAuthError as exc:
             await self._set_error(exc.message)
         except AccountIdentityConflictError as exc:
+            await self._set_error(str(exc))
+        except AccountReauthTargetError as exc:
             await self._set_error(str(exc))
         finally:
             async with self._store.lock:
@@ -363,6 +383,7 @@ class OauthService:
             chatgpt_account_id=raw_account_id,
             email=email,
             plan_type=plan_type,
+            provider_kind=ACCOUNT_PROVIDER_OPENAI_OAUTH,
             access_token_encrypted=self._encryptor.encrypt(tokens.access_token),
             refresh_token_encrypted=self._encryptor.encrypt(tokens.refresh_token),
             id_token_encrypted=self._encryptor.encrypt(tokens.id_token),
@@ -370,11 +391,31 @@ class OauthService:
             status=AccountStatus.ACTIVE,
             deactivation_reason=None,
         )
+        async with self._store.lock:
+            target_account_id = self._store.state.target_account_id
         if self._repo_factory:
             async with self._repo_factory() as repo:
-                await repo.upsert(account)
+                if target_account_id:
+                    await repo.update_openai_reauth_target(target_account_id, account)
+                else:
+                    await repo.upsert_openai_reauth(account)
         else:
-            await self._accounts_repo.upsert(account)
+            if target_account_id:
+                await self._accounts_repo.update_openai_reauth_target(target_account_id, account)
+            else:
+                await self._accounts_repo.upsert_openai_reauth(account)
+        get_account_selection_cache().invalidate()
+
+    async def _validate_reauth_target(self, target_account_id: str) -> None:
+        account = await self._accounts_repo.get_by_id(target_account_id)
+        if account is None:
+            raise OAuthError("account_not_found", "Account not found", 404)
+        if account.provider_kind != ACCOUNT_PROVIDER_OPENAI_OAUTH:
+            raise OAuthError(
+                "invalid_reauth_target",
+                "Only OpenAI OAuth accounts can be re-authenticated",
+                400,
+            )
 
     async def _set_success(self) -> None:
         async with self._store.lock:
