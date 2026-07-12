@@ -7599,7 +7599,7 @@ async def test_retry_http_bridge_precreated_request_releases_pending_lock_before
 
 
 @pytest.mark.asyncio
-async def test_retry_http_bridge_precreated_request_ignores_existing_response_id_entries(app_instance, monkeypatch):
+async def test_retry_http_bridge_precreated_request_refuses_when_sibling_is_pending(app_instance, monkeypatch):
     service = get_proxy_service_for_app(app_instance)
     session = proxy_module._HTTPBridgeSession(
         key=proxy_module._HTTPBridgeSessionKey("prompt_cache", "retry-race-key", None),
@@ -7650,8 +7650,155 @@ async def test_retry_http_bridge_precreated_request_ignores_existing_response_id
 
     monkeypatch.setattr(proxy_module.ProxyService, "_reconnect_http_bridge_session", fake_reconnect)
 
+    assert await service._retry_http_bridge_precreated_request(session) is False
+    assert replacement_upstream.sent_text == []
+
+
+@pytest.mark.asyncio
+async def test_retry_http_bridge_precreated_request_replays_verified_full_resend(app_instance, monkeypatch):
+    service = get_proxy_service_for_app(app_instance)
+    original_full_resend = json.dumps(
+        {"type": "response.create", "model": "gpt-5.6-sol", "input": ["complete history"]},
+        separators=(",", ":"),
+    )
+    session = proxy_module._HTTPBridgeSession(
+        key=proxy_module._HTTPBridgeSessionKey("prompt_cache", "retry-full-resend", None),
+        headers={},
+        affinity=proxy_module._AffinityPolicy(
+            key="retry-full-resend",
+            kind=proxy_module.StickySessionKind.PROMPT_CACHE,
+            max_age_seconds=300,
+        ),
+        request_model="gpt-5.6-sol",
+        account=cast(Account, SimpleNamespace(id="acct-stalled", status=AccountStatus.ACTIVE)),
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, _SilentUpstreamWebSocket()),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=None,
+        queued_request_count=1,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+    )
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req-retry-full-resend",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        previous_response_id="resp-proxy-anchor",
+        proxy_injected_previous_response_id=True,
+        fresh_upstream_request_text=original_full_resend,
+        fresh_upstream_request_is_retry_safe=True,
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","previous_response_id":"resp-proxy-anchor","input":["delta"]}',
+    )
+    session.pending_requests.append(request_state)
+    replacement_upstream = _RecordingUpstreamWebSocket()
+
+    async def fake_reconnect(self, target_session, *, request_state, restart_reader=False, prefer_same_account=True):
+        del self, request_state, restart_reader
+        assert prefer_same_account is False
+        target_session.account = cast(Account, SimpleNamespace(id="acct-recovery", status=AccountStatus.ACTIVE))
+        target_session.upstream = replacement_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_reconnect_http_bridge_session", fake_reconnect)
+
     assert await service._retry_http_bridge_precreated_request(session) is True
-    assert replacement_upstream.sent_text == [retry_request.request_text]
+    assert replacement_upstream.sent_text == [original_full_resend]
+    assert request_state.previous_response_id is None
+    assert request_state.proxy_injected_previous_response_id is False
+    assert request_state.request_text == original_full_resend
+    assert request_state.replay_count == 1
+    assert request_state.http_bridge_send_completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_retry_http_bridge_precreated_request_refuses_changed_send_generation(app_instance, monkeypatch):
+    service = get_proxy_service_for_app(app_instance)
+    session = proxy_module._HTTPBridgeSession(
+        key=proxy_module._HTTPBridgeSessionKey("prompt_cache", "retry-generation-change", None),
+        headers={},
+        affinity=proxy_module._AffinityPolicy(key="retry-generation-change"),
+        request_model="gpt-5.6-sol",
+        account=cast(Account, SimpleNamespace(id="acct-generation-old", status=AccountStatus.ACTIVE)),
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, _SilentUpstreamWebSocket()),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=None,
+        queued_request_count=1,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+    )
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req-generation-change",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","input":[]}',
+        http_bridge_send_completed_at=10.0,
+    )
+    session.pending_requests.append(request_state)
+    replacement_upstream = _RecordingUpstreamWebSocket()
+
+    async def fake_reconnect(self, target_session, *, request_state, restart_reader=False, prefer_same_account=True):
+        del self, restart_reader, prefer_same_account
+        target_session.upstream = replacement_upstream
+        request_state.http_bridge_send_completed_at = 11.0
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_reconnect_http_bridge_session", fake_reconnect)
+
+    assert (
+        await service._retry_http_bridge_precreated_request(
+            session,
+            expected_request_tokens=frozenset({("req-generation-change", 10.0)}),
+        )
+        is False
+    )
+    assert replacement_upstream.sent_text == []
+
+
+@pytest.mark.asyncio
+async def test_retry_http_bridge_precreated_request_refuses_client_continuation(app_instance, monkeypatch):
+    service = get_proxy_service_for_app(app_instance)
+    session = proxy_module._HTTPBridgeSession(
+        key=proxy_module._HTTPBridgeSessionKey("prompt_cache", "retry-client-anchor", None),
+        headers={},
+        affinity=proxy_module._AffinityPolicy(key="retry-client-anchor"),
+        request_model="gpt-5.6-sol",
+        account=cast(Account, SimpleNamespace(id="acct-client-anchor", status=AccountStatus.ACTIVE)),
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, _SilentUpstreamWebSocket()),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=None,
+        queued_request_count=1,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+    )
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req-client-anchor",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        previous_response_id="resp-client-anchor",
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","previous_response_id":"resp-client-anchor"}',
+    )
+    session.pending_requests.append(request_state)
+    reconnect = AsyncMock()
+    monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect)
+
+    assert await service._retry_http_bridge_precreated_request(session) is False
+    reconnect.assert_not_awaited()
+    assert request_state.replay_count == 0
 
 
 @pytest.mark.asyncio

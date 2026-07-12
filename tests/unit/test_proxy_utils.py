@@ -857,6 +857,7 @@ def _make_proxy_settings(*, log_proxy_service_tier_trace: bool) -> SimpleNamespa
         proxy_request_budget_seconds=75.0,
         proxy_reconnect_request_budget_seconds=75.0,
         stream_idle_timeout_seconds=75.0,
+        http_responses_session_bridge_response_created_timeout_seconds=120.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,
         upstream_compact_timeout_seconds=None,
@@ -5356,6 +5357,69 @@ def test_websocket_receive_timeout_prefers_request_budget_when_sooner(monkeypatc
     assert timeout.timeout_seconds == 1.0
     assert timeout.error_code == "upstream_request_timeout"
     assert timeout.error_message == "Proxy request budget exhausted"
+
+
+@pytest.mark.asyncio
+async def test_next_websocket_receive_timeout_bounds_precreated_wait_despite_metadata(monkeypatch):
+    monkeypatch.setattr(proxy_service.time, "monotonic", lambda: 100.0)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-precreated-stall",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        awaiting_response_created=True,
+        http_bridge_send_completed_at=90.0,
+        http_bridge_upstream_first_event_at=91.0,
+        http_bridge_upstream_first_event_type="codex.rate_limits",
+    )
+
+    timeout = await service._next_websocket_receive_timeout(
+        deque([request_state]),
+        pending_lock=anyio.Lock(),
+        proxy_request_budget_seconds=7200.0,
+        stream_idle_timeout_seconds=7200.0,
+        response_created_timeout_seconds=12.0,
+    )
+
+    assert timeout is not None
+    assert timeout.timeout_seconds == pytest.approx(2.0)
+    assert timeout.error_code == "response_created_timeout"
+    assert timeout.response_created_request_ids == frozenset({"req-precreated-stall"})
+    assert timeout.response_created_request_tokens == frozenset({("req-precreated-stall", 90.0)})
+
+
+@pytest.mark.asyncio
+async def test_next_websocket_receive_timeout_ignores_startup_deadline_after_response_created(monkeypatch):
+    monkeypatch.setattr(proxy_service.time, "monotonic", lambda: 100.0)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-created-long-running",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=90.0,
+        response_id="resp-created-long-running",
+        awaiting_response_created=False,
+        http_bridge_send_completed_at=90.0,
+    )
+
+    timeout = await service._next_websocket_receive_timeout(
+        deque([request_state]),
+        pending_lock=anyio.Lock(),
+        proxy_request_budget_seconds=480.0,
+        stream_idle_timeout_seconds=300.0,
+        response_created_timeout_seconds=12.0,
+    )
+
+    assert timeout is not None
+    assert timeout.timeout_seconds == pytest.approx(300.0)
+    assert timeout.error_code == "stream_idle_timeout"
+    assert timeout.response_created_request_ids == frozenset()
+    assert timeout.response_created_request_tokens == frozenset()
 
 
 def test_http_bridge_session_reuse_checks_request_model_support(monkeypatch):
