@@ -7,6 +7,7 @@ from typing import cast
 
 from fastapi import Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import HTTPConnection
 
 from app.core.auth.api_key_cache import get_api_key_cache
@@ -95,6 +96,13 @@ async def _validate_api_key_token(token: str) -> ApiKeyData:
             return validated
         except ApiKeyInvalidError as exc:
             raise ProxyAuthError(str(exc)) from exc
+        except SQLAlchemyError as exc:
+            stale = cast(ApiKeyData | None, await cache.get_stale(token_hash))
+            if stale is not None and (stale.expires_at is None or stale.expires_at > utcnow()):
+                logger.warning("API key validation DB lookup failed; using stale cached key", exc_info=True)
+                return stale
+            logger.warning("API key validation DB lookup failed without usable stale cache", exc_info=True)
+            raise ProxyUpstreamError("API key validation is temporarily unavailable") from exc
 
 
 # --- Self-service usage endpoint auth (always requires valid key) ---

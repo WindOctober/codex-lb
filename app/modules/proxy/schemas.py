@@ -138,10 +138,6 @@ class CodexModelEntry(BaseModel):
     visibility: str = "list"
 
 
-class CodexModelsResponse(BaseModel):
-    models: list[CodexModelEntry]
-
-
 class ModelMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -169,6 +165,12 @@ class ModelListItem(BaseModel):
     created: int
     owned_by: str
     metadata: ModelMetadata | None = None
+
+
+class CodexModelsResponse(BaseModel):
+    models: list[CodexModelEntry]
+    object: str = "list"
+    data: list[ModelListItem] = []
 
 
 class ModelListResponse(BaseModel):

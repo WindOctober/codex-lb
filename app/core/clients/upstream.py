@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from app.core.clients.http import get_http_client
+from app.core.egress import select_upstream_egress
 
 _PROBE_TIMEOUT_SECONDS = 8.0
 
@@ -80,7 +81,13 @@ async def _fetch_models(base_url: str, api_key: str, wire_api: str) -> list[str]
     timeout = aiohttp.ClientTimeout(total=_PROBE_TIMEOUT_SECONDS)
     headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
     models_url = build_models_url(base_url, wire_api)
-    async with get_http_client().session.get(models_url, headers=headers, timeout=timeout) as resp:
+    egress = select_upstream_egress()
+    async with get_http_client().session.get(
+        models_url,
+        headers=headers,
+        timeout=timeout,
+        proxy=egress.proxy_url,
+    ) as resp:
         if resp.status >= 400:
             raise UpstreamProbeError(f"Provider models endpoint returned HTTP {resp.status}")
         try:

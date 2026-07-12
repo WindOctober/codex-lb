@@ -48,7 +48,194 @@ class ModelRegistrySnapshot:
     fetched_at: float
 
 
-_BOOTSTRAP_WEBSOCKET_PREFERRED_MODEL_PATTERNS = ("gpt-5.4", "gpt-5.4-*")
+_BOOTSTRAP_WEBSOCKET_PREFERRED_MODEL_PATTERNS = (
+    "gpt-5.6-*",
+    "gpt-5.5",
+    "gpt-5.5-*",
+    "gpt-5.4",
+    "gpt-5.4-*",
+)
+
+_REASONING_LEVELS_EXTENDED = (
+    ReasoningLevel(effort="low", description="Low reasoning effort"),
+    ReasoningLevel(effort="medium", description="Medium reasoning effort"),
+    ReasoningLevel(effort="high", description="High reasoning effort"),
+    ReasoningLevel(effort="xhigh", description="Extra high reasoning effort"),
+)
+
+_REASONING_LEVELS_MAX = (
+    *_REASONING_LEVELS_EXTENDED,
+    ReasoningLevel(effort="max", description="Maximum reasoning effort"),
+)
+
+_REASONING_LEVELS_ULTRA = (
+    *_REASONING_LEVELS_MAX,
+    ReasoningLevel(effort="ultra", description="Maximum reasoning with automatic task delegation"),
+)
+
+_BOOTSTRAP_AVAILABLE_IN_PLANS = frozenset(
+    {
+        "plus",
+        "pro",
+        "prolite",
+        "team",
+        "business",
+        "enterprise",
+        "edu",
+        "education",
+        "k12",
+        "go",
+        "hc",
+        "finserv",
+        "free",
+        "free_workspace",
+        "quorum",
+        "self_serve_business_usage_based",
+        "enterprise_cbp_usage_based",
+    }
+)
+
+_BOOTSTRAP_CORE_AVAILABLE_IN_PLANS = frozenset(
+    plan for plan in _BOOTSTRAP_AVAILABLE_IN_PLANS if plan not in {"free", "free_workspace", "k12"}
+)
+
+
+def _bootstrap_model(
+    slug: str,
+    display_name: str,
+    *,
+    priority: int,
+    context_window: int,
+    max_context_window: int | None = None,
+    reasoning_levels: tuple[ReasoningLevel, ...] = _REASONING_LEVELS_EXTENDED,
+    default_reasoning_level: str | None = "medium",
+    default_verbosity: str | None = "low",
+    prefer_websockets: bool = True,
+    minimal_client_version: str | None = None,
+    input_modalities: tuple[str, ...] = ("text", "image"),
+    supported_in_api: bool = True,
+    available_in_plans: frozenset[str] = _BOOTSTRAP_AVAILABLE_IN_PLANS,
+    visibility: str = "list",
+    shell_type: str = "shell_command",
+    raw: dict[str, JsonValue] | None = None,
+) -> UpstreamModel:
+    raw_fields: dict[str, JsonValue] = {
+        "shell_type": shell_type,
+        "visibility": visibility,
+        "availability_nux": None,
+        "max_context_window": max_context_window if max_context_window is not None else context_window,
+    }
+    if raw:
+        raw_fields.update(raw)
+    return UpstreamModel(
+        slug=slug,
+        display_name=display_name,
+        description=display_name,
+        context_window=context_window,
+        input_modalities=input_modalities,
+        supported_reasoning_levels=reasoning_levels,
+        default_reasoning_level=default_reasoning_level,
+        supports_reasoning_summaries=True,
+        support_verbosity=True,
+        default_verbosity=default_verbosity,
+        prefer_websockets=prefer_websockets,
+        supports_parallel_tool_calls=True,
+        supported_in_api=supported_in_api,
+        minimal_client_version=minimal_client_version,
+        priority=priority,
+        available_in_plans=available_in_plans,
+        raw=raw_fields,
+    )
+
+
+_BOOTSTRAP_STATIC_MODELS: tuple[UpstreamModel, ...] = (
+    _bootstrap_model(
+        "gpt-5.6-sol",
+        "GPT-5.6-Sol",
+        priority=1,
+        context_window=372_000,
+        reasoning_levels=_REASONING_LEVELS_ULTRA,
+        default_reasoning_level="low",
+        raw={
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}],
+        },
+    ),
+    _bootstrap_model(
+        "gpt-5.6-terra",
+        "GPT-5.6-Terra",
+        priority=2,
+        context_window=372_000,
+        reasoning_levels=_REASONING_LEVELS_ULTRA,
+        raw={
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}],
+        },
+    ),
+    _bootstrap_model(
+        "gpt-5.6-luna",
+        "GPT-5.6-Luna",
+        priority=3,
+        context_window=372_000,
+        reasoning_levels=_REASONING_LEVELS_MAX,
+        raw={
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}],
+        },
+    ),
+    _bootstrap_model(
+        "gpt-5.5",
+        "GPT-5.5",
+        priority=7,
+        context_window=272_000,
+        minimal_client_version="0.124.0",
+        raw={
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}],
+        },
+    ),
+    _bootstrap_model(
+        "gpt-5.4",
+        "GPT-5.4",
+        priority=16,
+        context_window=272_000,
+        max_context_window=1_000_000,
+        minimal_client_version="0.98.0",
+        available_in_plans=_BOOTSTRAP_CORE_AVAILABLE_IN_PLANS,
+        raw={
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}],
+        },
+    ),
+    _bootstrap_model(
+        "gpt-5.4-mini",
+        "GPT-5.4-Mini",
+        priority=23,
+        context_window=272_000,
+        default_verbosity="medium",
+        minimal_client_version="0.98.0",
+        raw={"service_tiers": []},
+    ),
+    _bootstrap_model(
+        "gpt-5.2",
+        "GPT-5.2",
+        priority=29,
+        context_window=272_000,
+        minimal_client_version="0.0.1",
+        raw={"service_tiers": []},
+    ),
+    _bootstrap_model(
+        "codex-auto-review",
+        "Codex Auto Review",
+        priority=43,
+        context_window=272_000,
+        max_context_window=1_000_000,
+        minimal_client_version="0.98.0",
+        available_in_plans=_BOOTSTRAP_CORE_AVAILABLE_IN_PLANS,
+        visibility="hide",
+        raw={"service_tiers": []},
+    ),
+)
 
 
 class ModelRegistry:
@@ -57,7 +244,7 @@ class ModelRegistry:
             raise ValueError("ttl_seconds must be positive")
         self._ttl_seconds = ttl_seconds
         self._snapshot: ModelRegistrySnapshot | None = None
-        self._bootstrap_models: dict[str, UpstreamModel] = {}
+        self._bootstrap_models: dict[str, UpstreamModel] = {model.slug: model for model in _BOOTSTRAP_STATIC_MODELS}
         self._lock = anyio.Lock()
 
     def get_snapshot(self) -> ModelRegistrySnapshot | None:
@@ -70,9 +257,11 @@ class ModelRegistry:
         return self._bootstrap_models
 
     def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+        normalized_slug = slug.strip().lower()
         if self._snapshot is None:
-            return None
-        return self._snapshot.model_plans.get(slug, frozenset())
+            model = self._bootstrap_models.get(slug) or self._bootstrap_models.get(normalized_slug)
+            return model.available_in_plans if model is not None else None
+        return self._snapshot.model_plans.get(slug) or self._snapshot.model_plans.get(normalized_slug, frozenset())
 
     def prefers_websockets(self, slug: str | None) -> bool:
         if not isinstance(slug, str):
@@ -85,6 +274,11 @@ class ModelRegistry:
             model = self._snapshot.models.get(slug) or self._snapshot.models.get(normalized_slug)
             if model is not None:
                 return model.prefer_websockets
+            return False
+
+        bootstrap_model = self._bootstrap_models.get(slug) or self._bootstrap_models.get(normalized_slug)
+        if bootstrap_model is not None:
+            return bootstrap_model.prefer_websockets
 
         return any(fnmatchcase(normalized_slug, pattern) for pattern in _BOOTSTRAP_WEBSOCKET_PREFERRED_MODEL_PATTERNS)
 
@@ -157,6 +351,8 @@ def get_model_registry() -> ModelRegistry:
 
 
 def is_public_model(model: UpstreamModel, allowed_models: set[str] | None) -> bool:
+    if not model.supported_in_api:
+        return False
     if allowed_models is None:
         return True
     return model.slug in allowed_models

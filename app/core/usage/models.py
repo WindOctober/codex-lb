@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UsageWindow(BaseModel):
@@ -27,6 +29,31 @@ class CreditsPayload(BaseModel):
     balance: str | None = None
 
 
+class RateLimitResetCreditsPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    available_count: int
+
+
+class RateLimitResetCreditPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    status: str
+    reset_type: str | None = None
+
+
+class RateLimitResetCreditBankPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    credits: list[RateLimitResetCreditPayload] = Field(default_factory=list)
+    available_count: int = 0
+
+    @property
+    def available_credits(self) -> list[RateLimitResetCreditPayload]:
+        return [credit for credit in self.credits if credit.status == "available"]
+
+
 class AdditionalRateLimitPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -41,4 +68,15 @@ class UsagePayload(BaseModel):
     plan_type: str | None = None
     rate_limit: RateLimitPayload | None = None
     credits: CreditsPayload | None = None
+    rate_limit_reset_credits: RateLimitResetCreditsPayload | None = None
     additional_rate_limits: list[AdditionalRateLimitPayload] | None = None
+
+
+RateLimitResetConsumeCode = Literal["reset", "nothing_to_reset", "no_credit", "already_redeemed"]
+
+
+class RateLimitResetConsumePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    code: RateLimitResetConsumeCode
+    windows_reset: int = 0

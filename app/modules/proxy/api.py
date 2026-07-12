@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
-from typing import cast
+from typing import Awaitable, Callable, cast
 
 from fastapi import APIRouter, Body, Depends, File, Form, Request, Response, Security, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -32,6 +32,7 @@ from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, reso
 from app.core.openai.chat_requests import ChatCompletionsRequest
 from app.core.openai.chat_responses import ChatCompletionResult, collect_chat_completion, stream_chat_chunks
 from app.core.openai.exceptions import ClientPayloadError
+from app.core.openai.images import V1ImageResponse, V1ImagesEditsForm, V1ImagesGenerationsRequest
 from app.core.openai.model_registry import UpstreamModel, get_model_registry, is_public_model
 from app.core.openai.models import (
     CompactResponseResult,
@@ -67,6 +68,7 @@ from app.modules.api_keys.service import (
 )
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
+from app.modules.proxy import images_service as images_service_module
 from app.modules.proxy import service as proxy_service_module
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
@@ -113,6 +115,7 @@ _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
     }
 )
 _PUBLIC_RESPONSE_TEXT_PART_TYPES = frozenset({"output_text", "input_text", "text", "refusal"})
+_REMOTE_COMPACTION_V2_OUTPUT_ITEM_TYPES = frozenset({"context_compaction"})
 
 router = APIRouter(
     prefix="/backend-api/codex",
@@ -182,6 +185,7 @@ async def responses(
         codex_session_affinity=True,
         openai_cache_affinity=True,
         prefer_http_bridge=True,
+        enforce_openai_sdk_contract=False,
     )
 
 
@@ -302,6 +306,7 @@ async def internal_bridge_responses(
         forwarded_downstream_turn_state=forwarded_request_context.context.downstream_turn_state,
         forwarded_affinity_kind=forwarded_request_context.context.original_affinity_kind,
         forwarded_affinity_key=forwarded_request_context.context.original_affinity_key,
+        enforce_openai_sdk_contract=False,
     )
 
 
@@ -628,6 +633,393 @@ async def v1_audio_transcriptions(
     )
 
 
+@v1_router.post("/images/generations", response_model=None)
+async def v1_images_generations(
+    request: Request,
+    payload: V1ImagesGenerationsRequest = Body(...),
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    return await _proxy_images_generation_request(
+        request=request,
+        payload=payload,
+        context=context,
+        api_key=api_key,
+    )
+
+
+@v1_router.post("/images/edits", response_model=None)
+async def v1_images_edits(
+    request: Request,
+    model: str | None = Form(None),
+    prompt: str = Form(...),
+    image: list[UploadFile] | None = File(None),
+    image_brackets: list[UploadFile] | None = File(None, alias="image[]"),
+    mask: UploadFile | None = File(None),
+    n: str | None = Form(None),
+    size: str | None = Form(None),
+    quality: str | None = Form(None),
+    background: str | None = Form(None),
+    output_format: str | None = Form(None),
+    output_compression: str | None = Form(None),
+    moderation: str | None = Form(None),
+    partial_images: str | None = Form(None),
+    stream: str | None = Form(None),
+    input_fidelity: str | None = Form(None),
+    user: str | None = Form(None),
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    raw_form: dict[str, object] = {
+        "model": model,
+        "prompt": prompt,
+        "size": size if size is not None else "auto",
+        "quality": quality if quality is not None else "auto",
+        "background": background if background is not None else "auto",
+        "output_format": output_format if output_format is not None else "png",
+        "moderation": moderation if moderation is not None else "auto",
+        "input_fidelity": input_fidelity,
+        "user": user,
+        "n": n if n is not None else 1,
+        "output_compression": output_compression if output_compression is not None else 100,
+        "stream": stream if stream is not None else False,
+    }
+    if partial_images is not None:
+        raw_form["partial_images"] = partial_images
+    try:
+        form_payload = V1ImagesEditsForm.model_validate(raw_form)
+    except ValidationError as exc:
+        return _logged_error_json_response(request, 400, openai_validation_error(exc))
+
+    merged_images: list[UploadFile] = []
+    if image:
+        merged_images.extend(image)
+    if image_brackets:
+        merged_images.extend(image_brackets)
+    if not merged_images:
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "At least one `image` (or `image[]`) multipart part is required.",
+                param="image",
+            ),
+        )
+
+    images_payload: list[tuple[bytes, str | None]] = []
+    for upload in merged_images:
+        try:
+            data = await upload.read()
+        finally:
+            await upload.close()
+        if not data:
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error("image part is empty", param="image"),
+            )
+        images_payload.append((data, upload.content_type))
+
+    mask_payload: tuple[bytes, str | None] | None = None
+    if mask is not None:
+        try:
+            data = await mask.read()
+        finally:
+            await mask.close()
+        if not data:
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error("mask part is empty", param="mask"),
+            )
+        mask_payload = (data, mask.content_type)
+
+    return await _proxy_images_edit_request(
+        request=request,
+        payload=form_payload,
+        images=images_payload,
+        mask=mask_payload,
+        context=context,
+        api_key=api_key,
+    )
+
+
+@v1_router.post("/images/variations", include_in_schema=False)
+async def v1_images_variations(
+    request: Request,
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    del api_key
+    return _logged_error_json_response(
+        request,
+        status_code=404,
+        content=images_service_module.make_not_found_error(
+            "/v1/images/variations is not supported by codex-lb. Use /v1/images/edits with an explicit prompt instead."
+        ),
+    )
+
+
+async def _prime_upstream_stream(
+    request: Request,
+    upstream: AsyncIterator[str],
+    rate_limit_headers: Mapping[str, str],
+    *,
+    on_error: Callable[[], Awaitable[None]] | None = None,
+) -> tuple[AsyncIterator[str] | None, Response | None]:
+    iterator = upstream.__aiter__()
+    try:
+        first_chunk = await iterator.__anext__()
+    except StopAsyncIteration:
+        first_chunk = None
+    except ProxyResponseError as exc:
+        if on_error is not None:
+            await on_error()
+        return None, _logged_error_json_response(
+            request,
+            exc.status_code,
+            exc.payload,
+            headers=dict(rate_limit_headers),
+        )
+
+    async def _replay() -> AsyncIterator[str]:
+        if first_chunk is not None:
+            yield first_chunk
+        async for chunk in iterator:
+            yield chunk
+
+    return _replay(), None
+
+
+async def _proxy_images_generation_request(
+    *,
+    request: Request,
+    payload: V1ImagesGenerationsRequest,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+) -> Response:
+    settings = proxy_service_module.get_settings()
+    requested_model = payload.model
+    effective_model = _effective_model_for_api_key(api_key, requested_model or settings.images_default_model)
+    if not images_service_module.is_supported_image_model(effective_model):
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                f"Effective model '{effective_model}' is not a 'gpt-image-*' model.",
+                param="model",
+            ),
+        )
+    if effective_model != requested_model:
+        payload = payload.model_copy(update={"model": effective_model})
+
+    try:
+        payload = images_service_module.validate_generations_payload(payload)
+    except ClientPayloadError as exc:
+        return _logged_error_json_response(request, 400, _client_payload_error_envelope(exc))
+
+    public_model = payload.model
+    assert public_model is not None
+    validate_model_access(api_key, effective_model)
+    rate_limit_headers = await context.service.rate_limit_headers()
+    reservation = await _enforce_request_limits(api_key, request_model=effective_model, request_service_tier=None)
+
+    try:
+        responses_payload = images_service_module.images_generation_to_responses_request(
+            payload,
+            host_model=settings.images_host_model,
+        )
+    except ValidationError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(request, 400, openai_validation_error(exc), headers=rate_limit_headers)
+
+    upstream = context.service.stream_responses(
+        responses_payload,
+        request.headers,
+        codex_session_affinity=False,
+        propagate_http_errors=True,
+        openai_cache_affinity=True,
+        api_key=api_key,
+        api_key_reservation=None,
+    )
+    return await _proxy_images_upstream_result(
+        request=request,
+        upstream=upstream,
+        payload_stream=bool(payload.stream),
+        public_model=public_model,
+        reservation=reservation,
+        context=context,
+        rate_limit_headers=rate_limit_headers,
+        is_edit=False,
+    )
+
+
+async def _proxy_images_edit_request(
+    *,
+    request: Request,
+    payload: V1ImagesEditsForm,
+    images: list[tuple[bytes, str | None]],
+    mask: tuple[bytes, str | None] | None,
+    context: ProxyContext,
+    api_key: ApiKeyData | None,
+) -> Response:
+    settings = proxy_service_module.get_settings()
+    requested_model = payload.model
+    effective_model = _effective_model_for_api_key(api_key, requested_model or settings.images_default_model)
+    if not images_service_module.is_supported_image_model(effective_model):
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                f"Effective model '{effective_model}' is not a 'gpt-image-*' model.",
+                param="model",
+            ),
+        )
+    if effective_model != requested_model:
+        payload = payload.model_copy(update={"model": effective_model})
+
+    try:
+        payload = images_service_module.validate_edits_payload(payload)
+    except ClientPayloadError as exc:
+        return _logged_error_json_response(request, 400, _client_payload_error_envelope(exc))
+
+    public_model = payload.model
+    assert public_model is not None
+    validate_model_access(api_key, effective_model)
+    rate_limit_headers = await context.service.rate_limit_headers()
+    reservation = await _enforce_request_limits(api_key, request_model=effective_model, request_service_tier=None)
+
+    try:
+        responses_payload = images_service_module.images_edit_to_responses_request(
+            payload,
+            host_model=settings.images_host_model,
+            images=images,
+            mask=mask,
+        )
+    except ValidationError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(request, 400, openai_validation_error(exc), headers=rate_limit_headers)
+    except ValueError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(str(exc)),
+            headers=rate_limit_headers,
+        )
+
+    upstream = context.service.stream_responses(
+        responses_payload,
+        request.headers,
+        codex_session_affinity=False,
+        propagate_http_errors=True,
+        openai_cache_affinity=True,
+        api_key=api_key,
+        api_key_reservation=None,
+    )
+    return await _proxy_images_upstream_result(
+        request=request,
+        upstream=upstream,
+        payload_stream=bool(payload.stream),
+        public_model=public_model,
+        reservation=reservation,
+        context=context,
+        rate_limit_headers=rate_limit_headers,
+        is_edit=True,
+    )
+
+
+async def _proxy_images_upstream_result(
+    *,
+    request: Request,
+    upstream: AsyncIterator[str],
+    payload_stream: bool,
+    public_model: str,
+    reservation: ApiKeyUsageReservationData | None,
+    context: ProxyContext,
+    rate_limit_headers: Mapping[str, str],
+    is_edit: bool,
+) -> Response:
+    captured: dict[str, object] = {}
+    primed_upstream, prime_error = await _prime_upstream_stream(
+        request,
+        upstream,
+        rate_limit_headers,
+        on_error=lambda: _release_reservation(reservation),
+    )
+    if prime_error is not None:
+        return prime_error
+    assert primed_upstream is not None
+
+    if payload_stream:
+        translated = images_service_module.translate_responses_stream_to_images_stream(
+            primed_upstream,
+            captured=captured,
+            is_edit=is_edit,
+        )
+
+        async def _stream_with_accounting() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in translated:
+                    yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+            finally:
+                await _finalize_image_request_accounting(context, reservation, public_model, captured)
+
+        return StreamingResponse(
+            _stream_with_accounting(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", **rate_limit_headers},
+        )
+
+    try:
+        response_payload, error_envelope = await images_service_module.collect_responses_stream_for_images(
+            primed_upstream,
+            captured=captured,
+        )
+    except ProxyResponseError as exc:
+        await _release_reservation(reservation)
+        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+
+    await _finalize_image_request_accounting(context, reservation, public_model, captured)
+    if error_envelope is not None:
+        return _logged_error_json_response(
+            request,
+            _status_for_image_error_envelope(error_envelope),
+            error_envelope,
+            headers=rate_limit_headers,
+        )
+    assert response_payload is not None
+    images_result = images_service_module.images_response_from_responses(response_payload)
+    if not isinstance(images_result, V1ImageResponse):
+        return _logged_error_json_response(
+            request,
+            _status_for_image_error_envelope(images_result),
+            images_result,
+            headers=rate_limit_headers,
+        )
+    return JSONResponse(content=images_result.model_dump(mode="json", exclude_none=True), headers=rate_limit_headers)
+
+
+async def _finalize_image_request_accounting(
+    context: ProxyContext,
+    reservation: ApiKeyUsageReservationData | None,
+    public_model: str,
+    captured: Mapping[str, object],
+) -> None:
+    response_id = captured.get("response_id")
+    if isinstance(response_id, str) and response_id:
+        await context.service.rewrite_request_log_model(response_id, public_model)
+    input_tokens = captured.get("image_input_tokens")
+    output_tokens = captured.get("image_output_tokens")
+    cached_input_tokens = captured.get("image_cached_input_tokens")
+    await _finalize_image_reservation(
+        reservation,
+        model=public_model,
+        input_tokens=input_tokens if isinstance(input_tokens, int) else None,
+        output_tokens=output_tokens if isinstance(output_tokens, int) else None,
+        cached_input_tokens=cached_input_tokens if isinstance(cached_input_tokens, int) else None,
+    )
+
+
 async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
     reservation = await _enforce_request_limits(
         api_key,
@@ -641,17 +1033,22 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
 
     if not models:
         await _release_reservation(reservation)
-        return JSONResponse(content=CodexModelsResponse(models=[]).model_dump(mode="json"))
+        return JSONResponse(content=CodexModelsResponse(models=[], data=[]).model_dump(mode="json"))
 
     entries: list[CodexModelEntry] = []
+    data: list[ModelListItem] = []
+    created = int(time.time())
     for slug, model in models.items():
         if not _is_model_visible_for_api_key(slug, allowed_models):
             continue
         if not is_public_model(model, allowed_models):
             continue
-        entries.append(_to_codex_model_entry(model))
+        entry = _to_codex_model_entry(model)
+        entries.append(entry)
+        if entry.visibility == "list":
+            data.append(_to_model_list_item(slug, model, created=created))
     await _release_reservation(reservation)
-    return JSONResponse(content=CodexModelsResponse(models=entries).model_dump(mode="json"))
+    return JSONResponse(content=CodexModelsResponse(models=entries, data=data).model_dump(mode="json"))
 
 
 async def _build_models_response(api_key: ApiKeyData | None) -> Response:
@@ -677,12 +1074,7 @@ async def _build_models_response(api_key: ApiKeyData | None) -> Response:
             continue
         if not is_public_model(model, allowed_models):
             continue
-        items_by_id[slug] = ModelListItem(
-            id=slug,
-            created=created,
-            owned_by="codex-lb",
-            metadata=_to_model_metadata(model),
-        )
+        items_by_id[slug] = _to_model_list_item(slug, model, created=created)
     async with get_background_session() as session:
         accounts_repo = AccountsRepository(session)
         accounts = await accounts_repo.list_accounts()
@@ -725,6 +1117,15 @@ def _is_model_visible_for_api_key(
     allowed_models: set[str] | None,
 ) -> bool:
     return allowed_models is None or model_id in allowed_models
+
+
+def _to_model_list_item(slug: str, model: UpstreamModel, *, created: int) -> ModelListItem:
+    return ModelListItem(
+        id=slug,
+        created=created,
+        owned_by="codex-lb",
+        metadata=_to_model_metadata(model),
+    )
 
 
 def _to_codex_model_entry(model: UpstreamModel) -> CodexModelEntry:
@@ -947,6 +1348,7 @@ async def _stream_responses(
     forwarded_downstream_turn_state: str | None = None,
     forwarded_affinity_kind: str | None = None,
     forwarded_affinity_key: str | None = None,
+    enforce_openai_sdk_contract: bool = True,
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
     await _validate_model_access_for_request(api_key, payload.model)
@@ -1003,7 +1405,12 @@ async def _stream_responses(
             api_key_reservation=reservation,
             suppress_text_done_events=suppress_text_done_events,
         )
-    stream = _normalize_public_responses_stream(stream)
+    allow_remote_compaction_v2 = _allows_remote_compaction_v2_output(effective_headers)
+    stream = _normalize_public_responses_stream(
+        stream,
+        allow_remote_compaction_v2=allow_remote_compaction_v2,
+        enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+    )
     try:
         first = await stream.__anext__()
     except StopAsyncIteration:
@@ -1086,7 +1493,10 @@ async def _collect_responses(
             suppress_text_done_events=suppress_text_done_events,
         )
     try:
-        response_payload = await _collect_responses_payload(stream)
+        response_payload = await _collect_responses_payload(
+            stream,
+            allow_remote_compaction_v2=_allows_remote_compaction_v2_output(request.headers),
+        )
     except ProxyResponseError as exc:
         await _release_reservation(reservation)
         error = _parse_error_envelope(exc.payload)
@@ -1408,6 +1818,48 @@ async def _release_reservation(reservation: ApiKeyUsageReservationData | None) -
         await service.release_usage_reservation(reservation.reservation_id)
 
 
+async def _finalize_image_reservation(
+    reservation: ApiKeyUsageReservationData | None,
+    *,
+    model: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_input_tokens: int | None = None,
+) -> None:
+    if reservation is None:
+        return
+    try:
+        if not input_tokens and not output_tokens:
+            await _release_reservation(reservation)
+            return
+        async with get_background_session() as session:
+            service = ApiKeysService(ApiKeysRepository(session))
+            await service.finalize_usage_reservation(
+                reservation.reservation_id,
+                model=model,
+                input_tokens=int(input_tokens or 0),
+                output_tokens=int(output_tokens or 0),
+                cached_input_tokens=int(cached_input_tokens or 0),
+                service_tier=None,
+            )
+    except Exception:
+        logger.warning(
+            "failed to finalize image reservation reservation_id=%s model=%s",
+            reservation.reservation_id,
+            model,
+            exc_info=True,
+        )
+
+
+def _client_payload_error_envelope(exc: ClientPayloadError) -> OpenAIErrorEnvelope:
+    code = exc.code or "invalid_request_error"
+    error_type = exc.error_type or "invalid_request_error"
+    envelope = openai_error(code, str(exc), error_type=error_type)
+    if exc.param:
+        envelope["error"]["param"] = exc.param
+    return envelope
+
+
 def _effective_model_for_api_key(api_key: ApiKeyData | None, requested_model: str) -> str:
     if api_key is None or api_key.enforced_model is None:
         return requested_model
@@ -1422,7 +1874,11 @@ def _compact_request_service_tier(payload: ResponsesCompactRequest) -> str | Non
     return stripped or None
 
 
-async def _collect_responses_payload(stream: AsyncIterator[str]) -> OpenAIResponseResult:
+async def _collect_responses_payload(
+    stream: AsyncIterator[str],
+    *,
+    allow_remote_compaction_v2: bool = False,
+) -> OpenAIResponseResult:
     output_items: dict[int, dict[str, JsonValue]] = {}
     terminal_result: OpenAIResponseResult | None = None
     contract_violation_kind: str | None = None
@@ -1459,7 +1915,11 @@ async def _collect_responses_payload(stream: AsyncIterator[str]) -> OpenAIRespon
         if event_type in ("response.completed", "response.incomplete"):
             response = payload.get("response")
             if is_json_mapping(response):
-                normalized_response, violation_kind = _normalize_public_response_mapping(response, output_items)
+                normalized_response, violation_kind = _normalize_public_response_mapping(
+                    response,
+                    output_items,
+                    allow_remote_compaction_v2=allow_remote_compaction_v2,
+                )
                 if violation_kind is not None:
                     contract_violation_kind = contract_violation_kind or violation_kind
                 if normalized_response is not None:
@@ -1501,6 +1961,8 @@ def _collect_output_item_event(
 def _merge_collected_output_items(
     response: Mapping[str, JsonValue],
     output_items: dict[int, dict[str, JsonValue]],
+    *,
+    prefer_collected_output_items: bool = False,
 ) -> dict[str, JsonValue]:
     merged = dict(response)
     if not output_items:
@@ -1508,26 +1970,65 @@ def _merge_collected_output_items(
 
     existing_output = response.get("output")
     if isinstance(existing_output, list) and existing_output:
+        if not prefer_collected_output_items:
+            return merged
+        output = list(existing_output)
+        for output_index, item in sorted(output_items.items()):
+            if output_index < 0:
+                continue
+            if output_index < len(output):
+                output[output_index] = item
+            else:
+                output.append(item)
+        merged["output"] = output
         return merged
 
     merged["output"] = [item for _, item in sorted(output_items.items())]
     return merged
 
 
-async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> AsyncIterator[str]:
+async def _normalize_public_responses_stream(
+    stream: AsyncIterator[str],
+    *,
+    allow_remote_compaction_v2: bool = False,
+    enforce_openai_sdk_contract: bool = True,
+) -> AsyncIterator[str]:
     terminal_seen = False
+    done_seen = False
     contract_violation_kind: str | None = None
+    output_items: dict[int, dict[str, JsonValue]] = {}
     async for event_block in stream:
         if event_block.strip() == "data: [DONE]":
+            done_seen = True
             if terminal_seen:
                 yield event_block
             continue
         payload = _parse_sse_payload(event_block)
         if payload is None:
+            if not _looks_like_sse_data_block(event_block):
+                yield event_block
+                continue
             if _looks_like_sse_data_block(event_block):
                 contract_violation_kind = contract_violation_kind or "invalid_json"
             continue
-        normalized_payload, violation_kind = _normalize_public_stream_payload(payload)
+        event_type = payload.get("type")
+        if not enforce_openai_sdk_contract:
+            if isinstance(event_type, str) and event_type in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+                "error",
+            }:
+                terminal_seen = True
+            yield event_block
+            continue
+        if allow_remote_compaction_v2:
+            _collect_output_item_event(payload, output_items)
+        normalized_payload, violation_kind = _normalize_public_stream_payload(
+            payload,
+            output_items=output_items,
+            allow_remote_compaction_v2=allow_remote_compaction_v2,
+        )
         if violation_kind is not None:
             contract_violation_kind = contract_violation_kind or violation_kind
         if normalized_payload is None:
@@ -1542,6 +2043,8 @@ async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> Asyn
             terminal_seen = True
         yield format_sse_event(normalized_payload)
     if terminal_seen:
+        if not done_seen and not enforce_openai_sdk_contract:
+            yield "data: [DONE]\n\n"
         return
     error_kind = contract_violation_kind or "upstream_stream_truncated"
     yield format_sse_event(
@@ -1554,6 +2057,9 @@ async def _normalize_public_responses_stream(stream: AsyncIterator[str]) -> Asyn
 
 def _normalize_public_stream_payload(
     payload: dict[str, JsonValue],
+    output_items: dict[int, dict[str, JsonValue]] | None = None,
+    *,
+    allow_remote_compaction_v2: bool = False,
 ) -> tuple[dict[str, JsonValue] | None, str | None]:
     event_type = payload.get("type")
     if event_type in ("response.completed", "response.incomplete"):
@@ -1569,7 +2075,11 @@ def _normalize_public_stream_payload(
                 ),
                 "invalid_json",
             )
-        normalized_response, violation_kind = _normalize_public_response_mapping(response)
+        normalized_response, violation_kind = _normalize_public_response_mapping(
+            response,
+            output_items,
+            allow_remote_compaction_v2=allow_remote_compaction_v2,
+        )
         if normalized_response is None:
             error_kind = violation_kind or "invalid_output_item"
             return (
@@ -1589,24 +2099,29 @@ def _normalize_public_stream_payload(
         item = payload.get("item")
         if not is_json_mapping(item):
             return None, "invalid_output_item"
-        normalized_item = _normalize_public_output_item(item)
+        normalized_item = _normalize_public_output_item(
+            item,
+            allow_remote_compaction_v2=allow_remote_compaction_v2,
+        )
         if normalized_item is None:
             return None, "invalid_output_item"
         normalized_payload = dict(payload)
         normalized_payload["item"] = normalized_item
-        violation_kind = None
-        item_type = item.get("type")
-        if isinstance(item_type, str) and not _is_public_passthrough_output_item_type(item_type):
-            violation_kind = "invalid_output_item"
-        return normalized_payload, violation_kind
+        return normalized_payload, None
     return payload, None
 
 
 def _normalize_public_response_mapping(
     response: Mapping[str, JsonValue],
     output_items: dict[int, dict[str, JsonValue]] | None = None,
+    *,
+    allow_remote_compaction_v2: bool = False,
 ) -> tuple[dict[str, JsonValue] | None, str | None]:
-    merged = _merge_collected_output_items(response, output_items or {})
+    merged = _merge_collected_output_items(
+        response,
+        output_items or {},
+        prefer_collected_output_items=allow_remote_compaction_v2,
+    )
     output = merged.get("output")
     if not isinstance(output, list):
         return merged, None
@@ -1616,7 +2131,10 @@ def _normalize_public_response_mapping(
         if not is_json_mapping(item):
             dropped_items += 1
             continue
-        normalized_item = _normalize_public_output_item(item)
+        normalized_item = _normalize_public_output_item(
+            item,
+            allow_remote_compaction_v2=allow_remote_compaction_v2,
+        )
         if normalized_item is None:
             dropped_items += 1
             continue
@@ -1632,9 +2150,16 @@ def _normalize_public_response_mapping(
     return normalized, None
 
 
-def _normalize_public_output_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+def _normalize_public_output_item(
+    item: Mapping[str, JsonValue],
+    *,
+    allow_remote_compaction_v2: bool = False,
+) -> dict[str, JsonValue] | None:
     item_type = item.get("type")
-    if isinstance(item_type, str) and _is_public_passthrough_output_item_type(item_type):
+    if isinstance(item_type, str) and _is_public_passthrough_output_item_type(
+        item_type,
+        allow_remote_compaction_v2=allow_remote_compaction_v2,
+    ):
         return dict(item)
     text_value = _extract_public_output_item_text(item)
     if text_value is None:
@@ -1651,10 +2176,32 @@ def _normalize_public_output_item(item: Mapping[str, JsonValue]) -> dict[str, Js
     return normalized
 
 
-def _is_public_passthrough_output_item_type(item_type: str) -> bool:
+def _is_public_passthrough_output_item_type(
+    item_type: str,
+    *,
+    allow_remote_compaction_v2: bool = False,
+) -> bool:
+    if allow_remote_compaction_v2 and item_type in _REMOTE_COMPACTION_V2_OUTPUT_ITEM_TYPES:
+        return True
     if item_type in _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES:
         return True
     return item_type.endswith("_call") or item_type.endswith("_call_output")
+
+
+def _allows_remote_compaction_v2_output(headers: Mapping[str, str]) -> bool:
+    value = _header_value_case_insensitive(headers, "x-codex-beta-features")
+    if value is None:
+        return False
+    features = {feature.strip().lower() for feature in value.split(",")}
+    return "remote_compaction_v2" in features
+
+
+def _header_value_case_insensitive(headers: Mapping[str, str], name: str) -> str | None:
+    expected = name.lower()
+    for key, value in headers.items():
+        if key.lower() == expected:
+            return value
+    return None
 
 
 def _extract_public_output_item_text(item: Mapping[str, JsonValue]) -> str | None:
@@ -1768,4 +2315,21 @@ def _status_for_error(error_value: OpenAIError | None) -> int:
         return 400
     if error_value and error_value.code in _UNAVAILABLE_SELECTION_ERROR_CODES:
         return 503
+    return 502
+
+
+def _status_for_image_error_envelope(envelope: object) -> int:
+    if not isinstance(envelope, Mapping):
+        return 502
+    error = envelope.get("error")
+    if not is_json_mapping(error):
+        return 502
+    error_type = error.get("type")
+    code = error.get("code")
+    if error_type == "invalid_request_error":
+        return 404 if code == "not_found_error" else 400
+    if error_type == "permission_error":
+        return 403
+    if error_type == "rate_limit_error":
+        return 429
     return 502

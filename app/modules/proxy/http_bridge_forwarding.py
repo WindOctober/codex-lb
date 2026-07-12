@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from app.core.errors import OpenAIErrorEnvelope, openai_error, response_failed_e
 from app.core.openai.requests import ResponsesRequest
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
-from app.core.utils.sse import format_sse_event
+from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.modules.api_keys.service import ApiKeyUsageReservationData
 
 HTTP_BRIDGE_INTERNAL_FORWARD_PATH = "/internal/bridge/responses"
@@ -32,6 +33,8 @@ HTTP_BRIDGE_RESERVATION_MODEL_HEADER = "x-codex-bridge-reservation-model"
 HTTP_BRIDGE_AFFINITY_KIND_HEADER = "x-codex-bridge-affinity-kind"
 HTTP_BRIDGE_AFFINITY_KEY_HEADER = "x-codex-bridge-affinity-key"
 HTTP_BRIDGE_SIGNATURE_HEADER = "x-codex-bridge-signature"
+_TEXT_DELTA_EVENT_TYPES = frozenset({"response.output_text.delta", "response.refusal.delta"})
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,17 +88,22 @@ class HTTPBridgeOwnerClient:
             idle_timeout_seconds=settings.stream_idle_timeout_seconds,
         )
         async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+            owner_post_started_at = time.monotonic()
             async with session.post(
                 f"{owner_endpoint}{HTTP_BRIDGE_INTERNAL_FORWARD_PATH}",
                 json=payload.model_dump(mode="json", exclude_none=True),
                 headers=build_owner_forward_headers(headers=headers, payload=payload, context=context),
             ) as response:
+                owner_response_headers_at = time.monotonic()
                 if response.status != 200:
                     payload_text = await response.text()
                     raise ProxyResponseError(
                         response.status,
                         _owner_forward_error_payload(status_code=response.status, payload_text=payload_text),
                     )
+                first_forward_event_at: float | None = None
+                first_forward_event_type: str | None = None
+                first_forward_text_logged = False
                 try:
                     async for event_block in _iter_sse_event_blocks(
                         response,
@@ -103,6 +111,25 @@ class HTTPBridgeOwnerClient:
                         proxy_request_budget_seconds=settings.proxy_request_budget_seconds,
                         stream_idle_timeout_seconds=settings.stream_idle_timeout_seconds,
                     ):
+                        event_at = time.monotonic()
+                        event_type = _sse_event_type(event_block)
+                        if first_forward_event_at is None:
+                            first_forward_event_at = event_at
+                            first_forward_event_type = event_type
+                        if event_type in _TEXT_DELTA_EVENT_TYPES and not first_forward_text_logged:
+                            first_forward_text_logged = True
+                            _log_owner_forward_latency_breakdown(
+                                owner_endpoint=owner_endpoint,
+                                context=context,
+                                model=payload.model,
+                                event_type=event_type,
+                                first_forward_event_type=first_forward_event_type,
+                                request_started_at=request_started_at,
+                                owner_post_started_at=owner_post_started_at,
+                                owner_response_headers_at=owner_response_headers_at,
+                                first_forward_event_at=first_forward_event_at,
+                                first_forward_text_at=event_at,
+                            )
                         yield event_block
                 except _OwnerForwardStreamTimeoutError as exc:
                     raise OwnerForwardRelayFailure(
@@ -284,6 +311,56 @@ async def _iter_sse_event_blocks(
                 yield f"{text}\n\n"
     if buffer.strip():
         yield buffer.decode("utf-8")
+
+
+def _sse_event_type(event_block: str) -> str | None:
+    payload = parse_sse_data_json(event_block)
+    if not isinstance(payload, dict):
+        return None
+    event_type = payload.get("type")
+    return event_type if isinstance(event_type, str) else None
+
+
+def _elapsed_ms(start: float | None, end: float | None) -> int | None:
+    if start is None or end is None:
+        return None
+    return int((end - start) * 1000)
+
+
+def _log_owner_forward_latency_breakdown(
+    *,
+    owner_endpoint: str,
+    context: HTTPBridgeForwardContext,
+    model: str,
+    event_type: str | None,
+    first_forward_event_type: str | None,
+    request_started_at: float,
+    owner_post_started_at: float,
+    owner_response_headers_at: float,
+    first_forward_event_at: float | None,
+    first_forward_text_at: float,
+) -> None:
+    logger.warning(
+        "owner_forward_latency_breakdown origin_instance=%s target_instance=%s owner_endpoint=%s"
+        " model=%s affinity_kind=%s event_type=%s first_forward_event_type=%s"
+        " total_to_first_text_ms=%s local_before_owner_post_ms=%s owner_response_headers_ms=%s"
+        " owner_first_event_ms=%s owner_first_text_ms=%s headers_to_first_event_ms=%s"
+        " first_event_to_first_text_ms=%s",
+        context.origin_instance,
+        context.target_instance,
+        owner_endpoint,
+        model,
+        context.original_affinity_kind,
+        event_type,
+        first_forward_event_type,
+        _elapsed_ms(request_started_at, first_forward_text_at),
+        _elapsed_ms(request_started_at, owner_post_started_at),
+        _elapsed_ms(owner_post_started_at, owner_response_headers_at),
+        _elapsed_ms(request_started_at, first_forward_event_at),
+        _elapsed_ms(request_started_at, first_forward_text_at),
+        _elapsed_ms(owner_response_headers_at, first_forward_event_at),
+        _elapsed_ms(first_forward_event_at, first_forward_text_at),
+    )
 
 
 def _owner_forward_receive_timeout(

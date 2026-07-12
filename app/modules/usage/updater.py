@@ -426,6 +426,12 @@ class UsageUpdater:
             usage_written = usage_written or _usage_entry_written(entry)
         return AccountRefreshResult(usage_written=usage_written)
 
+    async def refresh_account_now(self, account: Account) -> AccountRefreshResult:
+        return await self._refresh_account(
+            account,
+            usage_account_id=account.chatgpt_account_id,
+        )
+
     async def _deactivate_for_client_error(self, account: Account, exc: UsageFetchError) -> None:
         if not self._auth_manager:
             return

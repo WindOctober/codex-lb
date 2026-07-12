@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -13,6 +14,7 @@ from app.core import usage as usage_core
 from app.core.account_groups import account_builtin_group_names
 from app.core.account_priorities import account_configured_priority, account_routing_priority
 from app.core.balancer import (
+    DEFAULT_ROUTING_STRATEGY,
     HEALTH_TIER_DRAINING,
     HEALTH_TIER_HEALTHY,
     HEALTH_TIER_PROBING,
@@ -56,8 +58,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MAX_SELECTION_ATTEMPTS = 4
-
 _STICKY_GRACE_PERIOD_SECONDS = 10.0
+_PRIMARY_DRAIN_BUCKET_SECONDS = 5 * 3600
+_PRIMARY_DRAIN_LOOKBACK_DAYS = 7
+_PRIMARY_DRAIN_FULL_BUCKET_THRESHOLD_PCT = 95.0
 _RECOVERABLE_STATUSES = frozenset(
     {
         AccountStatus.ACTIVE,
@@ -90,6 +94,7 @@ class AccountSelection:
     account: Account | None
     error_message: str | None
     error_code: str | None = None
+    retry_after_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +102,7 @@ class _SelectionInputs:
     accounts: list[Account]
     latest_primary: dict[str, UsageHistory]
     latest_secondary: dict[str, UsageHistory]
+    primary_drain_scores: dict[str, float] | None = None
     runtime_accounts: list[Account] | None = None
     error_message: str | None = None
     error_code: str | None = None
@@ -122,7 +128,7 @@ class LoadBalancer:
         reallocate_sticky: bool = False,
         sticky_max_age_seconds: int | None = None,
         prefer_earlier_reset_accounts: bool = False,
-        routing_strategy: RoutingStrategy = "capacity_weighted",
+        routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
         model: str | None = None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
@@ -145,12 +151,14 @@ class LoadBalancer:
                 account_ids=scoped_account_ids,
                 allowed_groups=normalized_allowed_groups,
                 preferred_group_priorities=normalized_preferred_group_priorities,
+                routing_strategy=routing_strategy,
             )
             if excluded_ids and selection_inputs.accounts:
                 selection_inputs = _SelectionInputs(
                     accounts=[account for account in selection_inputs.accounts if account.id not in excluded_ids],
                     latest_primary=selection_inputs.latest_primary,
                     latest_secondary=selection_inputs.latest_secondary,
+                    primary_drain_scores=selection_inputs.primary_drain_scores,
                     runtime_accounts=selection_inputs.runtime_accounts,
                     error_message=selection_inputs.error_message,
                     error_code=selection_inputs.error_code,
@@ -175,6 +183,7 @@ class LoadBalancer:
 
         selected_snapshot: Account | None = None
         error_message: str | None = None
+        retry_after_seconds: float | None = None
         selected_states: list[AccountState] = []
         selected_account_map: dict[str, Account] = {}
         if sticky_key is None:
@@ -186,6 +195,7 @@ class LoadBalancer:
                     accounts=selection_inputs.accounts,
                     latest_primary=selection_inputs.latest_primary,
                     latest_secondary=selection_inputs.latest_secondary,
+                    primary_drain_scores=selection_inputs.primary_drain_scores or {},
                     runtime=self._runtime,
                     preferred_group_priorities=normalized_preferred_group_priorities,
                 )
@@ -214,6 +224,7 @@ class LoadBalancer:
                     selected = account_map.get(result.account.account_id)
                     if selected is None:
                         error_message = result.error_message
+                        retry_after_seconds = result.retry_after_seconds
                     else:
                         selected_reset_at = selected.reset_at
                         for state in states:
@@ -228,6 +239,7 @@ class LoadBalancer:
                         selected_snapshot.reset_at = selected_reset_at
                 else:
                     error_message = result.error_message
+                    retry_after_seconds = result.retry_after_seconds
 
                 pre_persist_runtime_state = {
                     aid: (
@@ -251,6 +263,7 @@ class LoadBalancer:
                     if attempt >= _MAX_SELECTION_ATTEMPTS:
                         selected_snapshot = None
                         error_message = None
+                        retry_after_seconds = None
                         break
                     selection_inputs = await load_selection_inputs()
                     if selection_inputs.error_code is not None and not selection_inputs.accounts:
@@ -261,6 +274,7 @@ class LoadBalancer:
                         )
                     selected_snapshot = None
                     error_message = None
+                    retry_after_seconds = None
                     selected_states = []
                     selected_account_map = {}
                     continue
@@ -279,6 +293,7 @@ class LoadBalancer:
                         )
                     selected_snapshot = None
                     error_message = None
+                    retry_after_seconds = None
                     selected_states = []
                     selected_account_map = {}
                     await asyncio.sleep(0)
@@ -301,6 +316,7 @@ class LoadBalancer:
                                 error_code=selection_inputs.error_code,
                             )
                         error_message = None
+                        retry_after_seconds = None
                         selected_states = []
                         selected_account_map = {}
                         await asyncio.sleep(0)
@@ -317,6 +333,7 @@ class LoadBalancer:
                     accounts=selection_inputs.accounts,
                     latest_primary=selection_inputs.latest_primary,
                     latest_secondary=selection_inputs.latest_secondary,
+                    primary_drain_scores=selection_inputs.primary_drain_scores or {},
                     runtime=self._runtime,
                     preferred_group_priorities=normalized_preferred_group_priorities,
                 )
@@ -349,6 +366,7 @@ class LoadBalancer:
                         selected = account_map.get(result.account.account_id)
                         if selected is None:
                             error_message = result.error_message
+                            retry_after_seconds = result.retry_after_seconds
                         else:
                             selected_reset_at = selected.reset_at
                             for state in selected_states:
@@ -363,6 +381,7 @@ class LoadBalancer:
                             selected_snapshot.reset_at = selected_reset_at
                     else:
                         error_message = result.error_message
+                        retry_after_seconds = result.retry_after_seconds
 
                     stale_account_ids = await self._persist_selection_state(
                         repos.accounts,
@@ -373,6 +392,7 @@ class LoadBalancer:
                 if selected_snapshot is not None and selected_snapshot.id in stale_account_ids:
                     selected_snapshot = None
                     error_message = None
+                    retry_after_seconds = None
                     selected_states = []
                     selected_account_map = {}
                     if attempt >= _MAX_SELECTION_ATTEMPTS:
@@ -401,7 +421,12 @@ class LoadBalancer:
             if error_message == "No available accounts":
                 set_degraded("all upstream accounts are unavailable")
                 error_message = _format_degraded_error_message(error_message)
-            return AccountSelection(account=None, error_message=error_message, error_code=None)
+            return AccountSelection(
+                account=None,
+                error_message=error_message,
+                error_code=None,
+                retry_after_seconds=retry_after_seconds,
+            )
         logger.info(
             "Selected account_id=%s strategy=%s sticky=%s model=%s",
             selected_snapshot.id,
@@ -411,6 +436,85 @@ class LoadBalancer:
         )
         return AccountSelection(account=selected_snapshot, error_message=None, error_code=None)
 
+    async def count_routable_budget_safe_accounts(
+        self,
+        *,
+        model: str | None = None,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+        exclude_account_ids: Collection[str] | None = None,
+        allowed_groups: Collection[str] | None = None,
+        preferred_group_priorities: dict[str, int] | None = None,
+        budget_threshold_pct: float = 95.0,
+        routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
+    ) -> int:
+        account_ids = await self.routable_budget_safe_account_ids(
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=account_ids,
+            exclude_account_ids=exclude_account_ids,
+            allowed_groups=allowed_groups,
+            preferred_group_priorities=preferred_group_priorities,
+            budget_threshold_pct=budget_threshold_pct,
+            routing_strategy=routing_strategy,
+        )
+        return len(account_ids)
+
+    async def routable_budget_safe_account_ids(
+        self,
+        *,
+        model: str | None = None,
+        additional_limit_name: str | None = None,
+        account_ids: Collection[str] | None = None,
+        exclude_account_ids: Collection[str] | None = None,
+        allowed_groups: Collection[str] | None = None,
+        preferred_group_priorities: dict[str, int] | None = None,
+        budget_threshold_pct: float = 95.0,
+        routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
+    ) -> set[str]:
+        excluded_ids = set(exclude_account_ids or ())
+        normalized_allowed_groups = _normalize_group_filter(allowed_groups)
+        normalized_preferred_group_priorities = _normalize_group_priorities(preferred_group_priorities)
+        selection_inputs = await self._load_selection_inputs(
+            model=model,
+            additional_limit_name=additional_limit_name,
+            account_ids=None if account_ids is None else set(account_ids),
+            allowed_groups=normalized_allowed_groups,
+            preferred_group_priorities=normalized_preferred_group_priorities,
+            routing_strategy=routing_strategy,
+        )
+        accounts = [account for account in selection_inputs.accounts if account.id not in excluded_ids]
+        if not accounts:
+            return set()
+
+        self._prune_runtime(selection_inputs.runtime_accounts or accounts)
+        states, _ = _build_states(
+            accounts=accounts,
+            latest_primary=selection_inputs.latest_primary,
+            latest_secondary=selection_inputs.latest_secondary,
+            primary_drain_scores=selection_inputs.primary_drain_scores or {},
+            runtime=self._runtime,
+            preferred_group_priorities=normalized_preferred_group_priorities,
+        )
+        selectable_states: list[AccountState] = []
+        for state in states:
+            result = select_account(
+                [replace(state)],
+                routing_strategy=routing_strategy,
+                allow_backoff_fallback=False,
+            )
+            if result.account is not None:
+                selectable_states.append(state)
+        if not selectable_states:
+            return set()
+
+        budget_safe_states = [
+            state
+            for state in selectable_states
+            if not _state_above_budget_threshold(state, budget_threshold_pct)
+        ]
+        return {state.account_id for state in budget_safe_states or selectable_states}
+
     async def _load_selection_inputs(
         self,
         *,
@@ -419,7 +523,9 @@ class LoadBalancer:
         account_ids: Collection[str] | None = None,
         allowed_groups: frozenset[str] | None = None,
         preferred_group_priorities: dict[str, int] | None = None,
+        routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
     ) -> _SelectionInputs:
+        needs_primary_drain_scores = routing_strategy == "primary_drain"
         cache_key = (
             model,
             additional_limit_name,
@@ -428,6 +534,7 @@ class LoadBalancer:
             None
             if not preferred_group_priorities
             else tuple(sorted(preferred_group_priorities.items(), key=lambda item: (item[1], item[0]))),
+            needs_primary_drain_scores,
         )
         cached = await self._selection_inputs_cache.get(cache_key)
         if cached is not None:
@@ -540,6 +647,15 @@ class LoadBalancer:
                 )
                 latest_primary = _overlay_additional_usage(latest_primary, additional_primary)
                 latest_secondary = _overlay_additional_usage(latest_secondary, additional_secondary)
+            primary_drain_scores: dict[str, float] | None = None
+            if needs_primary_drain_scores:
+                account_ids_for_scores = [account.id for account in accounts]
+                primary_histories = await repos.usage.bulk_history_since(
+                    account_ids_for_scores,
+                    "primary",
+                    utcnow() - timedelta(days=7),
+                )
+                primary_drain_scores = _build_primary_drain_scores(primary_histories, now=utcnow())
             selection_inputs = _SelectionInputs(
                 accounts=[_clone_account(account) for account in accounts],
                 latest_primary={
@@ -548,6 +664,7 @@ class LoadBalancer:
                 latest_secondary={
                     account_id: _clone_usage_history(entry) for account_id, entry in latest_secondary.items()
                 },
+                primary_drain_scores=primary_drain_scores,
                 runtime_accounts=[_clone_account(account) for account in all_accounts],
             )
             await self._selection_inputs_cache.set(
@@ -720,7 +837,8 @@ class LoadBalancer:
         if sticky_kind is None:
             raise ValueError("sticky_kind is required when sticky_key is provided")
 
-        existing = await sticky_repo.get_account_id(
+        existing = await self._safe_get_sticky_account_id(
+            sticky_repo,
             sticky_key,
             kind=sticky_kind,
             max_age_seconds=sticky_max_age_seconds,
@@ -737,6 +855,19 @@ class LoadBalancer:
         if existing:
             pinned = next((state for state in states if state.account_id == existing), None)
             if pinned is not None:
+                priority_result: SelectionResult | None = None
+                if routing_strategy == "primary_drain" and not pinned.primary_drain_priority_enabled:
+                    priority_states = [state for state in states if state.primary_drain_priority_enabled]
+                    if priority_states:
+                        priority_result = select_account(
+                            priority_states,
+                            prefer_earlier_reset=prefer_earlier_reset_accounts,
+                            routing_strategy=routing_strategy,
+                            allow_backoff_fallback=False,
+                        )
+                should_rebind_to_primary_drain_priority = (
+                    priority_result is not None and priority_result.account is not None
+                )
                 # Proactively rebind session affinity for prompt-cache and
                 # codex sessions once the pinned account is already above the
                 # configured budget threshold. That preserves continuity below
@@ -754,7 +885,7 @@ class LoadBalancer:
                     and pinned.reset_at is not None
                     and pinned.reset_at - now >= 600  # 10 minutes
                 )
-                if not (budget_pressured or rate_limit_far_away):
+                if not (should_rebind_to_primary_drain_priority or budget_pressured or rate_limit_far_away):
                     pinned_result = select_account(
                         [pinned],
                         prefer_earlier_reset=prefer_earlier_reset_accounts,
@@ -763,15 +894,22 @@ class LoadBalancer:
                     )
                     if pinned_result.account is not None:
                         if sticky_max_age_seconds is not None:
-                            await sticky_repo.upsert(sticky_key, pinned.account_id, kind=sticky_kind)
+                            await self._safe_upsert_sticky_session(
+                                sticky_repo,
+                                sticky_key,
+                                pinned.account_id,
+                                kind=sticky_kind,
+                            )
                         return pinned_result
                 else:
+                    if should_rebind_to_primary_drain_priority:
+                        reallocate_sticky = True
                     # Before reallocating, check whether the pool has a
                     # meaningfully better candidate.  When every account
                     # is above the budget threshold, reallocating just
                     # wastes DB writes and destroys prompt-cache locality
                     # (thrashing).
-                    if budget_pressured:
+                    if budget_pressured and not should_rebind_to_primary_drain_priority:
                         pool_best = _select_account_preferring_budget_safe(
                             states,
                             prefer_earlier_reset=prefer_earlier_reset_accounts,
@@ -792,7 +930,8 @@ class LoadBalancer:
                             )
                             if pinned_result.account is not None:
                                 if sticky_max_age_seconds is not None:
-                                    await sticky_repo.upsert(
+                                    await self._safe_upsert_sticky_session(
+                                        sticky_repo,
                                         sticky_key,
                                         pinned.account_id,
                                         kind=sticky_kind,
@@ -816,10 +955,15 @@ class LoadBalancer:
                     )
                     if grace_result.account is not None:
                         if sticky_max_age_seconds is not None:
-                            await sticky_repo.upsert(sticky_key, pinned.account_id, kind=sticky_kind)
+                            await self._safe_upsert_sticky_session(
+                                sticky_repo,
+                                sticky_key,
+                                pinned.account_id,
+                                kind=sticky_kind,
+                            )
                         return grace_result
                 if reallocate_sticky:
-                    await sticky_repo.delete(sticky_key, kind=sticky_kind)
+                    await self._safe_delete_sticky_session(sticky_repo, sticky_key, kind=sticky_kind)
                 elif pinned.status not in _RECOVERABLE_STATUSES:
                     # Permanently down (PAUSED/DEACTIVATED) — let the
                     # fallback be persisted to rebind the mapping.
@@ -834,7 +978,7 @@ class LoadBalancer:
                 # fallback so the session sticks to one account during
                 # the outage instead of bouncing across random fallbacks.
             else:
-                await sticky_repo.delete(sticky_key, kind=sticky_kind)
+                await self._safe_delete_sticky_session(sticky_repo, sticky_key, kind=sticky_kind)
 
         chosen = _select_account_preferring_budget_safe(
             states,
@@ -843,8 +987,73 @@ class LoadBalancer:
             budget_threshold_pct=budget_threshold_pct,
         )
         if persist_fallback and chosen.account is not None and chosen.account.account_id in account_map:
-            await sticky_repo.upsert(sticky_key, chosen.account.account_id, kind=sticky_kind)
+            await self._safe_upsert_sticky_session(
+                sticky_repo,
+                sticky_key,
+                chosen.account.account_id,
+                kind=sticky_kind,
+            )
         return chosen
+
+    async def _safe_get_sticky_account_id(
+        self,
+        sticky_repo: StickySessionsRepository,
+        sticky_key: str,
+        *,
+        kind: StickySessionKind,
+        max_age_seconds: int | None,
+    ) -> str | None:
+        try:
+            return await sticky_repo.get_account_id(
+                sticky_key,
+                kind=kind,
+                max_age_seconds=max_age_seconds,
+            )
+        except Exception:
+            logger.warning(
+                "Sticky session lookup failed; continuing without sticky affinity key_hash=%s kind=%s",
+                _hash_identifier(sticky_key),
+                kind.value,
+                exc_info=True,
+            )
+            return None
+
+    async def _safe_upsert_sticky_session(
+        self,
+        sticky_repo: StickySessionsRepository,
+        sticky_key: str,
+        account_id: str,
+        *,
+        kind: StickySessionKind,
+    ) -> None:
+        try:
+            await sticky_repo.upsert(sticky_key, account_id, kind=kind)
+        except Exception:
+            logger.warning(
+                "Sticky session upsert failed; keeping selected account without persistence key_hash=%s "
+                "account_id=%s kind=%s",
+                _hash_identifier(sticky_key),
+                account_id,
+                kind.value,
+                exc_info=True,
+            )
+
+    async def _safe_delete_sticky_session(
+        self,
+        sticky_repo: StickySessionsRepository,
+        sticky_key: str,
+        *,
+        kind: StickySessionKind,
+    ) -> None:
+        try:
+            await sticky_repo.delete(sticky_key, kind=kind)
+        except Exception:
+            logger.warning(
+                "Sticky session delete failed; continuing without deleting stale affinity key_hash=%s kind=%s",
+                _hash_identifier(sticky_key),
+                kind.value,
+                exc_info=True,
+            )
 
     async def mark_rate_limit(self, account: Account, error: UpstreamError) -> None:
         lock = await self._get_account_lock(account.id)
@@ -926,6 +1135,7 @@ class LoadBalancer:
             deactivation_reason=account.deactivation_reason,
             plan_type=account.plan_type,
             capacity_credits=usage_core.capacity_for_plan(account.plan_type, "secondary"),
+            primary_drain_priority_enabled=bool(getattr(account, "primary_drain_priority_enabled", False)),
         )
 
     def _sync_runtime_state(
@@ -1059,6 +1269,7 @@ def _build_states(
     accounts: Iterable[Account],
     latest_primary: dict[str, UsageHistory],
     latest_secondary: dict[str, UsageHistory],
+    primary_drain_scores: dict[str, float],
     runtime: dict[str, RuntimeState],
     preferred_group_priorities: dict[str, int] | None = None,
 ) -> tuple[list[AccountState], dict[str, Account]]:
@@ -1072,6 +1283,7 @@ def _build_states(
             secondary_entry=latest_secondary.get(account.id),
             runtime=runtime.setdefault(account.id, RuntimeState()),
             group_priority_rank=_account_group_priority_rank(account, preferred_group_priorities),
+            primary_drain_score=primary_drain_scores.get(account.id, 0.0),
         )
         states.append(state)
         account_map[account.id] = account
@@ -1085,6 +1297,7 @@ def _state_from_account(
     secondary_entry: UsageHistory | None,
     runtime: RuntimeState,
     group_priority_rank: int = 1000000,
+    primary_drain_score: float = 0.0,
 ) -> AccountState:
     primary_used = primary_entry.used_percent if primary_entry else None
     primary_reset = primary_entry.reset_at if primary_entry else None
@@ -1235,7 +1448,71 @@ def _state_from_account(
         source_rank=account_routing_priority(account),
         configured_priority=account_configured_priority(account),
         health_tier=new_tier,
+        primary_drain_score=primary_drain_score,
+        primary_drain_priority_enabled=bool(getattr(account, "primary_drain_priority_enabled", False)),
     )
+
+
+def _build_primary_drain_scores(
+    histories_by_account: dict[str, list[UsageHistory]],
+    *,
+    now: datetime,
+) -> dict[str, float]:
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp() if now.tzinfo is None else now.timestamp())
+    since_epoch = now_epoch - (_PRIMARY_DRAIN_LOOKBACK_DAYS * 24 * 3600)
+    aligned_start = (since_epoch // _PRIMARY_DRAIN_BUCKET_SECONDS) * _PRIMARY_DRAIN_BUCKET_SECONDS
+    bucket_count = ((now_epoch - aligned_start) // _PRIMARY_DRAIN_BUCKET_SECONDS) + 1
+    scores: dict[str, float] = {}
+    for account_id, rows in histories_by_account.items():
+        bucket_usage = _primary_drain_bucket_usage(rows, aligned_start, bucket_count)
+        if not bucket_usage:
+            continue
+        recent_streak = 0
+        for used_percent in reversed(bucket_usage[:-1]):
+            if used_percent < _PRIMARY_DRAIN_FULL_BUCKET_THRESHOLD_PCT:
+                break
+            recent_streak += 1
+        latest_bucket_usage = bucket_usage[-1]
+        score = latest_bucket_usage + (recent_streak * 100.0)
+        if score > 0.0:
+            scores[account_id] = score
+    return scores
+
+
+def _primary_drain_bucket_usage(
+    rows: list[UsageHistory],
+    aligned_start_epoch: int,
+    bucket_count: int,
+) -> list[float]:
+    bucket_usage = [0.0 for _ in range(bucket_count)]
+    last_used_percent = 0.0
+    for row in sorted(rows, key=lambda entry: (_usage_recorded_epoch(entry), entry.id or 0)):
+        if row.recorded_at is None or row.used_percent is None:
+            continue
+        recorded_time = (
+            row.recorded_at if row.recorded_at.tzinfo is not None else row.recorded_at.replace(tzinfo=timezone.utc)
+        )
+        bucket_index = int((recorded_time.timestamp() - aligned_start_epoch) // _PRIMARY_DRAIN_BUCKET_SECONDS)
+        if bucket_index < 0 or bucket_index >= bucket_count:
+            continue
+        current_used_percent = max(0.0, min(100.0, float(row.used_percent)))
+        if current_used_percent >= last_used_percent:
+            bucket_usage[bucket_index] += current_used_percent - last_used_percent
+        else:
+            bucket_usage[bucket_index] += current_used_percent
+        last_used_percent = current_used_percent
+    return [max(0.0, min(100.0, value)) for value in bucket_usage]
+
+
+def _usage_recorded_epoch(entry: UsageHistory) -> float:
+    if entry.recorded_at is None:
+        return 0.0
+    recorded_time = (
+        entry.recorded_at
+        if entry.recorded_at.tzinfo is not None
+        else entry.recorded_at.replace(tzinfo=timezone.utc)
+    )
+    return recorded_time.timestamp()
 
 
 def _usage_entry_is_recent_enough(recorded_at: datetime | None) -> bool:
@@ -1444,6 +1721,9 @@ def _clone_selection_inputs(selection_inputs: SelectionInputs) -> SelectionInput
         latest_secondary={
             account_id: _clone_usage_history(entry) for account_id, entry in selection_inputs.latest_secondary.items()
         },
+        primary_drain_scores=(
+            None if selection_inputs.primary_drain_scores is None else dict(selection_inputs.primary_drain_scores)
+        ),
         runtime_accounts=(
             None
             if selection_inputs.runtime_accounts is None
@@ -1543,17 +1823,28 @@ def _select_account_preferring_budget_safe(
     deterministic_probe: bool = False,
 ) -> SelectionResult:
     state_list = list(states)
-    preferred_states = [state for state in state_list if not _state_above_budget_threshold(state, budget_threshold_pct)]
-    if preferred_states and len(preferred_states) != len(state_list):
-        preferred = select_account(
-            preferred_states,
+    if any(state.primary_drain_priority_enabled for state in state_list):
+        return select_account(
+            state_list,
             prefer_earlier_reset=prefer_earlier_reset,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
             deterministic_probe=deterministic_probe,
         )
-        if preferred.account is not None:
-            return preferred
+    if routing_strategy != "primary_drain":
+        preferred_states = [
+            state for state in state_list if not _state_above_budget_threshold(state, budget_threshold_pct)
+        ]
+        if preferred_states and len(preferred_states) != len(state_list):
+            preferred = select_account(
+                preferred_states,
+                prefer_earlier_reset=prefer_earlier_reset,
+                routing_strategy=routing_strategy,
+                allow_backoff_fallback=allow_backoff_fallback,
+                deterministic_probe=deterministic_probe,
+            )
+            if preferred.account is not None:
+                return preferred
     return select_account(
         state_list,
         prefer_earlier_reset=prefer_earlier_reset,
@@ -1575,3 +1866,7 @@ def _format_degraded_error_message(message: str | None) -> str:
     reason = degradation_status.get("reason") or "upstream capacity is currently unavailable"
     base_message = message or "Upstream unavailable"
     return f"{base_message}. Service is operating in degraded mode: {reason}"
+
+
+def _hash_identifier(value: str) -> str:
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]}"

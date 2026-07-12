@@ -1,4 +1,5 @@
 from app.core.balancer.logic import (
+    DEFAULT_ROUTING_STRATEGY,
     HEALTH_TIER_DRAINING,
     HEALTH_TIER_HEALTHY,
     HEALTH_TIER_PROBING,
@@ -18,6 +19,7 @@ from app.core.balancer.logic import (
 
 __all__ = [
     "PERMANENT_FAILURE_CODES",
+    "DEFAULT_ROUTING_STRATEGY",
     "HEALTH_TIER_DRAINING",
     "HEALTH_TIER_HEALTHY",
     "HEALTH_TIER_PROBING",

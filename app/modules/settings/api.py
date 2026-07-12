@@ -8,6 +8,7 @@ from fastapi import APIRouter, Body, Depends, Request
 
 from app.core.audit.service import AuditService
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
+from app.core.config.settings import get_settings as get_runtime_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.exceptions import DashboardBadRequestError
 from app.dependencies import SettingsContext, get_settings_context
@@ -75,6 +76,7 @@ async def get_settings(
     context: SettingsContext = Depends(get_settings_context),
 ) -> DashboardSettingsResponse:
     settings = await context.service.get_settings()
+    runtime_settings = get_runtime_settings()
     return DashboardSettingsResponse(
         sticky_threads_enabled=settings.sticky_threads_enabled,
         upstream_stream_transport=settings.upstream_stream_transport,
@@ -89,6 +91,8 @@ async def get_settings(
         totp_required_on_login=settings.totp_required_on_login,
         totp_configured=settings.totp_configured,
         api_key_auth_enabled=settings.api_key_auth_enabled,
+        news_refresh_enabled=runtime_settings.news_refresh_enabled,
+        scholar_refresh_enabled=runtime_settings.scholar_refresh_enabled,
     )
 
 
@@ -178,6 +182,7 @@ async def update_settings(
         actor_ip=request.client.host if request.client else None,
         details={"changed_fields": changed_fields},
     )
+    runtime_settings = get_runtime_settings()
     return DashboardSettingsResponse(
         sticky_threads_enabled=updated.sticky_threads_enabled,
         upstream_stream_transport=updated.upstream_stream_transport,
@@ -192,4 +197,6 @@ async def update_settings(
         totp_required_on_login=updated.totp_required_on_login,
         totp_configured=updated.totp_configured,
         api_key_auth_enabled=updated.api_key_auth_enabled,
+        news_refresh_enabled=runtime_settings.news_refresh_enabled,
+        scholar_refresh_enabled=runtime_settings.scholar_refresh_enabled,
     )

@@ -5,6 +5,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
+from app.core.utils.time import to_utc_naive
 from app.dependencies import ProxyContext, RequestLogsContext, get_proxy_context, get_request_logs_context
 from app.modules.request_logs.schemas import (
     RequestLogFilterOptionsResponse,
@@ -21,6 +22,12 @@ router = APIRouter(
 )
 
 _MODEL_OPTION_DELIMITER = ":::"
+
+
+def _normalize_query_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return to_utc_naive(value)
 
 
 def _parse_model_option(value: str) -> ServiceRequestLogModelOption | None:
@@ -59,8 +66,8 @@ async def list_request_logs(
         limit=limit,
         offset=offset,
         search=search,
-        since=since,
-        until=until,
+        since=_normalize_query_datetime(since),
+        until=_normalize_query_datetime(until),
         account_ids=account_id,
         model_options=parsed_options,
         models=model,
@@ -91,8 +98,8 @@ async def list_request_log_filter_options(
         parsed = [_parse_model_option(value) for value in model_option]
         parsed_options = [value for value in parsed if value is not None] or None
     options = await context.service.list_filter_options(
-        since=since,
-        until=until,
+        since=_normalize_query_datetime(since),
+        until=_normalize_query_datetime(until),
         account_ids=account_id,
         model_options=parsed_options,
         models=model,

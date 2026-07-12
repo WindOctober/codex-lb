@@ -33,6 +33,12 @@ class ApiKeyCache(Generic[_CacheValueT]):
             return entry.data
         return None
 
+    async def get_stale(self, key_hash: str) -> _CacheValueT | None:
+        entry = self._cache.get(key_hash)
+        if entry is None:
+            return None
+        return entry.data
+
     async def set(self, key_hash: str, data: _CacheValueT, *, if_version: int | None = None) -> None:
         async with self._lock:
             if if_version is not None and if_version != self._version:

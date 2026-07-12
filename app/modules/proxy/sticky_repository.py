@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -13,6 +14,8 @@ from sqlalchemy.sql import Insert
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, StickySession, StickySessionKind
 from app.modules.sticky_sessions.schemas import StickySessionSortBy, StickySessionSortDir
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,25 +58,33 @@ class StickySessionsRepository:
         return result.scalar_one_or_none()
 
     async def upsert(self, key: str, account_id: str, *, kind: StickySessionKind) -> StickySession:
-        statement = self._build_upsert_statement(key, account_id, kind)
-        await self._session.execute(statement)
-        await self._session.commit()
-        row = await self.get_entry(key, kind=kind)
-        if row is None:
-            raise RuntimeError(f"StickySession upsert failed for key={key!r} kind={kind.value!r}")
-        await self._session.refresh(row)
-        return row
+        try:
+            statement = self._build_upsert_statement(key, account_id, kind)
+            await self._session.execute(statement)
+            await self._session.commit()
+            row = await self.get_entry(key, kind=kind)
+            if row is None:
+                raise RuntimeError(f"StickySession upsert failed for key={key!r} kind={kind.value!r}")
+            await self._session.refresh(row)
+            return row
+        except Exception:
+            await self._rollback_after_failure("upsert", key=key, kind=kind)
+            raise
 
     async def delete(self, key: str, *, kind: StickySessionKind) -> bool:
         if not key:
             return False
-        statement = delete(StickySession).where(
-            StickySession.key == key,
-            StickySession.kind == kind,
-        )
-        result = await self._session.execute(statement.returning(StickySession.key))
-        await self._session.commit()
-        return result.scalar_one_or_none() is not None
+        try:
+            statement = delete(StickySession).where(
+                StickySession.key == key,
+                StickySession.kind == kind,
+            )
+            result = await self._session.execute(statement.returning(StickySession.key))
+            await self._session.commit()
+            return result.scalar_one_or_none() is not None
+        except Exception:
+            await self._rollback_after_failure("delete", key=key, kind=kind)
+            raise
 
     async def delete_entries(
         self,
@@ -88,6 +99,18 @@ class StickySessionsRepository:
         result = await self._session.execute(statement.returning(StickySession.key, StickySession.kind))
         await self._session.commit()
         return [(key, kind) for key, kind in result.all()]
+
+    async def _rollback_after_failure(self, operation: str, *, key: str, kind: StickySessionKind) -> None:
+        try:
+            await self._session.rollback()
+        except Exception:
+            logger.warning(
+                "Failed to rollback sticky session repository after %s failure key=%r kind=%s",
+                operation,
+                key,
+                kind.value,
+                exc_info=True,
+            )
 
     async def list_entry_identifiers(
         self,

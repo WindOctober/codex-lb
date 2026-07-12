@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from typing import cast
@@ -13,6 +14,8 @@ from app.core.middleware.firewall_cache import get_firewall_ip_cache
 from app.db.session import get_background_session
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
+
+logger = logging.getLogger(__name__)
 
 
 def add_api_firewall_middleware(app: FastAPI) -> None:
@@ -40,10 +43,19 @@ def add_api_firewall_middleware(app: FastAPI) -> None:
             is_allowed = cached_decision
         else:
             version_before_read = firewall_cache.version
-            async with get_background_session() as session:
-                repository = cast(FirewallRepositoryPort, FirewallRepository(session))
-                service = FirewallService(repository)
-                is_allowed = await service.is_ip_allowed(client_ip)
+            try:
+                async with get_background_session() as session:
+                    repository = cast(FirewallRepositoryPort, FirewallRepository(session))
+                    service = FirewallService(repository)
+                    is_allowed = await service.is_ip_allowed(client_ip)
+            except Exception:
+                logger.warning(
+                    "API firewall allowlist lookup failed; allowing request client_ip=%s path=%s",
+                    client_ip,
+                    path,
+                    exc_info=True,
+                )
+                is_allowed = True
             if client_ip is not None:
                 await firewall_cache.set(client_ip, is_allowed, if_version=version_before_read)
 

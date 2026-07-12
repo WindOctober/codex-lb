@@ -36,7 +36,13 @@ PLAN_TYPE_PRIORITY = (
 
 _RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "usage_limit_reached"})
 _QUOTA_CODES = frozenset({"insufficient_quota", "usage_not_included", "quota_exceeded"})
-_TRANSIENT_CODES = frozenset({"server_error", "upstream_error", "stream_incomplete"})
+_TRANSIENT_CODES = frozenset({"server_error", "server_is_overloaded", "upstream_error", "stream_incomplete"})
+_CONNECT_RETRYABLE_FORBIDDEN_CODES = frozenset({"forbidden", "insufficient_permissions", "permission_error"})
+_MODEL_CAPACITY_MESSAGES = frozenset(
+    {
+        "selected model is at capacity. please try a different model.",
+    }
+)
 
 
 def classify_upstream_failure(
@@ -49,8 +55,12 @@ def classify_upstream_failure(
     failure_class: FailureClass
     if error_code in _RATE_LIMIT_CODES:
         failure_class = "rate_limit"
+    elif _is_model_capacity_error(error):
+        failure_class = "rate_limit"
     elif error_code in _QUOTA_CODES:
         failure_class = "quota"
+    elif phase == "connect" and http_status == 403 and error_code in _CONNECT_RETRYABLE_FORBIDDEN_CODES:
+        failure_class = "retryable_transient"
     elif error_code in _TRANSIENT_CODES or (http_status is not None and http_status >= 500):
         failure_class = "retryable_transient"
     else:
@@ -62,6 +72,14 @@ def classify_upstream_failure(
         error=error,
         http_status=http_status,
     )
+
+
+def _is_model_capacity_error(error: UpstreamError) -> bool:
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    normalized = " ".join(message.split()).casefold()
+    return normalized in _MODEL_CAPACITY_MESSAGES
 
 
 def _header_account_id(account_id: str | None) -> str | None:

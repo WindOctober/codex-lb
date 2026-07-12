@@ -12,7 +12,6 @@ import os
 import socket
 import time
 from contextlib import asynccontextmanager
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
     AsyncContextManager,
@@ -36,6 +35,7 @@ from multidict import CIMultiDict
 from app.core.clients.http import get_http_client
 from app.core.clients.upstream import build_compact_responses_url, build_responses_url
 from app.core.config.settings import Settings, get_settings
+from app.core.egress import select_upstream_egress
 from app.core.errors import (
     OpenAIErrorDetail,
     OpenAIErrorEnvelope,
@@ -51,6 +51,18 @@ from app.core.openai.parsing import (
     parse_sse_event,
 )
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
+from app.core.openai.response_create import (
+    _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE as _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE,
+)
+from app.core.openai.response_create import (
+    _RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE as _RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE,
+)
+from app.core.openai.response_create import (
+    _response_create_too_large_error_envelope as _response_create_too_large_error_envelope,
+)
+from app.core.openai.response_create import (
+    _slim_response_create_payload_for_upstream as _slim_response_create_payload_for_upstream,
+)
 from app.core.resilience.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
@@ -58,7 +70,6 @@ from app.core.resilience.circuit_breaker import (
     get_circuit_breaker_for_account,
 )
 from app.core.types import JsonObject, JsonValue
-from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import format_sse_event
 
@@ -92,10 +103,6 @@ _IMAGE_INLINE_TIMEOUT_SECONDS = 8.0
 _BLOCKED_LITERAL_HOSTS = {"localhost", "localhost.localdomain"}
 _UPSTREAM_RESPONSE_CREATE_WARN_BYTES = 12 * 1024 * 1024
 _UPSTREAM_RESPONSE_CREATE_MAX_BYTES = 15 * 1024 * 1024
-_RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE = (
-    "[codex-lb omitted historical tool output ({bytes} bytes) to fit upstream websocket budget]"
-)
-_RESPONSE_CREATE_IMAGE_OMISSION_NOTICE = "[codex-lb omitted historical inline image to fit upstream websocket budget]"
 _UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
     {
         "accept",
@@ -1104,6 +1111,7 @@ async def _open_upstream_websocket(
     max_msg_size: int,
     account_id: str | None = None,
     hold_half_open_probe: bool = False,
+    proxy_url: str | None = None,
 ) -> tuple[AsyncContextManager[aiohttp.ClientWebSocketResponse], aiohttp.ClientWebSocketResponse]:
     settings = get_settings()
     circuit_breaker = get_circuit_breaker_for_account(account_id, settings) if account_id else None
@@ -1121,6 +1129,7 @@ async def _open_upstream_websocket(
                 autoping=True,
                 autoclose=True,
                 max_msg_size=max_msg_size,
+                proxy=proxy_url,
             )
             websocket = await asyncio.wait_for(websocket_cm.__aenter__(), timeout=connect_timeout_seconds)
             if hold_half_open_probe and is_probe and circuit_breaker is not None:
@@ -1151,6 +1160,7 @@ async def _open_upstream_websocket(
                 headers=request_headers,
                 timeout=timeout,
                 read_until_eof=False,
+                proxy=proxy_url,
             )
         except Exception as exc:
             if circuit_breaker is not None:
@@ -1305,6 +1315,7 @@ async def _stream_responses_via_websocket(
     max_event_bytes: int,
     raise_for_status: bool,
     account_id: str | None = None,
+    proxy_url: str | None = None,
 ) -> AsyncIterator[str]:
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
@@ -1345,6 +1356,7 @@ async def _stream_responses_via_websocket(
         max_msg_size=max_event_bytes,
         account_id=account_id,
         hold_half_open_probe=True,
+        proxy_url=proxy_url,
     )
 
     try:
@@ -1443,149 +1455,6 @@ def _prepare_websocket_response_create_payload(payload_dict: JsonObject) -> Json
         failure_phase="validation",
         failure_detail=f"response.create_bytes={payload_size}",
     )
-
-
-def _response_create_too_large_error_envelope(actual_bytes: int, max_bytes: int) -> OpenAIErrorEnvelope:
-    payload = openai_error(
-        "payload_too_large",
-        (
-            "response.create is too large for upstream websocket "
-            f"({actual_bytes} bytes > {max_bytes} bytes). "
-            "Reduce historical images/screenshots or compact the thread."
-        ),
-        error_type="invalid_request_error",
-    )
-    payload["error"]["param"] = "input"
-    return payload
-
-
-def _slim_response_create_payload_for_upstream(
-    payload: JsonObject,
-    *,
-    max_bytes: int,
-) -> tuple[JsonObject, dict[str, int] | None]:
-    del max_bytes
-    input_value = payload.get("input")
-    if not isinstance(input_value, list) or not input_value:
-        return payload, None
-
-    input_items = cast(list[JsonValue], deepcopy(input_value))
-    preserve_from = _response_create_recent_suffix_start(input_items)
-    historical = input_items[:preserve_from]
-    recent = input_items[preserve_from:]
-
-    tool_outputs_slimmed = 0
-    images_slimmed = 0
-
-    slimmed_historical: list[JsonValue] = []
-    for item in historical:
-        slimmed_item, item_tool_outputs_slimmed, item_images_slimmed = _slim_historical_response_input_item(item)
-        tool_outputs_slimmed += item_tool_outputs_slimmed
-        images_slimmed += item_images_slimmed
-        slimmed_historical.append(slimmed_item)
-
-    if tool_outputs_slimmed == 0 and images_slimmed == 0:
-        return payload, None
-
-    candidate_payload = dict(payload)
-    candidate_payload["input"] = slimmed_historical + recent
-    return candidate_payload, {
-        "historical_tool_outputs_slimmed": tool_outputs_slimmed,
-        "historical_images_slimmed": images_slimmed,
-    }
-
-
-def _response_create_recent_suffix_start(input_items: list[JsonValue]) -> int:
-    last_user_index: int | None = None
-    for index, item in enumerate(input_items):
-        if not is_json_mapping(item):
-            continue
-        if item.get("role") == "user":
-            last_user_index = index
-    if last_user_index is not None:
-        return last_user_index
-    return 0
-
-
-def _slim_historical_response_input_item(item: JsonValue) -> tuple[JsonValue, int, int]:
-    if not is_json_mapping(item):
-        return item, 0, 0
-
-    item_mapping = dict(cast(dict[str, JsonValue], deepcopy(item)))
-    tool_outputs_slimmed = 0
-    images_slimmed = 0
-
-    if item_mapping.get("type") == "function_call_output":
-        output = item_mapping.get("output")
-        output_text = output if isinstance(output, str) else None
-        if output_text is not None and _should_slim_historical_tool_output(output_text):
-            item_mapping["output"] = _RESPONSE_CREATE_TOOL_OUTPUT_OMISSION_NOTICE.format(
-                bytes=len(output_text.encode("utf-8"))
-            )
-            tool_outputs_slimmed += 1
-
-    content = item_mapping.get("content")
-    slimmed_content, content_images_slimmed = _slim_historical_response_content(content)
-    if content_images_slimmed > 0:
-        item_mapping["content"] = slimmed_content
-        images_slimmed += content_images_slimmed
-
-    if item_mapping.get("type") == "input_image" and _is_inline_image_reference(item_mapping.get("image_url")):
-        return _response_create_inline_image_notice_item(), tool_outputs_slimmed, images_slimmed + 1
-
-    return item_mapping, tool_outputs_slimmed, images_slimmed
-
-
-def _slim_historical_response_content(content: JsonValue) -> tuple[JsonValue, int]:
-    if is_json_mapping(content):
-        return _slim_historical_response_content_part(content)
-    if not isinstance(content, list):
-        return content, 0
-
-    slimmed_parts: list[JsonValue] = []
-    images_slimmed = 0
-    for part in content:
-        slimmed_part, part_images_slimmed = _slim_historical_response_content_part(part)
-        slimmed_parts.append(slimmed_part)
-        images_slimmed += part_images_slimmed
-    return slimmed_parts, images_slimmed
-
-
-def _slim_historical_response_content_part(part: JsonValue) -> tuple[JsonValue, int]:
-    if not is_json_mapping(part):
-        return part, 0
-
-    part_mapping = dict(cast(dict[str, JsonValue], deepcopy(part)))
-    part_type = part_mapping.get("type")
-    if part_type == "input_image" and _is_inline_image_reference(part_mapping.get("image_url")):
-        return _response_create_inline_image_notice_part(), 1
-
-    if part_type == "image_url":
-        image_url_value = part_mapping.get("image_url")
-        if is_json_mapping(image_url_value):
-            image_url = image_url_value.get("url")
-        else:
-            image_url = image_url_value
-        if _is_inline_image_reference(image_url):
-            return _response_create_inline_image_notice_part(), 1
-
-    return part_mapping, 0
-
-
-def _response_create_inline_image_notice_part() -> JsonObject:
-    return {"type": "input_text", "text": _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE}
-
-
-def _response_create_inline_image_notice_item() -> JsonObject:
-    return {"role": "user", "content": [_response_create_inline_image_notice_part()]}
-
-
-def _is_inline_image_reference(value: JsonValue) -> bool:
-    return isinstance(value, str) and value.startswith("data:image/")
-
-
-def _should_slim_historical_tool_output(output: str) -> bool:
-    return "data:image/" in output or len(output.encode("utf-8")) > 32 * 1024
 
 
 async def _inline_input_image_urls(
@@ -1883,6 +1752,8 @@ async def stream_responses(
     error_code: str | None = None
     error_message: str | None = None
     client_session = session or get_http_client().session
+    egress = select_upstream_egress() if session is None else None
+    upstream_proxy_url = egress.proxy_url if egress is not None else None
     payload_dict = payload.to_payload()
     if settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
@@ -1933,6 +1804,7 @@ async def stream_responses(
                 json=payload_dict,
                 headers=current_headers,
                 timeout=current_timeout,
+                proxy=upstream_proxy_url,
             ),
             settings=settings,
             account_id=account_id,
@@ -1989,6 +1861,7 @@ async def stream_responses(
                     max_event_bytes=settings.max_sse_event_bytes,
                     raise_for_status=raise_for_status,
                     account_id=account_id,
+                    proxy_url=upstream_proxy_url,
                 ):
                     if status_code is None:
                         status_code = 101
@@ -2264,6 +2137,7 @@ async def compact_responses(
         base_url=base_url,
         wire_api=wire_api or "codex",
         session=session or get_http_client().session,
+        proxy_url=None if session is not None else select_upstream_egress().proxy_url,
     )
     return await transport.execute()
 
@@ -2281,6 +2155,7 @@ class _CompactCommandTransport:
     base_url: str | None
     wire_api: str
     session: aiohttp.ClientSession
+    proxy_url: str | None = None
 
     async def execute(self) -> CompactResponsePayload:
         settings = get_settings()
@@ -2351,6 +2226,7 @@ class _CompactCommandTransport:
                     json=payload_dict,
                     headers=upstream_headers,
                     timeout=timeout,
+                    proxy=self.proxy_url,
                 ),
                 settings=settings,
                 account_id=self.account_id,
@@ -2525,6 +2401,8 @@ async def transcribe_audio(
         form.add_field("prompt", prompt)
 
     client_session = session or get_http_client().session
+    egress = select_upstream_egress() if session is None else None
+    upstream_proxy_url = egress.proxy_url if egress is not None else None
     started_at = time.monotonic()
     status_code: int | None = None
     error_code: str | None = None
@@ -2552,6 +2430,7 @@ async def transcribe_audio(
                 data=form,
                 headers=upstream_headers,
                 timeout=timeout,
+                proxy=upstream_proxy_url,
             ),
             settings=settings,
             account_id=account_id,

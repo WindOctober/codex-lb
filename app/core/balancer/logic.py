@@ -21,7 +21,8 @@ PERMANENT_FAILURE_CODES = {
 
 SECONDS_PER_DAY = 60 * 60 * 24
 UNKNOWN_RESET_BUCKET_DAYS = 10_000
-RoutingStrategy = Literal["usage_weighted", "round_robin", "capacity_weighted"]
+RoutingStrategy = Literal["usage_weighted", "capacity_weighted", "high_waterline", "primary_drain"]
+DEFAULT_ROUTING_STRATEGY: RoutingStrategy = "high_waterline"
 UNKNOWN_PLAN_FALLBACK = "free"
 CAPACITY_PLAN_ALIASES = {
     "education": "edu",
@@ -43,6 +44,9 @@ DRAIN_ERROR_WINDOW_SECONDS = 60.0
 DRAIN_ERROR_COUNT_THRESHOLD = 2
 PROBE_QUIET_SECONDS = 60.0
 PROBE_SUCCESS_STREAK_REQUIRED = 3
+RESET_PRIMER_MAX_USED_PERCENT = 0.0
+RESET_PRIMER_MIN_SECONDS_UNTIL_SECONDARY_RESET = SECONDS_PER_DAY
+RESET_PRIMER_SELECTION_COOLDOWN_SECONDS = 15 * 60.0
 
 
 @dataclass
@@ -63,14 +67,17 @@ class AccountState:
     capacity_credits: float | None = None
     group_priority_rank: int = 1000000
     source_rank: int = 0
-    configured_priority: int = 0
+    configured_priority: int = 100
     health_tier: int = 0
+    primary_drain_score: float = 0.0
+    primary_drain_priority_enabled: bool = False
 
 
 @dataclass
 class SelectionResult:
     account: AccountState | None
     error_message: str | None
+    retry_after_seconds: float | None = None
 
 
 def _usage_sort_key(state: AccountState) -> tuple[int, float, float, float, float, str]:
@@ -112,7 +119,7 @@ def select_account(
     now: float | None = None,
     *,
     prefer_earlier_reset: bool = False,
-    routing_strategy: RoutingStrategy = "capacity_weighted",
+    routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
     allow_backoff_fallback: bool = True,
     deterministic_probe: bool = False,
 ) -> SelectionResult:
@@ -130,8 +137,14 @@ def select_account(
         prefer_earlier_reset: Whether to bias selection toward accounts whose
             secondary quota window resets sooner.
         routing_strategy: Balancing strategy used to pick from the effective
-            pool (``"capacity_weighted"``, ``"round_robin"``, or
-            ``"usage_weighted"``).
+            pool (``"primary_drain"``, ``"high_waterline"``,
+            ``"capacity_weighted"``, or ``"usage_weighted"``).
+            Eligible starred accounts are selected before the configured
+            routing strategy runs. Primary-drain routes deterministically to
+            accounts with a recent primary-window drain signal and falls back
+            to capacity-weighted routing otherwise. High-waterline routes to a
+            meaningfully underused account when one exists and also falls back
+            to capacity-weighted routing otherwise.
         allow_backoff_fallback: Whether to allow a fallback attempt with the
             backoff account nearest to recovery when no fully available
             account exists.
@@ -218,15 +231,17 @@ def select_account(
                 return SelectionResult(None, "All accounts are paused")
             if deactivated and not rate_limited and not quota_exceeded:
                 return SelectionResult(None, "All accounts require re-authentication")
-            if quota_exceeded:
-                reset_candidates = [s.reset_at for s in quota_exceeded if s.reset_at]
-                if reset_candidates:
-                    wait_seconds = max(0, min(reset_candidates) - int(current))
-                    return SelectionResult(None, f"Rate limit exceeded. Try again in {wait_seconds:.0f}s")
+            reset_candidates = [s.reset_at for s in rate_limited if s.reset_at]
+            reset_candidates.extend(s.reset_at for s in quota_exceeded if s.reset_at)
             cooldowns = [s.cooldown_until for s in all_states if s.cooldown_until and s.cooldown_until > current]
-            if cooldowns:
-                wait_seconds = max(0.0, min(cooldowns) - current)
-                return SelectionResult(None, f"Rate limit exceeded. Try again in {wait_seconds:.0f}s")
+            recoverable_at = [float(value) for value in reset_candidates] + cooldowns
+            if recoverable_at:
+                wait_seconds = max(0.0, min(recoverable_at) - current)
+                return SelectionResult(
+                    None,
+                    f"Rate limit exceeded. Try again in {wait_seconds:.0f}s",
+                    retry_after_seconds=wait_seconds,
+                )
             return SelectionResult(None, "No available accounts")
 
     def _reset_first_sort_key(state: AccountState) -> tuple[int, float, int, float, float, float, str]:
@@ -234,32 +249,68 @@ def select_account(
         group_rank, source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
         return group_rank, source_rank, reset_bucket_days, secondary_used, primary_used, last_selected, account_id
 
-    def _round_robin_sort_key(state: AccountState) -> tuple[int, float, str]:
-        # Pick the least recently selected account, then stabilize by account_id.
-        return state.group_priority_rank, state.last_selected_at or 0.0, state.account_id
-
     healthy = [s for s in available if s.health_tier == HEALTH_TIER_HEALTHY]
     probing = [s for s in available if s.health_tier == HEALTH_TIER_PROBING]
     draining = [s for s in available if s.health_tier == HEALTH_TIER_DRAINING]
     effective_pool = healthy or probing or draining or available
+    starred_account = _select_starred_account(available)
+    if starred_account is not None:
+        return SelectionResult(starred_account, None)
+    reset_primer = _select_reset_primer_account(effective_pool, current)
+    if reset_primer is not None:
+        return SelectionResult(reset_primer, None)
 
-    if routing_strategy == "round_robin":
-        selected = min(effective_pool, key=_round_robin_sort_key)
-    elif routing_strategy == "capacity_weighted":
-        candidate_pool = (
-            _prefer_earlier_reset_candidates(effective_pool, current) if prefer_earlier_reset else effective_pool
+    if routing_strategy == "capacity_weighted":
+        selected = _select_capacity_weighted_from_pool(
+            effective_pool,
+            current=current,
+            prefer_earlier_reset=prefer_earlier_reset,
+            deterministic_probe=deterministic_probe,
         )
-        min_group_rank = min(state.group_priority_rank for state in candidate_pool)
-        candidate_pool = [state for state in candidate_pool if state.group_priority_rank == min_group_rank]
-        min_source_rank = min(state.source_rank for state in candidate_pool)
-        candidate_pool = [state for state in candidate_pool if state.source_rank == min_source_rank]
-        if deterministic_probe:
-            selected = min(candidate_pool, key=_capacity_probe_sort_key)
-        else:
-            selected = _select_capacity_weighted(candidate_pool)
+    elif routing_strategy == "primary_drain":
+        selected = _select_primary_drain_account(effective_pool)
+        if selected is None:
+            selected = _select_capacity_weighted_from_pool(
+                effective_pool,
+                current=current,
+                prefer_earlier_reset=prefer_earlier_reset,
+                deterministic_probe=deterministic_probe,
+            )
+    elif routing_strategy == "high_waterline":
+        selected = _select_high_waterline_account(effective_pool)
+        if selected is None:
+            selected = _select_capacity_weighted_from_pool(
+                effective_pool,
+                current=current,
+                prefer_earlier_reset=prefer_earlier_reset,
+                deterministic_probe=deterministic_probe,
+            )
     else:
         selected = min(effective_pool, key=_reset_first_sort_key if prefer_earlier_reset else _usage_sort_key)
     return SelectionResult(selected, None)
+
+
+def _min_group_source_candidates(available: list[AccountState]) -> list[AccountState]:
+    min_group_rank = min(state.group_priority_rank for state in available)
+    candidate_pool = [state for state in available if state.group_priority_rank == min_group_rank]
+    min_source_rank = min(state.source_rank for state in candidate_pool)
+    return [state for state in candidate_pool if state.source_rank == min_source_rank]
+
+
+def _select_capacity_weighted_from_pool(
+    available: list[AccountState],
+    *,
+    current: float,
+    prefer_earlier_reset: bool,
+    deterministic_probe: bool,
+) -> AccountState:
+    candidate_pool = _prefer_earlier_reset_candidates(available, current) if prefer_earlier_reset else available
+    if not candidate_pool:
+        candidate_pool = available
+    candidate_pool = _min_group_source_candidates(candidate_pool)
+    if deterministic_probe:
+        return min(candidate_pool, key=_capacity_probe_sort_key)
+    return _select_capacity_weighted(candidate_pool)
 
 
 def _remaining_secondary_credits(state: AccountState) -> float:
@@ -278,12 +329,125 @@ def _remaining_secondary_credits(state: AccountState) -> float:
     return max(0.0, capacity * (1.0 - min(used_pct, 100.0) / 100.0))
 
 
+def _configured_priority_weight_factor(state: AccountState) -> float:
+    configured_priority = state.configured_priority if state.configured_priority > 0 else 1
+    return 100.0 / float(configured_priority)
+
+
+def _capacity_selection_weight(state: AccountState) -> float:
+    return _remaining_secondary_credits(state) * _configured_priority_weight_factor(state)
+
+
+HIGH_WATERLINE_MARGIN_PCT = 1.0
+PRIMARY_DRAIN_MIN_SCORE = 1.0
+
+
+def _remaining_percent_for_waterline(state: AccountState) -> float:
+    if state.secondary_used_percent is not None:
+        used_percent = state.secondary_used_percent
+    elif state.used_percent is not None:
+        used_percent = state.used_percent
+    else:
+        used_percent = 0.0
+    return max(0.0, min(100.0, 100.0 - float(used_percent)))
+
+
+def _select_high_waterline_account(available: list[AccountState]) -> AccountState | None:
+    candidate_pool = _min_group_source_candidates(available)
+    if len(candidate_pool) < 2:
+        return None
+
+    average_remaining = sum(_remaining_percent_for_waterline(state) for state in candidate_pool) / len(candidate_pool)
+    selected = max(
+        candidate_pool,
+        key=lambda state: (
+            _remaining_percent_for_waterline(state),
+            -float(state.configured_priority if state.configured_priority > 0 else 1),
+            -(state.last_selected_at or 0.0),
+            state.account_id,
+        ),
+    )
+    if _remaining_percent_for_waterline(selected) < average_remaining + HIGH_WATERLINE_MARGIN_PCT:
+        return None
+    return selected
+
+
+def _select_starred_account(available: list[AccountState]) -> AccountState | None:
+    priority_pool = [state for state in available if state.primary_drain_priority_enabled]
+    if not priority_pool:
+        return None
+    priority_full_primary_pool = [
+        state
+        for state in priority_pool
+        if state.used_percent is not None and state.used_percent >= 100.0
+    ]
+    candidate_pool = _min_group_source_candidates(priority_full_primary_pool or priority_pool)
+    return min(
+        candidate_pool,
+        key=lambda state: (
+            -float(state.primary_drain_score),
+            -(state.used_percent if state.used_percent is not None else 0.0),
+            state.configured_priority if state.configured_priority > 0 else 1,
+            state.last_selected_at or 0.0,
+            state.account_id,
+        ),
+    )
+
+
+def _select_primary_drain_account(available: list[AccountState]) -> AccountState | None:
+    candidate_pool = _min_group_source_candidates(available)
+    selected = min(
+        candidate_pool,
+        key=lambda state: (
+            -float(state.primary_drain_score),
+            -(state.used_percent if state.used_percent is not None else 0.0),
+            state.configured_priority if state.configured_priority > 0 else 1,
+            state.last_selected_at or 0.0,
+            state.account_id,
+        ),
+    )
+    if selected.primary_drain_score < PRIMARY_DRAIN_MIN_SCORE:
+        return None
+    return selected
+
+
+def _select_reset_primer_account(available: list[AccountState], current: float) -> AccountState | None:
+    primer_candidates = [state for state in available if _is_reset_primer_candidate(state, current)]
+    if not primer_candidates:
+        return None
+    candidate_pool = _min_group_source_candidates(primer_candidates)
+    return min(
+        candidate_pool,
+        key=lambda state: (
+            state.last_selected_at or 0.0,
+            state.configured_priority if state.configured_priority > 0 else 1,
+            state.secondary_reset_at or float("inf"),
+            state.account_id,
+        ),
+    )
+
+
+def _is_reset_primer_candidate(state: AccountState, current: float) -> bool:
+    if state.secondary_used_percent is None or state.secondary_reset_at is None:
+        return False
+    if float(state.secondary_used_percent) > RESET_PRIMER_MAX_USED_PERCENT:
+        return False
+    if state.secondary_reset_at - current < RESET_PRIMER_MIN_SECONDS_UNTIL_SECONDARY_RESET:
+        return False
+    if (
+        state.last_selected_at is not None
+        and current - state.last_selected_at < RESET_PRIMER_SELECTION_COOLDOWN_SECONDS
+    ):
+        return False
+    return True
+
+
 def _capacity_probe_sort_key(state: AccountState) -> tuple[int, float, float, float, float, float, str]:
     group_rank, source_rank, secondary_used, primary_used, last_selected, account_id = _usage_sort_key(state)
     return (
         group_rank,
         source_rank,
-        -_remaining_secondary_credits(state),
+        -_capacity_selection_weight(state),
         secondary_used,
         primary_used,
         last_selected,
@@ -292,8 +456,8 @@ def _capacity_probe_sort_key(state: AccountState) -> tuple[int, float, float, fl
 
 
 def _select_capacity_weighted(available: list[AccountState]) -> AccountState:
-    """Select an account with probability proportional to remaining secondary credits."""
-    weights = [_remaining_secondary_credits(s) for s in available]
+    """Select an account with probability proportional to priority-adjusted remaining credits."""
+    weights = [_capacity_selection_weight(s) for s in available]
     total = sum(weights)
     if total <= 0.0:
         # All accounts exhausted — fall back to deterministic usage-weighted

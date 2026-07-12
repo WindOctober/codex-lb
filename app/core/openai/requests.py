@@ -314,7 +314,7 @@ class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = Field(min_length=1)
-    instructions: str
+    instructions: str = ""
     input: JsonValue
     tools: list[JsonValue] = Field(default_factory=list)
     tool_choice: str | JsonObject | None = None
@@ -323,7 +323,7 @@ class ResponsesRequest(BaseModel):
     store: bool = False
     stream: bool | None = None
     include: list[str] = Field(default_factory=list)
-    service_tier: str | None = None
+    service_tier: str | None = "default"
     conversation: str | None = None
     previous_response_id: str | None = None
     truncation: str | None = None
@@ -387,7 +387,7 @@ class ResponsesRequest(BaseModel):
     @classmethod
     def _normalize_service_tier_field(cls, value: str | None) -> str | None:
         if value is None:
-            return None
+            return "default"
         normalized = _normalize_service_tier_alias_value(value)
         return normalized if isinstance(normalized, str) else value
 
@@ -406,11 +406,11 @@ class ResponsesCompactRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = Field(min_length=1)
-    instructions: str
+    instructions: str = ""
     input: JsonValue
     reasoning: ResponsesReasoning | None = None
     store: bool = False
-    service_tier: str | None = None
+    service_tier: str | None = "default"
     prompt_cache_key: str | None = None
 
     @field_validator("input")
@@ -444,6 +444,14 @@ class ResponsesCompactRequest(BaseModel):
     @classmethod
     def _ensure_store_false(cls, value: bool) -> bool:
         return False
+
+    @field_validator("service_tier")
+    @classmethod
+    def _normalize_service_tier_field(cls, value: str | None) -> str | None:
+        if value is None:
+            return "default"
+        normalized = _normalize_service_tier_alias_value(value)
+        return normalized if isinstance(normalized, str) else value
 
     def to_payload(self) -> JsonObject:
         payload: MutableJsonObject = self.model_dump(mode="json", exclude_none=True)
@@ -570,7 +578,10 @@ def _normalize_service_tier_aliases(payload: MutableJsonObject) -> None:
 def _normalize_service_tier_alias_value(value: JsonValue) -> JsonValue:
     if not isinstance(value, str):
         return value
-    if value.strip().lower() == "fast":
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return "default"
+    if normalized == "fast":
         return "priority"
     return value
 

@@ -70,6 +70,21 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
 
 
 DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
+    "gpt-5.5": ModelPrice(
+        input_per_1m=5.0,
+        cached_input_per_1m=0.5,
+        output_per_1m=30.0,
+        priority_input_per_1m=12.5,
+        priority_cached_input_per_1m=1.25,
+        priority_output_per_1m=75.0,
+        flex_input_per_1m=2.5,
+        flex_cached_input_per_1m=0.25,
+        flex_output_per_1m=15.0,
+        long_context_threshold_tokens=272_000,
+        long_context_input_per_1m=10.0,
+        long_context_cached_input_per_1m=1.0,
+        long_context_output_per_1m=45.0,
+    ),
     "gpt-5.4": ModelPrice(
         input_per_1m=2.5,
         cached_input_per_1m=0.25,
@@ -207,9 +222,31 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         priority_cached_input_per_1m=0.25,
         priority_output_per_1m=20.0,
     ),
+    # OpenAI Images token-based pricing (per 1M tokens, USD).
+    "gpt-image-2": ModelPrice(
+        input_per_1m=5.0,
+        cached_input_per_1m=2.0,
+        output_per_1m=30.0,
+    ),
+    "gpt-image-1.5": ModelPrice(
+        input_per_1m=5.0,
+        cached_input_per_1m=2.0,
+        output_per_1m=30.0,
+    ),
+    "gpt-image-1": ModelPrice(
+        input_per_1m=5.0,
+        cached_input_per_1m=2.0,
+        output_per_1m=30.0,
+    ),
+    "gpt-image-1-mini": ModelPrice(
+        input_per_1m=5.0,
+        cached_input_per_1m=2.0,
+        output_per_1m=30.0,
+    ),
 }
 
 DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "gpt-5.5*": "gpt-5.5",
     "gpt-5.4-pro*": "gpt-5.4-pro",
     "gpt-5.4-mini*": "gpt-5.4-mini",
     "gpt-5.4-nano*": "gpt-5.4-nano",
@@ -228,6 +265,10 @@ DEFAULT_MODEL_ALIASES: dict[str, str] = {
     "gpt-5.1-codex-mini*": "gpt-5.1-codex-mini",
     "gpt-5.1-codex*": "gpt-5.1-codex",
     "gpt-5-codex*": "gpt-5-codex",
+    "gpt-image-2*": "gpt-image-2",
+    "gpt-image-1.5*": "gpt-image-1.5",
+    "gpt-image-1-mini*": "gpt-image-1-mini",
+    "gpt-image-1*": "gpt-image-1",
 }
 
 

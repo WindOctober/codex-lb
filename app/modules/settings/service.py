@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.modules.accounts.repository import AccountsRepository
 from app.modules.settings.repository import SettingsRepository
 
 
@@ -39,8 +40,9 @@ class DashboardSettingsUpdateData:
 
 
 class SettingsService:
-    def __init__(self, repository: SettingsRepository) -> None:
+    def __init__(self, repository: SettingsRepository, accounts_repository: AccountsRepository | None = None) -> None:
         self._repository = repository
+        self._accounts_repository = accounts_repository
 
     async def get_settings(self) -> DashboardSettingsData:
         row = await self._repository.get_or_create()

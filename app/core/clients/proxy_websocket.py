@@ -23,6 +23,7 @@ from app.core.clients.proxy import ProxyResponseError, filter_inbound_headers
 from app.core.clients.proxy import stream_responses as upstream_stream_responses
 from app.core.clients.upstream import build_responses_url
 from app.core.config.settings import get_settings
+from app.core.egress import select_upstream_egress
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.openai.parsing import parse_error_payload
 from app.core.openai.requests import ResponsesRequest
@@ -278,6 +279,7 @@ async def connect_responses_websocket(
     origin = cast(Origin | None, _pop_header_case_insensitive(upstream_headers, "origin"))
     user_agent = _pop_header_case_insensitive(upstream_headers, "user-agent")
     _ = session
+    egress = select_upstream_egress()
 
     try:
         response = await websocket_connect(
@@ -285,7 +287,7 @@ async def connect_responses_websocket(
             origin=origin,
             additional_headers=upstream_headers or None,
             user_agent_header=user_agent,
-            proxy=True if settings.upstream_websocket_trust_env else None,
+            proxy=egress.proxy_url,
             open_timeout=settings.upstream_connect_timeout_seconds,
             max_size=settings.max_sse_event_bytes,
         )

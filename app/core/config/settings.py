@@ -135,6 +135,14 @@ class Settings(BaseSettings):
     upstream_connect_timeout_seconds: float = 8.0
     upstream_compact_timeout_seconds: float | None = None
     upstream_websocket_trust_env: bool = False
+    upstream_egress_mode: Literal["direct", "proxy", "auto"] = "auto"
+    upstream_proxy_url: str | None = None
+    upstream_egress_probe_url: str = "https://api.openai.com/v1/models"
+    upstream_egress_probe_interval_seconds: float = Field(default=5.0, gt=0.0)
+    upstream_egress_fail_threshold: int = Field(default=3, ge=1)
+    upstream_egress_recover_threshold: int = Field(default=3, ge=1)
+    upstream_egress_cooldown_seconds: float = Field(default=60.0, ge=0.0)
+    upstream_egress_probe_timeout_seconds: float = Field(default=8.0, gt=0.0)
     proxy_request_budget_seconds: float = Field(default=240.0, gt=0)
     proxy_reconnect_request_budget_seconds: float = Field(default=240.0, gt=0)
     compact_request_budget_seconds: float = Field(default=75.0, gt=0)
@@ -166,10 +174,15 @@ class Settings(BaseSettings):
     http_responses_session_bridge_idle_ttl_seconds: float = Field(default=120.0, gt=0)
     http_responses_session_bridge_codex_idle_ttl_seconds: float = Field(default=900.0, gt=0)
     http_responses_session_bridge_codex_prewarm_enabled: bool = False
-    http_responses_session_bridge_max_sessions: int = Field(default=256, gt=0)
+    http_responses_session_bridge_max_sessions: int = Field(default=0, ge=0)
     http_responses_session_bridge_queue_limit: int = Field(default=0, ge=0)
     http_responses_session_bridge_soft_shard_pending_limit: int = Field(default=1, ge=1)
     http_responses_session_bridge_soft_shard_max_shards: int = Field(default=64, ge=1)
+    http_responses_session_bridge_pressure_eviction_enabled: bool = True
+    http_responses_session_bridge_pressure_eviction_threshold_percent: float = Field(default=80.0, gt=0.0, le=100.0)
+    http_responses_session_bridge_pressure_eviction_batch_window_seconds: float = Field(default=120.0, gt=0.0)
+    http_responses_session_bridge_pressure_eviction_min_batch_sessions: int = Field(default=16, ge=1)
+    http_responses_session_bridge_pressure_eviction_min_idle_seconds: float = Field(default=30.0, ge=0.0)
     http_responses_session_bridge_gateway_safe_mode: bool = False
     http_responses_session_bridge_instance_id: str = Field(default_factory=_default_http_bridge_instance_id)
     http_responses_session_bridge_instance_ring: Annotated[list[str], NoDecode] = Field(default_factory=list)
@@ -188,12 +201,21 @@ class Settings(BaseSettings):
     max_decompressed_body_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     image_inline_fetch_enabled: bool = True
     image_inline_allowed_hosts: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # OpenAI Images API compatibility (POST /v1/images/{generations,edits}).
+    # The host model is used internally to invoke the Responses image_generation
+    # tool; callers only see the public gpt-image-* model.
+    images_host_model: str = "gpt-5.5"
+    images_default_model: str = "gpt-image-2"
+    images_max_partial_images: int = Field(default=3, ge=0, le=3)
     model_registry_enabled: bool = False
     model_registry_refresh_interval_seconds: int = Field(default=300, gt=0)
     api_provider_model_refresh_enabled: bool = False
     news_refresh_enabled: bool = False
     trendradar_refresh_enabled: bool = False
     scholar_refresh_enabled: bool = False
+    codex_reset_forecast_refresh_enabled: bool = True
+    codex_reset_forecast_refresh_interval_seconds: int = Field(default=43200, gt=0)
+    codex_reset_forecast_initial_delay_seconds: int = Field(default=5, ge=0)
     model_registry_client_version: str = "0.150.0"
     model_context_window_overrides: Annotated[dict[str, int], NoDecode] = Field(default_factory=dict)
     proxy_unauthenticated_client_cidrs: Annotated[list[str], NoDecode] = Field(default_factory=list)
@@ -244,6 +266,9 @@ class Settings(BaseSettings):
     proxy_upstream_websocket_connect_limit: int = Field(default=128, ge=0)
     proxy_response_create_limit: int = Field(default=256, ge=0)
     proxy_compact_response_create_limit: int = Field(default=64, ge=0)
+    proxy_account_model_concurrency_limit: int = Field(default=48, ge=0)
+    proxy_http_bridge_account_model_connect_limit: int = Field(default=20, ge=0)
+    proxy_http_bridge_account_model_session_limit: int = Field(default=20, ge=0)
     proxy_admission_wait_timeout_seconds: float = Field(default=10.0, gt=0)
     proxy_refresh_failure_cooldown_seconds: float = Field(default=5.0, ge=0.0)
     usage_refresh_auth_failure_cooldown_seconds: float = Field(default=300.0, ge=0.0)
@@ -358,6 +383,16 @@ class Settings(BaseSettings):
             return stripped or None
         raise TypeError("http_responses_session_bridge_advertise_base_url must be a string")
 
+    @field_validator("upstream_proxy_url", mode="before")
+    @classmethod
+    def _normalize_upstream_proxy_url(cls, value: OptionalStringInput) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        raise TypeError("upstream_proxy_url must be a string")
+
     @field_validator("model_context_window_overrides", mode="before")
     @classmethod
     def _parse_model_context_window_overrides(cls, value: ModelContextWindowOverridesInput) -> dict[str, int]:
@@ -405,6 +440,19 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "http_responses_session_bridge_advertise_base_url must be replica-specific for bridge routing"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_upstream_egress_configuration(self) -> "Settings":
+        if self.upstream_egress_mode == "proxy" and self.upstream_proxy_url is None:
+            raise ValueError("upstream_egress_mode=proxy requires upstream_proxy_url")
+        if self.upstream_proxy_url is not None:
+            parsed = urlparse(self.upstream_proxy_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("upstream_proxy_url must be an absolute http(s) proxy URL")
+        parsed_probe = urlparse(self.upstream_egress_probe_url)
+        if parsed_probe.scheme not in {"http", "https"} or not parsed_probe.netloc:
+            raise ValueError("upstream_egress_probe_url must be an absolute http(s) URL")
         return self
 
     @model_validator(mode="after")

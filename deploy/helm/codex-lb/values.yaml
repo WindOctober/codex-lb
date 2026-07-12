@@ -153,11 +153,11 @@ config:
   # @param config.sessionBridgeCodexIdleTtlSeconds Idle TTL for Codex session bridge sessions
   sessionBridgeCodexIdleTtlSeconds: 900
   # @param config.sessionBridgeCodexPrewarmEnabled Proactively open upstream WebSocket for Codex sessions
-  sessionBridgeCodexPrewarmEnabled: true
-  # @param config.sessionBridgeMaxSessions Max in-memory bridge sessions per pod
-  sessionBridgeMaxSessions: 256
-  # @param config.sessionBridgeQueueLimit Max pending requests per bridge session
-  sessionBridgeQueueLimit: 8
+  sessionBridgeCodexPrewarmEnabled: false
+  # @param config.sessionBridgeMaxSessions Max in-memory bridge sessions per pod; 0 disables the local cap
+  sessionBridgeMaxSessions: 0
+  # @param config.sessionBridgeQueueLimit Max pending requests per bridge session; 0 disables the local per-session cap
+  sessionBridgeQueueLimit: 0
   # @param config.sessionBridgeInstanceRing Comma-separated pod hostnames for session routing
   sessionBridgeInstanceRing: ""
   # @param config.sessionBridgeAdvertiseBaseUrl Optional explicit owner-handoff base URL. Empty = auto-advertise headless-service DNS for the current pod

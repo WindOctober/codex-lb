@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import cast as typing_cast
 
 import anyio
@@ -18,6 +18,28 @@ from app.db.models import Account, ApiKey, RequestLog
 
 
 @dataclass(frozen=True, slots=True)
+class RequestLatencyHistoryBucket:
+    bucket_start: datetime
+    latency_first_token_p50_ms: int | None
+    latency_first_token_p95_ms: int | None
+    success_count: int
+    error_count: int
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class RequestLatencyHealthSnapshot:
+    anchor_at: datetime | None
+    latency_first_token_p50_ms: int | None
+    latency_first_token_p95_ms: int | None
+    latency_first_token_p99_ms: int | None
+    success_rate_percent: float | None
+    success_count: int
+    request_count: int
+    history: list[RequestLatencyHistoryBucket]
+
+
+@dataclass(frozen=True, slots=True)
 class _RequestLogFilters:
     conditions: list
     needs_related_search_joins: bool
@@ -30,6 +52,79 @@ class RequestLogsRepository:
     async def list_since(self, since: datetime) -> list[RequestLog]:
         result = await self._session.execute(select(RequestLog).where(RequestLog.requested_at >= since))
         return list(result.scalars().all())
+
+    async def bridge_latency_health_snapshot(
+        self,
+        *,
+        latency_window_minutes: int = 60,
+        availability_window_minutes: int = 10_080,
+        history_bucket_count: int = 60,
+    ) -> RequestLatencyHealthSnapshot:
+        anchor_result = await self._session.execute(select(func.max(RequestLog.requested_at)))
+        anchor_at = anchor_result.scalar_one_or_none()
+        if anchor_at is None:
+            return RequestLatencyHealthSnapshot(
+                anchor_at=None,
+                latency_first_token_p50_ms=None,
+                latency_first_token_p95_ms=None,
+                latency_first_token_p99_ms=None,
+                success_rate_percent=None,
+                success_count=0,
+                request_count=0,
+                history=[],
+            )
+
+        latency_since = anchor_at - timedelta(minutes=max(1, latency_window_minutes))
+        availability_since = anchor_at - timedelta(minutes=max(1, availability_window_minutes))
+        latency_rows = await self._session.execute(
+            select(
+                RequestLog.requested_at,
+                RequestLog.latency_first_token_ms,
+                RequestLog.status,
+            ).where(
+                RequestLog.requested_at >= latency_since,
+                RequestLog.requested_at <= anchor_at,
+                or_(
+                    RequestLog.latency_first_token_ms.is_not(None),
+                    RequestLog.status != "success",
+                ),
+            )
+        )
+        rows = [
+            (row.requested_at, row.latency_first_token_ms, row.status)
+            for row in latency_rows.all()
+            if isinstance(row.requested_at, datetime)
+        ]
+        latencies = sorted(
+            int(latency_ms)
+            for _requested_at, latency_ms, status in rows
+            if status == "success" and isinstance(latency_ms, int)
+        )
+
+        availability_result = await self._session.execute(
+            select(
+                func.count(RequestLog.id).label("request_count"),
+                func.coalesce(func.sum(cast(RequestLog.status == "success", Integer)), 0).label("success_count"),
+            ).where(
+                RequestLog.requested_at >= availability_since,
+                RequestLog.requested_at <= anchor_at,
+            )
+        )
+        availability = availability_result.one()
+        request_count = int(availability.request_count or 0)
+        success_count = int(availability.success_count or 0)
+        success_rate_percent = round(success_count / request_count * 100.0, 2) if request_count > 0 else None
+
+        return RequestLatencyHealthSnapshot(
+            anchor_at=anchor_at,
+            latency_first_token_p50_ms=_percentile_int(latencies, 0.50),
+            latency_first_token_p95_ms=_percentile_int(latencies, 0.95),
+            latency_first_token_p99_ms=_percentile_int(latencies, 0.99),
+            success_rate_percent=success_rate_percent,
+            success_count=success_count,
+            request_count=request_count,
+            history=_build_latency_history(rows, anchor_at=anchor_at, bucket_count=history_bucket_count),
+        )
 
     async def find_latest_account_id_for_response_id(
         self,
@@ -220,6 +315,25 @@ class RequestLogsRepository:
             return log
         except sa_exc.ResourceClosedError:
             return log
+        except BaseException:
+            await _safe_rollback(self._session)
+            raise
+
+    async def update_model_for_request(self, request_id: str, model: str) -> int:
+        """Override the model field of request-log rows matching request_id."""
+        resolved_request_id = ensure_request_id(request_id)
+        try:
+            result = await self._session.execute(select(RequestLog).where(RequestLog.request_id == resolved_request_id))
+            logs = list(result.scalars())
+            if not logs:
+                return 0
+            for log in logs:
+                log.model = model
+                log.cost_usd = calculated_cost_from_log(typing_cast(RequestLogLike, log))
+            await self._session.commit()
+            return len(logs)
+        except sa_exc.ResourceClosedError:
+            return 0
         except BaseException:
             await _safe_rollback(self._session)
             raise
@@ -458,3 +572,78 @@ async def _safe_rollback(session: AsyncSession) -> None:
             await session.rollback()
     except BaseException:
         return
+
+
+def _percentile_int(values: list[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    clamped = min(1.0, max(0.0, percentile))
+    index = round((len(values) - 1) * clamped)
+    return values[index]
+
+
+def _latency_bucket_status(
+    *,
+    latency_first_token_p50_ms: int | None,
+    latency_first_token_p95_ms: int | None,
+    success_count: int,
+    error_count: int,
+) -> str:
+    if success_count == 0 and error_count == 0:
+        return "empty"
+    total_count = success_count + error_count
+    error_rate = error_count / total_count if total_count > 0 else 0.0
+    if error_rate >= 0.2 or (latency_first_token_p95_ms is not None and latency_first_token_p95_ms >= 30_000):
+        return "critical"
+    if error_rate >= 0.05 or (latency_first_token_p50_ms is not None and latency_first_token_p50_ms >= 10_000):
+        return "warning"
+    return "ok"
+
+
+def _build_latency_history(
+    rows: list[tuple[datetime, int | None, str]],
+    *,
+    anchor_at: datetime,
+    bucket_count: int,
+) -> list[RequestLatencyHistoryBucket]:
+    count = max(1, min(bucket_count, 120))
+    anchor_minute = anchor_at.replace(second=0, microsecond=0)
+    starts = [anchor_minute - timedelta(minutes=count - 1 - index) for index in range(count)]
+    grouped: dict[datetime, list[tuple[int | None, str]]] = {start: [] for start in starts}
+    earliest = starts[0]
+    for requested_at, latency_ms, status in rows:
+        bucket_start = requested_at.replace(second=0, microsecond=0)
+        if bucket_start < earliest or bucket_start > anchor_minute:
+            continue
+        grouped.setdefault(bucket_start, []).append((latency_ms, status))
+
+    buckets: list[RequestLatencyHistoryBucket] = []
+    for bucket_start in starts:
+        items = grouped.get(bucket_start, [])
+        success_latencies = sorted(
+            int(latency_ms)
+            for latency_ms, status in items
+            if status == "success" and isinstance(latency_ms, int)
+        )
+        success_count = sum(1 for _latency_ms, status in items if status == "success")
+        error_count = len(items) - success_count
+        p50 = _percentile_int(success_latencies, 0.50)
+        p95 = _percentile_int(success_latencies, 0.95)
+        buckets.append(
+            RequestLatencyHistoryBucket(
+                bucket_start=bucket_start,
+                latency_first_token_p50_ms=p50,
+                latency_first_token_p95_ms=p95,
+                success_count=success_count,
+                error_count=error_count,
+                status=_latency_bucket_status(
+                    latency_first_token_p50_ms=p50,
+                    latency_first_token_p95_ms=p95,
+                    success_count=success_count,
+                    error_count=error_count,
+                ),
+            )
+        )
+    return buckets
