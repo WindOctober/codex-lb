@@ -76,8 +76,8 @@ def _account_to_summary(
     )
     weekly_only_usage = (
         effective_primary_usage is None
-        and primary_usage is not None
-        and usage_core.is_weekly_window_minutes(primary_usage.window_minutes)
+        and effective_secondary_usage is not None
+        and usage_core.is_weekly_window_minutes(effective_secondary_usage.window_minutes)
     )
     # Keep account payload aligned with UI semantics: weekly-only plans expose
     # their quota as secondary/7d and omit primary/5h fields.

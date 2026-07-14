@@ -254,7 +254,7 @@ class TestRetryHelperPreservesPreviousResponseId:
         request_state = _make_request_state(previous_response_id="resp_xyz789")
 
         reconnect_mock = AsyncMock()
-        monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect_mock)
+        monkeypatch.setattr(service, "_reconnect_http_bridge_session_locked", reconnect_mock)
 
         result = await service._retry_http_bridge_request_on_fresh_upstream(
             session=session,
@@ -287,7 +287,7 @@ class TestRetryHelperPreservesPreviousResponseId:
 
         send_text = AsyncMock()
         session.upstream = cast(Any, SimpleNamespace(send_text=send_text, close=AsyncMock()))
-        monkeypatch.setattr(service, "_reconnect_http_bridge_session", AsyncMock())
+        monkeypatch.setattr(service, "_reconnect_http_bridge_session_locked", AsyncMock())
 
         result = await service._retry_http_bridge_request_on_fresh_upstream(
             session=session,
@@ -301,6 +301,8 @@ class TestRetryHelperPreservesPreviousResponseId:
         assert request_state.previous_response_id is None
         assert request_state.proxy_injected_previous_response_id is False
         assert request_state.request_text == '{"type":"response.create","input":"hello"}'
+        proxy_service._release_websocket_response_create_gate(request_state, session.response_create_gate)
+        service._release_request_account_model_concurrency(request_state)
 
 
 class TestContextGrowthScenarios:

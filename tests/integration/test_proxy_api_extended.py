@@ -11,6 +11,7 @@ from app.core.auth import generate_unique_account_id
 from app.core.clients.proxy import ProxyResponseError
 from app.db.models import Account, AccountStatus, RequestLog
 from app.db.session import SessionLocal
+from app.dependencies import get_proxy_service_for_app
 
 pytestmark = pytest.mark.integration
 
@@ -97,7 +98,7 @@ async def test_proxy_compact_upstream_error_propagates(async_client, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_proxy_stream_records_cached_and_reasoning_tokens(async_client, monkeypatch):
+async def test_proxy_stream_records_cached_and_reasoning_tokens(async_client, app_instance, monkeypatch):
     expected_account_id = await _import_account(async_client, "acc_usage", "usage@example.com")
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
@@ -125,6 +126,7 @@ async def test_proxy_stream_records_cached_and_reasoning_tokens(async_client, mo
 
     event = _extract_first_event(lines)
     assert event["type"] == "response.completed"
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         result = await session.execute(
@@ -143,7 +145,7 @@ async def test_proxy_stream_records_cached_and_reasoning_tokens(async_client, mo
 
 
 @pytest.mark.asyncio
-async def test_proxy_stream_retries_rate_limit_then_success(async_client, monkeypatch):
+async def test_proxy_stream_retries_rate_limit_then_success(async_client, app_instance, monkeypatch):
     expected_account_id_1 = await _import_account(async_client, "acc_1", "one@example.com")
     expected_account_id_2 = await _import_account(async_client, "acc_2", "two@example.com")
 
@@ -174,6 +176,7 @@ async def test_proxy_stream_retries_rate_limit_then_success(async_client, monkey
 
     event = _extract_first_event(lines)
     assert event["type"] == "response.completed"
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
@@ -195,7 +198,7 @@ async def test_proxy_stream_retries_rate_limit_then_success(async_client, monkey
 
 
 @pytest.mark.asyncio
-async def test_proxy_stream_does_not_retry_stream_idle_timeout(async_client, monkeypatch):
+async def test_proxy_stream_does_not_retry_stream_idle_timeout(async_client, app_instance, monkeypatch):
     await _import_account(async_client, "acc_idle_1", "idle-one@example.com")
     await _import_account(async_client, "acc_idle_2", "idle-two@example.com")
 
@@ -220,6 +223,7 @@ async def test_proxy_stream_does_not_retry_stream_idle_timeout(async_client, mon
     event = _extract_first_event(lines)
     assert event["type"] == "response.failed"
     assert event["response"]["error"]["code"] == "stream_idle_timeout"
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
@@ -275,7 +279,7 @@ async def test_proxy_stream_drops_forwarded_headers(async_client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxy_stream_usage_limit_returns_http_error(async_client, monkeypatch):
+async def test_proxy_stream_usage_limit_returns_http_error(async_client, app_instance, monkeypatch):
     expected_account_id = await _import_account(async_client, "acc_limit", "limit@example.com")
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
@@ -302,6 +306,7 @@ async def test_proxy_stream_usage_limit_returns_http_error(async_client, monkeyp
     assert error["type"] == "usage_limit_reached"
     assert error["plan_type"] == "plus"
     assert error["resets_at"] == 1767612327
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         acc = await session.get(Account, expected_account_id)

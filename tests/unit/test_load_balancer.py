@@ -765,6 +765,7 @@ def _make_test_usage(
     used_percent: float = 10.0,
     reset_at: int | None = None,
     recorded_at: datetime | None = None,
+    window_minutes: int | None = None,
 ) -> UsageHistory:
     return UsageHistory(
         id=1,
@@ -773,7 +774,7 @@ def _make_test_usage(
         window=window,
         used_percent=used_percent,
         reset_at=reset_at,
-        window_minutes=10080,
+        window_minutes=window_minutes if window_minutes is not None else (300 if window == "primary" else 10080),
     )
 
 
@@ -781,6 +782,110 @@ def _epoch_to_naive_utc(epoch: float) -> datetime:
     from datetime import timezone
 
     return datetime.fromtimestamp(epoch, timezone.utc).replace(tzinfo=None)
+
+
+def test_state_from_account_ignores_full_primary_when_override_is_enabled() -> None:
+    account = _make_test_account()
+    primary = _make_test_usage(
+        window="primary",
+        used_percent=100.0,
+        window_minutes=300,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+        primary_drain_score=250.0,
+        ignore_five_hour_limit=True,
+    )
+
+    assert state.status == AccountStatus.ACTIVE
+    assert state.used_percent is None
+    assert state.primary_drain_score == 0.0
+
+
+def test_state_from_account_override_clears_unmarked_stale_rate_limit() -> None:
+    account = _make_test_account(status=AccountStatus.RATE_LIMITED, reset_at=1_800_000_000)
+    primary = _make_test_usage(
+        window="primary",
+        used_percent=100.0,
+        window_minutes=300,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+        ignore_five_hour_limit=True,
+    )
+
+    assert state.status == AccountStatus.ACTIVE
+    assert state.reset_at is None
+
+
+def test_state_from_account_override_preserves_explicit_rate_limit_block() -> None:
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=1_800_000_000,
+        blocked_at=1_700_000_000,
+    )
+    primary = _make_test_usage(
+        window="primary",
+        used_percent=100.0,
+        window_minutes=300,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+        ignore_five_hour_limit=True,
+    )
+
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.blocked_at == 1_700_000_000
+
+
+def test_state_from_account_override_still_enforces_weekly_quota() -> None:
+    account = _make_test_account()
+    secondary = _make_test_usage(
+        window="secondary",
+        used_percent=100.0,
+        window_minutes=10080,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=None,
+        secondary_entry=secondary,
+        runtime=RuntimeState(),
+        ignore_five_hour_limit=True,
+    )
+
+    assert state.status == AccountStatus.QUOTA_EXCEEDED
+
+
+def test_state_from_account_weekly_primary_is_not_treated_as_five_hour_limit() -> None:
+    account = _make_test_account()
+    weekly_primary = _make_test_usage(
+        window="primary",
+        used_percent=100.0,
+        window_minutes=10080,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=weekly_primary,
+        secondary_entry=None,
+        runtime=RuntimeState(),
+    )
+
+    assert state.status == AccountStatus.QUOTA_EXCEEDED
+    assert state.secondary_used_percent == 100.0
 
 
 def test_state_from_account_recovers_quota_exceeded_on_restart_without_blocked_at_when_usage_shows_new_reset_window(

@@ -27,7 +27,7 @@ from app.modules.proxy.types import (
 )
 from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
 from app.modules.usage.latest_model import get_latest_model_quota_key
-from app.modules.usage.updater import UsageUpdater
+from app.modules.usage.updater import UsageUpdater, background_usage_refresh_repo_context
 
 
 class _RateLimitRuntimeService(Protocol):
@@ -128,7 +128,12 @@ class _RateLimitRuntimeMixin:
         accounts: list[Account],
     ) -> None:
         latest_usage = await repos.usage.latest_by_account(window="primary")
-        updater = UsageUpdater(repos.usage, repos.accounts, repos.additional_usage)
+        updater = UsageUpdater(
+            repos.usage,
+            repos.accounts,
+            repos.additional_usage,
+            repo_factory=background_usage_refresh_repo_context,
+        )
         await updater.refresh_accounts(accounts, latest_usage)
 
     async def _latest_usage_rows(

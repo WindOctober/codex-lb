@@ -24,6 +24,7 @@ async def test_settings_api_get_and_update(async_client):
     assert payload["stickyThreadsEnabled"] is True
     assert payload["upstreamStreamTransport"] == "default"
     assert payload["preferEarlierResetAccounts"] is True
+    assert payload["ignoreFiveHourLimit"] is False
     assert payload["routingStrategy"] == "high_waterline"
     assert payload["openaiCacheAffinityMaxAgeSeconds"] == 1800
     assert payload["httpResponsesSessionBridgePromptCacheIdleTtlSeconds"] == 3600
@@ -42,6 +43,7 @@ async def test_settings_api_get_and_update(async_client):
             "stickyThreadsEnabled": False,
             "upstreamStreamTransport": "websocket",
             "preferEarlierResetAccounts": False,
+            "ignoreFiveHourLimit": True,
             "routingStrategy": "primary_drain",
             "openaiCacheAffinityMaxAgeSeconds": 180,
             "httpResponsesSessionBridgePromptCacheIdleTtlSeconds": 1800,
@@ -57,6 +59,7 @@ async def test_settings_api_get_and_update(async_client):
     assert updated["stickyThreadsEnabled"] is False
     assert updated["upstreamStreamTransport"] == "websocket"
     assert updated["preferEarlierResetAccounts"] is False
+    assert updated["ignoreFiveHourLimit"] is True
     assert updated["routingStrategy"] == "primary_drain"
     assert updated["openaiCacheAffinityMaxAgeSeconds"] == 180
     assert updated["httpResponsesSessionBridgePromptCacheIdleTtlSeconds"] == 1800
@@ -75,6 +78,7 @@ async def test_settings_api_get_and_update(async_client):
     assert payload["stickyThreadsEnabled"] is False
     assert payload["upstreamStreamTransport"] == "websocket"
     assert payload["preferEarlierResetAccounts"] is False
+    assert payload["ignoreFiveHourLimit"] is True
     assert payload["routingStrategy"] == "primary_drain"
     assert payload["openaiCacheAffinityMaxAgeSeconds"] == 180
     assert payload["httpResponsesSessionBridgePromptCacheIdleTtlSeconds"] == 1800

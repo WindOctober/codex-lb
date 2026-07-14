@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from ipaddress import ip_address
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import urlparse
 
 from app.core.balancer.rendezvous_hash import select_node
@@ -21,6 +21,8 @@ from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 from app.modules.proxy.ring_membership import RingMembershipService
 
 logger = logging.getLogger("app.modules.proxy.service")
+
+_DurableBridgeLocalReuseDecision = Literal["allow", "fence", "reject"]
 
 
 class _BridgeRegistrationService(Protocol):
@@ -61,13 +63,28 @@ def _durable_bridge_lookup_active_owner(lookup: DurableBridgeLookup | None) -> s
     return lookup.owner_instance_id
 
 
-def _durable_bridge_lookup_allows_local_reuse(
+def _durable_bridge_lookup_local_reuse_decision(
     lookup: DurableBridgeLookup | None,
     *,
     current_instance: str,
-) -> bool:
+    local_session_id: str | None,
+    local_owner_epoch: int | None,
+) -> _DurableBridgeLocalReuseDecision:
     owner_instance = _durable_bridge_lookup_active_owner(lookup)
-    return owner_instance is None or owner_instance == current_instance
+    if owner_instance is None:
+        return "allow"
+    if owner_instance != current_instance:
+        return "reject"
+    assert lookup is not None
+    if local_session_id is None or local_owner_epoch is None:
+        return "reject"
+    if lookup.owner_epoch > local_owner_epoch:
+        return "reject"
+    if lookup.owner_epoch < local_owner_epoch:
+        return "fence"
+    if lookup.session_id != local_session_id:
+        return "reject"
+    return "allow"
 
 
 def _http_bridge_allow_durable_takeover(lookup: DurableBridgeLookup | None) -> bool:

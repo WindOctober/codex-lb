@@ -19,6 +19,7 @@ from app.core.openai.model_registry import ModelRegistrySnapshot
 from app.core.utils.time import utcnow
 from app.db.models import (
     ACCOUNT_PROVIDER_API_KEY,
+    ACCOUNT_PROVIDER_OPENAI_OAUTH,
     Account,
     AccountGroupMembership,
     AccountStatus,
@@ -33,6 +34,7 @@ from app.modules.proxy.load_balancer import (
     ADDITIONAL_QUOTA_DATA_UNAVAILABLE,
     NO_ADDITIONAL_QUOTA_ELIGIBLE_ACCOUNTS,
     NO_PLAN_SUPPORT_FOR_MODEL,
+    UPSTREAM_CAPABILITY_UNAVAILABLE,
     LoadBalancer,
     RuntimeState,
     _build_states,
@@ -668,6 +670,72 @@ async def test_select_account_reads_cached_usage_once_per_window() -> None:
 
 
 @pytest.mark.asyncio
+async def test_select_account_required_responses_filters_mixed_pool_to_capable_provider() -> None:
+    oauth_account = _make_account("acc-capability-oauth")
+    provider_account = _make_api_key_provider_account(
+        "acc-capability-provider",
+        supported_models=["gpt-5.6-sol"],
+    )
+    provider_account.upstream_wire_api = "responses"
+    accounts_repo = StubAccountsRepository([oauth_account, provider_account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection = await balancer.select_account(required_upstream_wire_api="responses")
+
+    assert selection.account is not None
+    assert selection.account.id == provider_account.id
+    assert accounts_repo.status_updates == []
+
+
+@pytest.mark.asyncio
+async def test_select_account_required_responses_rejects_oauth_pool_without_health_mutation() -> None:
+    oauth_account = _make_account("acc-capability-oauth-only")
+    accounts_repo = StubAccountsRepository([oauth_account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection = await balancer.select_account(required_upstream_wire_api="responses")
+
+    assert selection.account is None
+    assert selection.error_code == UPSTREAM_CAPABILITY_UNAVAILABLE
+    assert oauth_account.status == AccountStatus.ACTIVE
+    assert oauth_account.deactivation_reason is None
+    assert accounts_repo.status_updates == []
+
+
+@pytest.mark.asyncio
+async def test_select_account_required_codex_filters_native_responses_providers() -> None:
+    responses_provider = _make_api_key_provider_account(
+        "acc-capability-responses-provider",
+        supported_models=["gpt-5.6-sol"],
+    )
+    responses_provider.upstream_wire_api = "responses"
+    v1_provider = _make_api_key_provider_account(
+        "acc-capability-v1-provider",
+        supported_models=["gpt-5.6-sol"],
+    )
+    v1_provider.upstream_wire_api = "v1"
+    oauth_account = _make_account("acc-capability-codex-oauth")
+    oauth_account.provider_kind = ACCOUNT_PROVIDER_OPENAI_OAUTH
+    accounts_repo = StubAccountsRepository([responses_provider, v1_provider, oauth_account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    selection = await balancer.select_account(
+        model="gpt-5.6-sol",
+        required_upstream_wire_api="codex",
+    )
+
+    assert selection.account is not None
+    assert selection.account.id == oauth_account.id
+    assert accounts_repo.status_updates == []
+
+
+@pytest.mark.asyncio
 async def test_select_account_prefers_budget_safe_account_when_any_exist() -> None:
     safe_account = _make_account("acc-safe", "safe@example.com")
     pressured_account = _make_account("acc-pressured", "pressured@example.com")
@@ -1262,7 +1330,10 @@ async def test_select_account_uses_canonical_quota_key_for_upstream_limit_alias(
             additional_usage_repo,
         )
     )
-    selection = await balancer.select_account(model="gpt-5.3-codex-spark")
+    selection = await balancer.select_account(
+        model="gpt-5.3-codex-spark",
+        ignore_five_hour_limit=True,
+    )
 
     assert selection.account is not None
     assert selection.account.id == account.id
@@ -3006,7 +3077,10 @@ async def test_select_account_returns_no_eligible_error_for_mapped_model(monkeyp
             additional_usage_repo,
         )
     )
-    selection = await balancer.select_account(model="gpt-5.3-codex-spark")
+    selection = await balancer.select_account(
+        model="gpt-5.3-codex-spark",
+        ignore_five_hour_limit=True,
+    )
 
     assert selection.account is None
     assert selection.error_code == NO_ADDITIONAL_QUOTA_ELIGIBLE_ACCOUNTS

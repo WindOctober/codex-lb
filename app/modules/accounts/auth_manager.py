@@ -49,20 +49,20 @@ class RefreshAdmissionLeasePort(Protocol):
 logger = logging.getLogger(__name__)
 
 
-_RefreshSingleflightKey: TypeAlias = tuple[str, str, bool]
+_RefreshSingleflightKey: TypeAlias = tuple[str, str]
 
 
 class _RefreshSingleflight:
     def __init__(self) -> None:
-        self._inflight: dict[_RefreshSingleflightKey, asyncio.Task[Account]] = {}
+        self._inflight: dict[_RefreshSingleflightKey, asyncio.Task[TokenRefreshResult]] = {}
         self._recent_failures: dict[_RefreshSingleflightKey, tuple[float, tuple[str, str, bool]]] = {}
         self._lock = asyncio.Lock()
 
     async def run(
         self,
         key: _RefreshSingleflightKey,
-        factory: Callable[[], Coroutine[object, object, Account]],
-    ) -> Account:
+        factory: Callable[[], Coroutine[object, object, TokenRefreshResult]],
+    ) -> TokenRefreshResult:
         account_id = key[0]
         async with self._lock:
             self._purge_stale_versions(account_id, keep_key=key)
@@ -83,10 +83,10 @@ class _RefreshSingleflight:
         assert task is not None
         return await asyncio.shield(task)
 
-    def _schedule_complete(self, key: _RefreshSingleflightKey, task: asyncio.Task[Account]) -> None:
+    def _schedule_complete(self, key: _RefreshSingleflightKey, task: asyncio.Task[TokenRefreshResult]) -> None:
         asyncio.create_task(self._complete(key, task))
 
-    async def _complete(self, key: _RefreshSingleflightKey, task: asyncio.Task[Account]) -> None:
+    async def _complete(self, key: _RefreshSingleflightKey, task: asyncio.Task[TokenRefreshResult]) -> None:
         try:
             async with self._lock:
                 current = self._inflight.get(key)
@@ -148,17 +148,21 @@ class AuthManager:
         deactivate_on_permanent_error: bool = True,
     ) -> Account:
         if force or should_refresh(account.last_refresh):
-            account = await _REFRESH_SINGLEFLIGHT.run(
-                _refresh_singleflight_key(
-                    self._encryptor,
+            refresh_token = self._encryptor.decrypt(account.refresh_token_encrypted)
+            acquire_refresh_admission = self._acquire_refresh_admission
+            try:
+                result = await _REFRESH_SINGLEFLIGHT.run(
+                    _refresh_singleflight_key(self._encryptor, account),
+                    lambda: _refresh_tokens_with_admission(refresh_token, acquire_refresh_admission),
+                )
+            except RefreshError as exc:
+                account = await self._resolve_refresh_failure(
                     account,
+                    exc,
                     deactivate_on_permanent_error=deactivate_on_permanent_error,
-                ),
-                lambda: self.refresh_account(
-                    account,
-                    deactivate_on_permanent_error=deactivate_on_permanent_error,
-                ),
-            )
+                )
+            else:
+                account = await self._apply_refresh_result(account, result)
         return await self._ensure_chatgpt_account_id(account)
 
     async def refresh_account(
@@ -171,22 +175,14 @@ class AuthManager:
         try:
             result = await self._refresh_tokens(refresh_token)
         except RefreshError as exc:
-            if exc.is_permanent:
-                latest = await self._repo.get_by_id(account.id)
-                if latest is not None and _refresh_token_material_changed(
-                    self._encryptor,
-                    latest.refresh_token_encrypted,
-                    account.refresh_token_encrypted,
-                ):
-                    return latest
-                if not deactivate_on_permanent_error:
-                    raise
-                reason = PERMANENT_FAILURE_CODES.get(exc.code, exc.message)
-                await self._repo.update_status(account.id, AccountStatus.DEACTIVATED, reason)
-                account.status = AccountStatus.DEACTIVATED
-                account.deactivation_reason = reason
-            raise
+            return await self._resolve_refresh_failure(
+                account,
+                exc,
+                deactivate_on_permanent_error=deactivate_on_permanent_error,
+            )
+        return await self._apply_refresh_result(account, result)
 
+    async def _apply_refresh_result(self, account: Account, result: TokenRefreshResult) -> Account:
         account.access_token_encrypted = self._encryptor.encrypt(result.access_token)
         account.refresh_token_encrypted = self._encryptor.encrypt(result.refresh_token)
         account.id_token_encrypted = self._encryptor.encrypt(result.id_token)
@@ -210,15 +206,30 @@ class AuthManager:
         )
         return account
 
+    async def _resolve_refresh_failure(
+        self,
+        account: Account,
+        exc: RefreshError,
+        *,
+        deactivate_on_permanent_error: bool,
+    ) -> Account:
+        if not exc.is_permanent or not deactivate_on_permanent_error:
+            raise exc
+        latest = await self._repo.get_by_id(account.id)
+        if latest is not None and _refresh_token_material_changed(
+            self._encryptor,
+            latest.refresh_token_encrypted,
+            account.refresh_token_encrypted,
+        ):
+            return latest
+        reason = PERMANENT_FAILURE_CODES.get(exc.code, exc.message)
+        await self._repo.update_status(account.id, AccountStatus.DEACTIVATED, reason)
+        account.status = AccountStatus.DEACTIVATED
+        account.deactivation_reason = reason
+        raise exc
+
     async def _refresh_tokens(self, refresh_token: str) -> TokenRefreshResult:
-        refresh_lease: RefreshAdmissionLeasePort | None = None
-        if self._acquire_refresh_admission is not None:
-            refresh_lease = await self._acquire_refresh_admission()
-        try:
-            return await refresh_access_token(refresh_token)
-        finally:
-            if refresh_lease is not None:
-                refresh_lease.release()
+        return await _refresh_tokens_with_admission(refresh_token, self._acquire_refresh_admission)
 
     async def _ensure_chatgpt_account_id(self, account: Account) -> Account:
         if account.chatgpt_account_id:
@@ -248,6 +259,20 @@ class AuthManager:
         return account
 
 
+async def _refresh_tokens_with_admission(
+    refresh_token: str,
+    acquire_refresh_admission: Callable[[], Awaitable[RefreshAdmissionLeasePort]] | None,
+) -> TokenRefreshResult:
+    refresh_lease: RefreshAdmissionLeasePort | None = None
+    if acquire_refresh_admission is not None:
+        refresh_lease = await acquire_refresh_admission()
+    try:
+        return await refresh_access_token(refresh_token)
+    finally:
+        if refresh_lease is not None:
+            refresh_lease.release()
+
+
 def _chatgpt_account_id_from_id_token(id_token: str) -> str | None:
     claims = extract_id_token_claims(id_token)
     auth_claims = claims.auth or OpenAIAuthClaims()
@@ -257,13 +282,10 @@ def _chatgpt_account_id_from_id_token(id_token: str) -> str | None:
 def _refresh_singleflight_key(
     encryptor: TokenEncryptor,
     account: Account,
-    *,
-    deactivate_on_permanent_error: bool,
 ) -> _RefreshSingleflightKey:
     return (
         account.id,
         _refresh_token_material_fingerprint(encryptor, account.refresh_token_encrypted),
-        deactivate_on_permanent_error,
     )
 
 

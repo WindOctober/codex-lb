@@ -48,8 +48,11 @@ from app.modules.proxy._service.service_tier import (
 from app.modules.proxy._service.support import (
     _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES,
     _REQUEST_TRANSPORT_HTTP,
+    _await_operation_before_hard_timeout,
+    _CompactReservationOwnership,
     _is_account_neutral_error_code,
     _routing_strategy,
+    _schedule_tracked_background_task,
 )
 from app.modules.proxy._service.upstream_account import (
     _account_upstream_base_url,
@@ -73,6 +76,7 @@ _COMPACT_MAX_ACCOUNT_ATTEMPTS = 2
 class _CompactRuntimeService(Protocol):
     _encryptor: TokenEncryptor
     _load_balancer: LoadBalancer
+    _proxy_cleanup_tasks: set[asyncio.Task[None]]
 
     def _proxy_runtime_settings(self) -> Settings: ...
 
@@ -131,6 +135,7 @@ class _CompactRuntimeService(Protocol):
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         reasoning_effort: str | None = None,
         transport: str | None = None,
@@ -162,13 +167,18 @@ class _CompactRuntimeMixin:
         openai_cache_affinity: bool = False,
         api_key: ApiKeyData | None = None,
         api_key_reservation: ApiKeyUsageReservationData | None = None,
+        reservation_ownership: _CompactReservationOwnership | None = None,
+        request_started_at: float | None = None,
+        request_deadline_at: float | None = None,
     ) -> CompactResponsePayload:
         base_settings = self._proxy_runtime_settings()
         _maybe_log_proxy_request_payload("compact", payload, headers, settings=base_settings)
         filtered = filter_inbound_headers(headers)
         request_id = get_request_id() or ensure_request_id(None)
-        start = time.monotonic()
-        deadline = start + base_settings.compact_request_budget_seconds
+        start = time.monotonic() if request_started_at is None else request_started_at
+        deadline = (
+            start + base_settings.compact_request_budget_seconds if request_deadline_at is None else request_deadline_at
+        )
         account_id_value: str | None = None
         log_status = "error"
         log_error_code: str | None = None
@@ -176,7 +186,40 @@ class _CompactRuntimeMixin:
         response: CompactResponsePayload | None = None
         request_service_tier: str | None = None
         actual_service_tier: str | None = None
-        settings = await self._proxy_dashboard_settings()
+
+        def schedule_pre_routing_budget_log() -> None:
+            _schedule_tracked_background_task(
+                self._proxy_cleanup_tasks,
+                self._write_request_log(
+                    account_id=None,
+                    api_key=api_key,
+                    request_id=request_id,
+                    model=payload.model,
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                    status="error",
+                    error_code="upstream_unavailable",
+                    error_message="Proxy request budget exhausted",
+                    reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                    transport=_REQUEST_TRANSPORT_HTTP,
+                ),
+                name=f"compact-pre-routing-budget-log-{request_id}",
+                label=f"Compact pre-routing budget request log request_id={request_id}",
+            )
+
+        dashboard_remaining = self._remaining_budget_seconds_compatible(deadline)
+        if dashboard_remaining <= 0:
+            schedule_pre_routing_budget_log()
+            _raise_proxy_budget_exhausted()
+        try:
+            settings = await _await_operation_before_hard_timeout(
+                self._proxy_dashboard_settings(),
+                timeout_seconds=dashboard_remaining,
+                tasks=self._proxy_cleanup_tasks,
+                label=f"Compact dashboard settings request_id={request_id}",
+            )
+        except TimeoutError:
+            schedule_pre_routing_budget_log()
+            _raise_proxy_budget_exhausted()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
         had_prompt_cache_key = _prompt_cache_key_from_request_model(payload) is not None
         affinity = _sticky_key_for_compact_request(
@@ -204,6 +247,8 @@ class _CompactRuntimeMixin:
             prompt_cache_key_set=_prompt_cache_key_from_request_model(payload) is not None,
         )
         routing_strategy = _routing_strategy(settings)
+        if reservation_ownership is not None:
+            reservation_ownership.transferred = True
         try:
 
             async def _call_compact(
@@ -222,15 +267,6 @@ class _CompactRuntimeMixin:
                         target.id,
                     )
                     _raise_proxy_budget_exhausted()
-                if wire_api != "codex":
-                    raise ProxyResponseError(
-                        501,
-                        openai_error(
-                            "not_implemented",
-                            "responses/compact is not supported by this upstream provider",
-                            error_type="server_error",
-                        ),
-                    )
                 if base_settings.upstream_compact_timeout_seconds is None:
                     timeout_tokens = push_compact_timeout_overrides(
                         connect_timeout_seconds=remaining_budget,
@@ -272,6 +308,7 @@ class _CompactRuntimeMixin:
                     routing_strategy=routing_strategy,
                     model=payload.model,
                     exclude_account_ids=excluded_account_ids,
+                    required_upstream_wire_api=affinity.required_upstream_wire_api,
                 )
                 account = selection.account
                 if not account:
@@ -310,23 +347,11 @@ class _CompactRuntimeMixin:
                         response = await _call_compact(account, effective_payload)
                         actual_service_tier = _service_tier_from_response(response)
                         await self._load_balancer.record_success(account)
-                        await self._settle_compact_api_key_usage(
-                            api_key=api_key,
-                            api_key_reservation=api_key_reservation,
-                            response=response,
-                            request_service_tier=request_service_tier,
-                        )
                         log_status = "success"
                         return response
                     except ProxyResponseError as exc:
                         if exc.status_code == 401:
                             if refresh_retry_used:
-                                await self._settle_compact_api_key_usage(
-                                    api_key=api_key,
-                                    api_key_reservation=api_key_reservation,
-                                    response=None,
-                                    request_service_tier=request_service_tier,
-                                )
                                 await self._handle_proxy_error(account, exc)
                                 raise
                             try:
@@ -347,20 +372,8 @@ class _CompactRuntimeMixin:
                             except RefreshError as refresh_exc:
                                 if refresh_exc.is_permanent:
                                     await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
-                                await self._settle_compact_api_key_usage(
-                                    api_key=api_key,
-                                    api_key_reservation=api_key_reservation,
-                                    response=None,
-                                    request_service_tier=request_service_tier,
-                                )
                                 raise exc
                             except (aiohttp.ClientError, asyncio.TimeoutError) as timeout_exc:
-                                await self._settle_compact_api_key_usage(
-                                    api_key=api_key,
-                                    api_key_reservation=api_key_reservation,
-                                    response=None,
-                                    request_service_tier=request_service_tier,
-                                )
                                 logger.warning(
                                     "Compact forced refresh/connect failed request_id=%s account_id=%s",
                                     request_id,
@@ -410,12 +423,6 @@ class _CompactRuntimeMixin:
                             error.type if error else None,
                         )
                         if _is_account_neutral_error_code(code):
-                            await self._settle_compact_api_key_usage(
-                                api_key=api_key,
-                                api_key_reservation=api_key_reservation,
-                                response=None,
-                                request_service_tier=request_service_tier,
-                            )
                             raise
                         classified = await self._handle_stream_error(
                             account,
@@ -445,21 +452,9 @@ class _CompactRuntimeMixin:
                             excluded_account_ids.add(account.id)
                             transient_exhausted = True
                             break
-                        await self._settle_compact_api_key_usage(
-                            api_key=api_key,
-                            api_key_reservation=api_key_reservation,
-                            response=None,
-                            request_service_tier=request_service_tier,
-                        )
                         raise
                 if transient_exhausted:
                     continue
-            await self._settle_compact_api_key_usage(
-                api_key=api_key,
-                api_key_reservation=api_key_reservation,
-                response=None,
-                request_service_tier=request_service_tier,
-            )
             if last_exc is not None:
                 raise last_exc
             raise ProxyResponseError(
@@ -475,6 +470,12 @@ class _CompactRuntimeMixin:
             log_error_message = log_error_message or (error.message if error else None)
             raise
         finally:
+            await self._settle_compact_api_key_usage(
+                api_key=api_key,
+                api_key_reservation=api_key_reservation,
+                response=response,
+                request_service_tier=request_service_tier,
+            )
             usage = response.usage if response else None
             reasoning_effort = payload.reasoning.effort if payload.reasoning else None
             await self._write_request_log(
@@ -490,6 +491,9 @@ class _CompactRuntimeMixin:
                 output_tokens=usage.output_tokens if usage else None,
                 cached_input_tokens=(
                     usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
+                ),
+                cache_write_tokens=(
+                    usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
                 ),
                 reasoning_tokens=(
                     usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None

@@ -130,6 +130,7 @@ class AccountsRepository:
             func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
             func.coalesce(func.sum(output_tokens_expr), 0).label("output_tokens"),
             func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
+            func.coalesce(func.sum(RequestLog.cache_write_tokens), 0).label("cache_write_tokens"),
             func.count(RequestLog.cost_usd).label("persisted_cost_count"),
             func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("persisted_cost_usd"),
             func.coalesce(
@@ -144,6 +145,10 @@ class AccountsRepository:
                 func.sum(case((missing_cost_expr, func.coalesce(RequestLog.cached_input_tokens, 0)), else_=0)),
                 0,
             ).label("legacy_cached_input_tokens"),
+            func.coalesce(
+                func.sum(case((missing_cost_expr, func.coalesce(RequestLog.cache_write_tokens, 0)), else_=0)),
+                0,
+            ).label("legacy_cache_write_tokens"),
             func.coalesce(
                 func.sum(
                     case(
@@ -170,11 +175,13 @@ class AccountsRepository:
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            cache_write_tokens,
             persisted_cost_count,
             persisted_cost_usd,
             legacy_input_tokens,
             legacy_output_tokens,
             legacy_cached_input_tokens,
+            legacy_cache_write_tokens,
             tokens_7d,
         ) in result.all():
             if not account_id:
@@ -183,6 +190,7 @@ class AccountsRepository:
             output_sum = int(output_tokens or 0)
             cached_sum = int(cached_input_tokens or 0)
             cached_sum = max(0, min(cached_sum, input_sum))
+            cache_write_sum = max(0, min(int(cache_write_tokens or 0), input_sum - cached_sum))
             tokens_sum = input_sum + output_sum
 
             entry = rollup.setdefault(
@@ -206,6 +214,7 @@ class AccountsRepository:
                 input_tokens=float(input_sum),
                 output_tokens=float(output_sum),
                 cached_input_tokens=float(cached_sum),
+                cache_write_tokens=float(cache_write_sum),
             )
             legacy_input_sum = int(legacy_input_tokens or 0)
             legacy_output_sum = int(legacy_output_tokens or 0)
@@ -213,10 +222,15 @@ class AccountsRepository:
                 0,
                 min(int(legacy_cached_input_tokens or 0), legacy_input_sum),
             )
+            legacy_cache_write_sum = max(
+                0,
+                min(int(legacy_cache_write_tokens or 0), legacy_input_sum - legacy_cached_sum),
+            )
             legacy_usage = UsageTokens(
                 input_tokens=float(legacy_input_sum),
                 output_tokens=float(legacy_output_sum),
                 cached_input_tokens=float(legacy_cached_sum),
+                cache_write_tokens=float(legacy_cache_write_sum),
             )
             group_cost_usd = float(persisted_cost_usd or 0.0)
             resolved = get_pricing_for_model(model or "", None, None)
@@ -795,6 +809,9 @@ def _calculate_display_cost(
         billable_input = max(0.0, usage.input_tokens - usage.cached_input_tokens)
         cost_cny = (
             (billable_input / 1_000_000.0) * _DUCKCODING_CNY_INPUT_PER_1M
+            + (usage.cache_write_tokens / 1_000_000.0)
+            * _DUCKCODING_CNY_INPUT_PER_1M
+            * max(0.0, price.cache_write_multiplier - 1.0)
             + (usage.cached_input_tokens / 1_000_000.0) * _DUCKCODING_CNY_CACHED_PER_1M
             + (usage.output_tokens / 1_000_000.0) * duck_output_rate
         )

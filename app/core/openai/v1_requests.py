@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.message_coercion import coerce_messages
 from app.core.openai.requests import (
+    PromptCacheOptions,
     ResponsesCompactRequest,
     ResponsesReasoning,
     ResponsesRequest,
@@ -33,7 +34,15 @@ class V1ResponsesRequest(BaseModel):
     previous_response_id: str | None = None
     truncation: str | None = None
     prompt_cache_key: str | None = None
+    prompt_cache_options: PromptCacheOptions | None = None
     text: ResponsesTextControls | None = None
+
+    @field_validator("prompt_cache_options", mode="before")
+    @classmethod
+    def _reject_null_prompt_cache_options(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("prompt_cache_options cannot be null")
+        return value
 
     @field_validator("input")
     @classmethod
@@ -97,6 +106,15 @@ class V1ResponsesCompactRequest(BaseModel):
     input: JsonValue | None = None
     instructions: str | None = None
     reasoning: ResponsesReasoning | None = None
+    prompt_cache_key: str | None = None
+    prompt_cache_options: PromptCacheOptions | None = None
+
+    @field_validator("prompt_cache_options", mode="before")
+    @classmethod
+    def _reject_null_prompt_cache_options(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("prompt_cache_options cannot be null")
+        return value
 
     @model_validator(mode="after")
     def _validate_input(self) -> "V1ResponsesCompactRequest":

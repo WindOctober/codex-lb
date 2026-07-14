@@ -29,7 +29,6 @@ from app.modules.proxy._service.budget import (
     _raise_proxy_budget_exhausted,
     _raise_proxy_unavailable,
     _remaining_budget_seconds,
-    _websocket_connect_deadline,
 )
 from app.modules.proxy._service.http_bridge.keys import _http_bridge_key_strength
 from app.modules.proxy._service.http_bridge.policy import (
@@ -102,6 +101,7 @@ class _HTTPBridgeSessionCreateService(Protocol):
         *,
         model: str | None,
         protected_key: _HTTPBridgeSessionKey,
+        request_deadline_at: float,
         account_ids: set[str] | None = None,
     ) -> bool: ...
 
@@ -144,7 +144,7 @@ class _HTTPBridgeSessionCreateService(Protocol):
     @staticmethod
     def _http_bridge_connect_rejected_error() -> ProxyResponseError: ...
 
-    async def _mark_http_bridge_account_permanent_failure(
+    def _mark_http_bridge_account_permanent_failure(
         self,
         account: Account,
         error_code: str,
@@ -166,6 +166,7 @@ class _HTTPBridgeSessionCreateMixin:
         request_stage: str = "first_turn",
         preferred_account_id: str | None = None,
         require_preferred_account: bool = False,
+        request_deadline_at: float | None = None,
     ) -> _HTTPBridgeSession:
         request_state = _WebSocketRequestState(
             request_id=f"http_bridge_connect_{uuid4().hex}",
@@ -174,6 +175,7 @@ class _HTTPBridgeSessionCreateMixin:
             reasoning_effort=None,
             api_key_reservation=None,
             started_at=time.monotonic(),
+            request_deadline_at=request_deadline_at,
             transport=_REQUEST_TRANSPORT_HTTP,
         )
         runtime_settings = self._http_bridge_runtime_settings()
@@ -182,13 +184,17 @@ class _HTTPBridgeSessionCreateMixin:
             if request_stage in {"reattach", "context_overflow_recover"}
             else runtime_settings.proxy_request_budget_seconds
         )
-        deadline = _websocket_connect_deadline(request_state, connect_budget_seconds)
+        phase_deadline = time.monotonic() + connect_budget_seconds
+        deadline = phase_deadline if request_deadline_at is None else min(phase_deadline, request_deadline_at)
+        if deadline <= time.monotonic():
+            _raise_proxy_budget_exhausted()
         settings = await self._http_bridge_dashboard_settings()
         excluded_account_ids: set[str] = set()
         retry_same_account_once = preferred_account_id is not None
         preferred_candidate_id = preferred_account_id
         attempt = 0
         last_connect_exc: ProxyResponseError | None = None
+        last_transport_error_message: str | None = None
         session_account_model_concurrency: AccountModelConcurrencyLease | None = None
         trace = _HTTPBridgeSessionCreateTrace()
         account: Account
@@ -212,6 +218,7 @@ class _HTTPBridgeSessionCreateMixin:
                 model=request_model,
                 exclude_account_ids=excluded_account_ids,
                 preferred_account_id=preferred_candidate_id,
+                required_upstream_wire_api=affinity.required_upstream_wire_api,
             )
             trace.add_elapsed("select_account_ms", select_account_started_at)
             selected_account = selection.account
@@ -253,6 +260,7 @@ class _HTTPBridgeSessionCreateMixin:
                     reclaimed = await self._evict_http_bridge_idle_session_for_account_model_capacity(
                         model=request_model,
                         protected_key=key,
+                        request_deadline_at=deadline,
                     )
                     if reclaimed:
                         continue
@@ -269,6 +277,12 @@ class _HTTPBridgeSessionCreateMixin:
                     await asyncio.sleep(min(0.05, remaining))
                     trace.add_elapsed("account_capacity_wait_ms", wait_started_at)
                     continue
+                if last_connect_exc is not None:
+                    if self._is_retryable_http_bridge_connect_forbidden(last_connect_exc):
+                        raise self._http_bridge_connect_rejected_error() from last_connect_exc
+                    raise last_connect_exc
+                if last_transport_error_message is not None:
+                    _raise_proxy_unavailable(last_transport_error_message)
                 raise ProxyResponseError(
                     503,
                     openai_error(
@@ -312,6 +326,7 @@ class _HTTPBridgeSessionCreateMixin:
                 reclaimed = await self._evict_http_bridge_idle_session_for_account_model_capacity(
                     model=request_model,
                     protected_key=key,
+                    request_deadline_at=deadline,
                     account_ids={account.id},
                 )
                 if reclaimed:
@@ -406,6 +421,7 @@ class _HTTPBridgeSessionCreateMixin:
                 session_account_model_concurrency.release()
                 session_account_model_concurrency = None
                 last_connect_exc = exc
+                last_transport_error_message = None
                 classified = await self._handle_websocket_connect_error(account, exc)
                 failure_class = classified["failure_class"]
                 action = (
@@ -453,8 +469,13 @@ class _HTTPBridgeSessionCreateMixin:
                 session_account_model_concurrency.release()
                 session_account_model_concurrency = None
                 if exc.is_permanent:
-                    await self._mark_http_bridge_account_permanent_failure(account, exc.code)
-                if selected_is_preferred and _remaining_budget_seconds(deadline) > 0:
+                    self._mark_http_bridge_account_permanent_failure(account, exc.code)
+                remaining = _remaining_budget_seconds(deadline)
+                if remaining > 0 and not require_preferred_account:
+                    excluded_account_ids.add(account.id)
+                    preferred_candidate_id = None
+                    continue
+                if selected_is_preferred and remaining > 0:
                     if retry_same_account_once and not exc.is_permanent:
                         retry_same_account_once = False
                         continue
@@ -466,26 +487,66 @@ class _HTTPBridgeSessionCreateMixin:
                         401,
                         openai_error(
                             "invalid_api_key",
-                            exc.message,
+                            "Upstream credential refresh failed",
                             error_type="authentication_error",
                         ),
                     ) from exc
                 if request_stage == "first_turn":
                     _record_bridge_first_turn_timeout()
-                _raise_proxy_unavailable(exc.message or "Temporary upstream refresh failure")
+                _raise_proxy_unavailable("Temporary upstream credential refresh failed")
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 session_account_model_concurrency.release()
                 session_account_model_concurrency = None
-                if selected_is_preferred and _remaining_budget_seconds(deadline) > 0:
-                    if retry_same_account_once:
-                        retry_same_account_once = False
-                        continue
+                last_transport_error_message = (
+                    "HTTP bridge upstream connection timed out"
+                    if isinstance(exc, asyncio.TimeoutError)
+                    else "HTTP bridge upstream connection failed"
+                )
+                logger.warning(
+                    "HTTP bridge upstream connection attempt failed request_id=%s account_id=%s",
+                    request_state.request_log_id or request_state.request_id,
+                    account.id,
+                    exc_info=True,
+                )
+                await self._handle_websocket_connect_error(
+                    account,
+                    ProxyResponseError(
+                        504 if isinstance(exc, asyncio.TimeoutError) else 502,
+                        openai_error("upstream_unavailable", last_transport_error_message),
+                    ),
+                )
+                last_connect_exc = None
+                remaining = _remaining_budget_seconds(deadline)
+                if selected_is_preferred and retry_same_account_once and remaining > 0:
+                    retry_same_account_once = False
+                    continue
+                if require_preferred_account:
+                    logger.info(
+                        "Failover decision request_id=%s transport=http_bridge_connect account_id=%s "
+                        "attempt=%d failure_class=retryable_transient action=surface",
+                        request_state.request_log_id or request_state.request_id,
+                        account.id,
+                        attempt,
+                    )
+                elif remaining > 0 and attempt < _WEBSOCKET_MAX_ACCOUNT_ATTEMPTS:
                     excluded_account_ids.add(account.id)
-                    preferred_candidate_id = None
+                    if selected_is_preferred:
+                        preferred_candidate_id = None
+                    logger.info(
+                        "Failover decision request_id=%s transport=http_bridge_connect account_id=%s "
+                        "attempt=%d failure_class=retryable_transient action=failover_next",
+                        request_state.request_log_id or request_state.request_id,
+                        account.id,
+                        attempt,
+                    )
                     continue
                 if request_stage == "first_turn":
                     _record_bridge_first_turn_timeout()
-                _raise_proxy_unavailable(str(exc) or "Request to upstream timed out")
+                _raise_proxy_unavailable(last_transport_error_message)
+            except Exception:
+                session_account_model_concurrency.release()
+                session_account_model_concurrency = None
+                raise
             finally:
                 connect_account_model_concurrency.release()
         else:
@@ -493,32 +554,38 @@ class _HTTPBridgeSessionCreateMixin:
                 if self._is_retryable_http_bridge_connect_forbidden(last_connect_exc):
                     raise self._http_bridge_connect_rejected_error() from last_connect_exc
                 raise last_connect_exc
+            if last_transport_error_message is not None:
+                _raise_proxy_unavailable(last_transport_error_message)
             _raise_proxy_unavailable("No active accounts available")
 
         assert session_account_model_concurrency is not None
-        session = _HTTPBridgeSession(
-            key=key,
-            headers=connect_headers,
-            affinity=affinity,
-            api_key=api_key,
-            request_model=request_model,
-            account=account,
-            upstream=upstream,
-            upstream_control=_WebSocketUpstreamControl(),
-            pending_requests=deque(),
-            pending_lock=anyio.Lock(),
-            response_create_gate=None,
-            queued_request_count=0,
-            last_used_at=time.monotonic(),
-            idle_ttl_seconds=idle_ttl_seconds,
-            codex_session=affinity.kind == StickySessionKind.CODEX_SESSION,
-            prewarm_lock=anyio.Lock(),
-            upstream_turn_state=_upstream_turn_state_from_socket(upstream),
-            downstream_turn_state=None,
-            account_model_session_lease=session_account_model_concurrency,
-            client_kind=_http_bridge_client_kind(connect_headers, key=key),
-        )
-        session.upstream_reader = asyncio.create_task(self._relay_http_bridge_upstream_messages(session))
+        try:
+            session = _HTTPBridgeSession(
+                key=key,
+                headers=connect_headers,
+                affinity=affinity,
+                api_key=api_key,
+                request_model=request_model,
+                account=account,
+                upstream=upstream,
+                upstream_control=_WebSocketUpstreamControl(),
+                pending_requests=deque(),
+                pending_lock=anyio.Lock(),
+                response_create_gate=None,
+                queued_request_count=0,
+                last_used_at=time.monotonic(),
+                idle_ttl_seconds=idle_ttl_seconds,
+                codex_session=affinity.kind == StickySessionKind.CODEX_SESSION,
+                prewarm_lock=anyio.Lock(),
+                upstream_turn_state=_upstream_turn_state_from_socket(upstream),
+                downstream_turn_state=None,
+                client_kind=_http_bridge_client_kind(connect_headers, key=key),
+            )
+            session.upstream_reader = asyncio.create_task(self._relay_http_bridge_upstream_messages(session))
+        except BaseException:
+            session_account_model_concurrency.release()
+            raise
+        session.account_model_session_lease = session_account_model_concurrency
         logger.warning(
             "http_bridge_session_create_breakdown request_id=%s account_id=%s model=%s"
             " request_stage=%s total_ms=%s attempts=%s select_account_ms=%s account_capacity_wait_ms=%s"

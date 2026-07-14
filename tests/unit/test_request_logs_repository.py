@@ -112,6 +112,65 @@ async def test_add_log_ignores_closed_transaction(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_request_log_persists_cache_write_tokens_and_reprices_after_model_rewrite(db_setup) -> None:
+    del db_setup
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        log = await repo.add_log(
+            account_id=None,
+            request_id="req-cache-write",
+            model="gpt-5.6-sol",
+            input_tokens=1_000,
+            output_tokens=0,
+            cached_input_tokens=0,
+            cache_write_tokens=1_000,
+            latency_ms=1,
+            status="success",
+            error_code=None,
+        )
+
+        assert log.cache_write_tokens == 1_000
+        assert log.cost_usd == pytest.approx(0.00625)
+
+        assert await repo.update_model_for_request("req-cache-write", "gpt-5.6-terra") == 1
+        await session.refresh(log)
+        assert log.cache_write_tokens == 1_000
+        assert log.cost_usd == pytest.approx(0.003125)
+
+
+@pytest.mark.asyncio
+async def test_request_log_distinguishes_unknown_and_zero_cache_write_tokens(db_setup) -> None:
+    del db_setup
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        unknown = await repo.add_log(
+            account_id=None,
+            request_id="req-cache-write-unknown",
+            model="gpt-5.6-sol",
+            input_tokens=1,
+            output_tokens=0,
+            cache_write_tokens=None,
+            latency_ms=1,
+            status="success",
+            error_code=None,
+        )
+        zero = await repo.add_log(
+            account_id=None,
+            request_id="req-cache-write-zero",
+            model="gpt-5.6-sol",
+            input_tokens=1,
+            output_tokens=0,
+            cache_write_tokens=0,
+            latency_ms=1,
+            status="success",
+            error_code=None,
+        )
+
+        assert unknown.cache_write_tokens is None
+        assert zero.cache_write_tokens == 0
+
+
+@pytest.mark.asyncio
 async def test_find_latest_account_id_for_response_id_prefers_session_then_falls_back_to_api_key_scope() -> None:
     session = AsyncMock()
     repo = RequestLogsRepository(session)

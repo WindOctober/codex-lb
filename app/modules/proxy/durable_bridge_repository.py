@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
+from typing import cast
 
-from sqlalchemy import case, delete, select, text
+from sqlalchemy import case, delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -215,7 +217,10 @@ class DurableBridgeRepository:
             account_changed = existing.account_id != account_id
             owner_changed = existing.owner_instance_id != instance_id
             if not owner_changed:
-                next_epoch = existing.owner_epoch
+                # claim_session represents publication of a new live socket;
+                # steady-state lease refreshes use renew_session. Fence an old
+                # same-instance close owner from retiring its replacement.
+                next_epoch = existing.owner_epoch + 1
             else:
                 lease_expired = existing.lease_expires_at is None or to_utc_naive(existing.lease_expires_at) <= now
                 if not allow_takeover and not lease_expired and not state_allows_takeover:
@@ -282,28 +287,39 @@ class DurableBridgeRepository:
         latest_input_full_fingerprint: str | None = None,
         state: HttpBridgeSessionState | None = None,
     ) -> DurableBridgeSessionSnapshot | None:
-        row = await self._session.get(HttpBridgeSessionRecord, session_id)
-        if row is None:
-            return None
-        if row.owner_instance_id != instance_id or row.owner_epoch != owner_epoch:
-            return _to_snapshot(row)
         now = utcnow()
-        row.lease_expires_at = now + timedelta(seconds=max(1.0, lease_ttl_seconds))
-        row.last_seen_at = now
+        values: dict[str, object] = {
+            "lease_expires_at": now + timedelta(seconds=max(1.0, lease_ttl_seconds)),
+            "last_seen_at": now,
+        }
         if latest_turn_state is not None:
-            row.latest_turn_state = latest_turn_state
+            values["latest_turn_state"] = latest_turn_state
         if latest_response_id is not None:
-            row.latest_response_id = latest_response_id
-        _set_latest_input_metadata(
-            row,
-            latest_input_item_count,
-            latest_input_full_fingerprint,
-            clear_when_absent=latest_response_id is not None,
-        )
+            values["latest_response_id"] = latest_response_id
+        if latest_input_item_count is not None and latest_input_full_fingerprint is not None:
+            values["latest_input_item_count"] = latest_input_item_count
+            values["latest_input_full_fingerprint"] = latest_input_full_fingerprint
+        elif latest_response_id is not None:
+            values["latest_input_item_count"] = None
+            values["latest_input_full_fingerprint"] = None
         if state is not None:
-            row.state = state
+            values["state"] = state
+        result = cast(
+            CursorResult[tuple[object, ...]],
+            await self._session.execute(
+                update(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                )
+                .values(**values)
+            ),
+        )
         await self._session.commit()
-        await self._session.refresh(row)
+        if result.rowcount != 1:
+            return None
+        row = await self._session.get(HttpBridgeSessionRecord, session_id)
         return _to_snapshot(row)
 
     async def release_session(
@@ -314,19 +330,24 @@ class DurableBridgeRepository:
         owner_epoch: int,
         draining: bool,
     ) -> DurableBridgeSessionSnapshot | None:
-        row = await self._session.get(HttpBridgeSessionRecord, session_id)
-        if row is None:
-            return None
-        if row.owner_instance_id != instance_id or row.owner_epoch != owner_epoch:
-            return _to_snapshot(row)
         now = utcnow()
-        row.owner_instance_id = None
-        row.lease_expires_at = now
-        row.last_seen_at = now
-        row.state = HttpBridgeSessionState.DRAINING if draining else HttpBridgeSessionState.CLOSED
-        row.closed_at = None if draining else now
+        await self._session.execute(
+            update(HttpBridgeSessionRecord)
+            .where(
+                HttpBridgeSessionRecord.id == session_id,
+                HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+            )
+            .values(
+                owner_instance_id=None,
+                lease_expires_at=now,
+                last_seen_at=now,
+                state=HttpBridgeSessionState.DRAINING if draining else HttpBridgeSessionState.CLOSED,
+                closed_at=None if draining else now,
+            )
+        )
         await self._session.commit()
-        await self._session.refresh(row)
+        row = await self._session.get(HttpBridgeSessionRecord, session_id)
         return _to_snapshot(row)
 
     async def mark_owner_draining(self, *, instance_id: str) -> int:
@@ -351,7 +372,24 @@ class DurableBridgeRepository:
         alias_kind: str,
         alias_value: str,
         api_key_scope: str,
-    ) -> None:
+        instance_id: str,
+        owner_epoch: int,
+    ) -> bool:
+        ownership_result = cast(
+            CursorResult[tuple[object, ...]],
+            await self._session.execute(
+                update(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                )
+                .values(owner_epoch=owner_epoch)
+            ),
+        )
+        if ownership_result.rowcount != 1:
+            await self._session.rollback()
+            return False
         dialect = self._session.get_bind().dialect.name
         values = {
             "session_id": session_id,
@@ -398,6 +436,7 @@ class DurableBridgeRepository:
             raise RuntimeError(f"DurableBridgeRepository alias upsert unsupported for dialect={dialect!r}")
         await self._session.execute(statement)
         await self._session.commit()
+        return True
 
     async def _clear_aliases_for_session(self, session_id: str) -> None:
         await self._session.execute(

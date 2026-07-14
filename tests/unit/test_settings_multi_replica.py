@@ -28,6 +28,9 @@ def test_settings_multi_replica_defaults():
     assert settings.proxy_compact_response_create_limit == 64
     assert settings.proxy_http_bridge_account_model_connect_limit == 20
     assert settings.proxy_http_bridge_account_model_session_limit == 20
+    assert settings.http_responses_stream_request_budget_seconds == 7200.0
+    assert settings.http_responses_session_bridge_request_budget_seconds == 7200.0
+    assert settings.stream_idle_timeout_seconds == 7200.0
     assert settings.proxy_downstream_websocket_idle_timeout_seconds == 120.0
     assert settings.max_sse_event_bytes == 16 * 1024 * 1024
     assert settings.proxy_refresh_failure_cooldown_seconds == 5.0

@@ -160,9 +160,17 @@ export const AccountAvailabilityResponseSchema = z.object({
   failedAccountIds: z.array(z.string()).default([]),
 });
 
+export const AccountRateLimitResetCreditSchema = z.object({
+  resetType: z.string().nullable().default(null),
+  title: z.string().nullable().default(null),
+  grantedAt: z.string().datetime({ offset: true }).nullable().default(null),
+  expiresAt: z.string().datetime({ offset: true }).nullable().default(null),
+});
+
 export const AccountRateLimitResetCreditsResponseSchema = z.object({
   accountId: z.string(),
   availableCount: z.number().int().nonnegative(),
+  credits: z.array(AccountRateLimitResetCreditSchema).default([]),
 });
 
 export const AccountRateLimitResetConsumeRequestSchema = z.object({
@@ -270,6 +278,9 @@ export type ApiProviderCreateResponse = z.infer<
 >;
 export type AccountAvailabilityResponse = z.infer<
   typeof AccountAvailabilityResponseSchema
+>;
+export type AccountRateLimitResetCredit = z.infer<
+  typeof AccountRateLimitResetCreditSchema
 >;
 export type AccountRateLimitResetCreditsResponse = z.infer<
   typeof AccountRateLimitResetCreditsResponseSchema

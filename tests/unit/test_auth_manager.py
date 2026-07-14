@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -194,6 +195,65 @@ async def test_ensure_fresh_singleflights_concurrent_refreshes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ensure_fresh_singleflights_mixed_deactivation_policies_per_waiter(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    refresh_calls = 0
+
+    async def _fake_refresh(_: str) -> TokenRefreshResult:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        started.set()
+        await release.wait()
+        raise RefreshError("invalid_grant", "refresh token was rejected", True)
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
+
+    encryptor = TokenEncryptor()
+    stale_refresh = utcnow().replace(year=utcnow().year - 1)
+    account_a = Account(
+        id="acc_sf_mixed_policy",
+        email="user@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-old"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-old"),
+        id_token_encrypted=encryptor.encrypt("id-old"),
+        last_refresh=stale_refresh,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    account_b = Account(**{column.name: getattr(account_a, column.name) for column in Account.__table__.columns})
+    probe_repo = _DummyRepo()
+    deactivating_repo = _DummyRepo()
+
+    probe = asyncio.create_task(
+        AuthManager(cast(AccountsRepositoryPort, probe_repo)).ensure_fresh(
+            account_a,
+            force=True,
+            deactivate_on_permanent_error=False,
+        )
+    )
+    await started.wait()
+    deactivating = asyncio.create_task(
+        AuthManager(cast(AccountsRepositoryPort, deactivating_repo)).ensure_fresh(
+            account_b,
+            force=True,
+            deactivate_on_permanent_error=True,
+        )
+    )
+    await asyncio.sleep(0)
+
+    release.set()
+    results = await asyncio.gather(probe, deactivating, return_exceptions=True)
+
+    assert refresh_calls == 1
+    assert all(isinstance(result, RefreshError) for result in results)
+    assert probe_repo.status_payload is None
+    assert deactivating_repo.status_payload is not None
+    assert deactivating_repo.status_payload["status"] == AccountStatus.DEACTIVATED
+
+
+@pytest.mark.asyncio
 async def test_ensure_fresh_singleflights_refresh_admission_for_same_account(monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()
@@ -252,6 +312,60 @@ async def test_ensure_fresh_singleflights_refresh_admission_for_same_account(mon
 
     assert refresh_calls == 1
     assert admission_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_singleflight_waiter_never_uses_closed_repository(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_refresh(_: str) -> TokenRefreshResult:
+        started.set()
+        await release.wait()
+        return TokenRefreshResult(
+            access_token="new-access",
+            refresh_token="new-refresh",
+            id_token="new-id",
+            account_id="acc_cancelled_waiter",
+            plan_type="plus",
+            email=None,
+        )
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
+    encryptor = TokenEncryptor()
+    stale_refresh = utcnow().replace(year=utcnow().year - 1)
+    account_a = Account(
+        id="acc_cancelled_waiter",
+        email="user@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-old"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-old"),
+        id_token_encrypted=encryptor.encrypt("id-old"),
+        last_refresh=stale_refresh,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    account_b = Account(**{column.name: getattr(account_a, column.name) for column in Account.__table__.columns})
+    first_repo = _DummyRepo()
+    second_repo = _DummyRepo()
+    first = asyncio.create_task(
+        AuthManager(cast(AccountsRepositoryPort, first_repo)).ensure_fresh(account_a, force=True)
+    )
+    await started.wait()
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    second = asyncio.create_task(
+        AuthManager(cast(AccountsRepositoryPort, second_repo)).ensure_fresh(account_b, force=True)
+    )
+    release.set()
+    refreshed = await second
+
+    assert refreshed.chatgpt_account_id == "acc_cancelled_waiter"
+    assert first_repo.tokens_payload is None
+    assert first_repo.status_payload is None
+    assert second_repo.tokens_payload is not None
 
 
 @pytest.mark.asyncio
@@ -429,6 +543,8 @@ async def test_refresh_account_can_probe_permanent_failure_without_deactivating(
         deactivation_reason=None,
     )
     repo = _DummyRepo()
+    get_by_id = AsyncMock(side_effect=AssertionError("proxy-mode permanent failure must not read persistence"))
+    monkeypatch.setattr(repo, "get_by_id", get_by_id)
     manager = AuthManager(cast(AccountsRepositoryPort, repo))
 
     with pytest.raises(RefreshError) as exc_info:
@@ -438,3 +554,4 @@ async def test_refresh_account_can_probe_permanent_failure_without_deactivating(
     assert repo.status_payload is None
     assert account.status == AccountStatus.ACTIVE
     assert account.deactivation_reason is None
+    get_by_id.assert_not_awaited()

@@ -145,8 +145,11 @@ class Settings(BaseSettings):
     upstream_egress_probe_timeout_seconds: float = Field(default=8.0, gt=0.0)
     proxy_request_budget_seconds: float = Field(default=240.0, gt=0)
     proxy_reconnect_request_budget_seconds: float = Field(default=240.0, gt=0)
+    codex_search_request_budget_seconds: float = Field(default=1200.0, gt=0)
+    codex_search_account_attempt_timeout_seconds: float = Field(default=600.0, gt=0)
+    http_responses_stream_request_budget_seconds: float = Field(default=7200.0, gt=0)
     compact_request_budget_seconds: float = Field(default=75.0, gt=0)
-    stream_idle_timeout_seconds: float = 300.0
+    stream_idle_timeout_seconds: float = 7200.0
     proxy_downstream_websocket_idle_timeout_seconds: float = Field(default=120.0, gt=0)
     # Applies to both upstream SSE event buffering and upstream websocket message
     # frames. Keep the default aligned with the common 16 MiB websocket ceiling so
@@ -171,6 +174,7 @@ class Settings(BaseSettings):
     openai_cache_affinity_max_age_seconds: int = Field(default=1800, gt=0)
     openai_prompt_cache_key_derivation_enabled: bool = True
     http_responses_session_bridge_enabled: bool = True
+    http_responses_session_bridge_request_budget_seconds: float = Field(default=7200.0, gt=0)
     http_responses_session_bridge_idle_ttl_seconds: float = Field(default=120.0, gt=0)
     http_responses_session_bridge_codex_idle_ttl_seconds: float = Field(default=900.0, gt=0)
     http_responses_session_bridge_codex_prewarm_enabled: bool = False
@@ -419,6 +423,14 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("upstream_compact_timeout_seconds must be greater than zero")
         return value
+
+    @model_validator(mode="after")
+    def _validate_codex_search_budgets(self) -> "Settings":
+        if self.codex_search_account_attempt_timeout_seconds >= self.codex_search_request_budget_seconds:
+            raise ValueError(
+                "codex_search_account_attempt_timeout_seconds must be less than codex_search_request_budget_seconds"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_http_bridge_instance_configuration(self) -> "Settings":

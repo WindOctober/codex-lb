@@ -6,9 +6,8 @@ import hmac
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import cast
 
 import aiohttp
 
@@ -21,6 +20,7 @@ from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.modules.api_keys.service import ApiKeyUsageReservationData
+from app.modules.proxy._service.support import _await_operation_before_hard_timeout
 
 HTTP_BRIDGE_INTERNAL_FORWARD_PATH = "/internal/bridge/responses"
 HTTP_BRIDGE_FORWARDED_HEADER = "x-codex-bridge-forwarded"
@@ -32,9 +32,12 @@ HTTP_BRIDGE_RESERVATION_KEY_ID_HEADER = "x-codex-bridge-reservation-key-id"
 HTTP_BRIDGE_RESERVATION_MODEL_HEADER = "x-codex-bridge-reservation-model"
 HTTP_BRIDGE_AFFINITY_KIND_HEADER = "x-codex-bridge-affinity-kind"
 HTTP_BRIDGE_AFFINITY_KEY_HEADER = "x-codex-bridge-affinity-key"
+HTTP_BRIDGE_REQUEST_DEADLINE_UNIX_MS_HEADER = "x-codex-bridge-request-deadline-unix-ms"
 HTTP_BRIDGE_SIGNATURE_HEADER = "x-codex-bridge-signature"
+HTTP_BRIDGE_OWNER_ACCEPTED_EVENT_TYPE = "codex.bridge_owner.accepted"
 _TEXT_DELTA_EVENT_TYPES = frozenset({"response.output_text.delta", "response.refusal.delta"})
 logger = logging.getLogger(__name__)
+_OWNER_FORWARD_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +46,7 @@ class HTTPBridgeForwardContext:
     target_instance: str
     codex_session_affinity: bool
     downstream_turn_state: str | None
+    request_deadline_unix_ms: int
     original_affinity_kind: str | None = None
     original_affinity_key: str | None = None
     reservation: ApiKeyUsageReservationData | None = None
@@ -73,6 +77,9 @@ class OwnerForwardRelayFailure(Exception):
 
 
 class HTTPBridgeOwnerClient:
+    def __init__(self, cleanup_tasks: set[asyncio.Task[None]] | None = None) -> None:
+        self._cleanup_tasks = cleanup_tasks if cleanup_tasks is not None else set()
+
     async def stream_responses(
         self,
         *,
@@ -81,66 +88,137 @@ class HTTPBridgeOwnerClient:
         headers: Mapping[str, str],
         context: HTTPBridgeForwardContext,
         request_started_at: float,
+        request_deadline_at: float,
     ) -> AsyncIterator[str]:
         settings = get_settings()
+        remaining_request_seconds = _remaining_wall_clock_seconds(context.request_deadline_unix_ms)
+        if remaining_request_seconds <= 0:
+            raise ProxyResponseError(
+                504,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+            )
         timeout = _owner_forward_timeout(
             connect_timeout_seconds=settings.upstream_connect_timeout_seconds,
             idle_timeout_seconds=settings.stream_idle_timeout_seconds,
+            total_timeout_seconds=remaining_request_seconds,
         )
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+        session = aiohttp.ClientSession(timeout=timeout, trust_env=False)
+        response_context = None
+        response: aiohttp.ClientResponse | None = None
+        resources_detached = False
+        resources_close_started = False
+
+        def mark_resources_detached() -> None:
+            nonlocal resources_detached
+            resources_detached = True
+
+        async def close_resources() -> None:
+            nonlocal resources_close_started
+            if resources_close_started:
+                return
+            resources_close_started = True
+            try:
+                if response_context is not None and response is not None:
+                    await response_context.__aexit__(None, None, None)
+            finally:
+                await session.close()
+
+        async def remember_late_response(late_response: aiohttp.ClientResponse) -> None:
+            nonlocal response
+            response = late_response
+
+        try:
             owner_post_started_at = time.monotonic()
-            async with session.post(
+            response_context = session.post(
                 f"{owner_endpoint}{HTTP_BRIDGE_INTERNAL_FORWARD_PATH}",
                 json=payload.model_dump(mode="json", exclude_none=True),
                 headers=build_owner_forward_headers(headers=headers, payload=payload, context=context),
-            ) as response:
-                owner_response_headers_at = time.monotonic()
-                if response.status != 200:
-                    payload_text = await response.text()
-                    raise ProxyResponseError(
-                        response.status,
-                        _owner_forward_error_payload(status_code=response.status, payload_text=payload_text),
-                    )
-                first_forward_event_at: float | None = None
-                first_forward_event_type: str | None = None
-                first_forward_text_logged = False
+            )
+            try:
+                response = await _await_operation_before_hard_timeout(
+                    response_context.__aenter__(),
+                    timeout_seconds=min(
+                        remaining_request_seconds,
+                        max(0.0, request_deadline_at - time.monotonic()),
+                    ),
+                    tasks=self._cleanup_tasks,
+                    label="HTTP bridge owner connection",
+                    late_result_cleanup=remember_late_response,
+                    late_completion_cleanup=close_resources,
+                    on_detach=mark_resources_detached,
+                )
+            except TimeoutError as exc:
+                raise ProxyResponseError(
+                    504,
+                    openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                ) from exc
+            owner_response_headers_at = time.monotonic()
+            if response.status != 200:
                 try:
-                    async for event_block in _iter_sse_event_blocks(
-                        response,
-                        request_started_at=request_started_at,
-                        proxy_request_budget_seconds=settings.proxy_request_budget_seconds,
-                        stream_idle_timeout_seconds=settings.stream_idle_timeout_seconds,
-                    ):
-                        event_at = time.monotonic()
-                        event_type = _sse_event_type(event_block)
-                        if first_forward_event_at is None:
-                            first_forward_event_at = event_at
-                            first_forward_event_type = event_type
-                        if event_type in _TEXT_DELTA_EVENT_TYPES and not first_forward_text_logged:
-                            first_forward_text_logged = True
-                            _log_owner_forward_latency_breakdown(
-                                owner_endpoint=owner_endpoint,
-                                context=context,
-                                model=payload.model,
-                                event_type=event_type,
-                                first_forward_event_type=first_forward_event_type,
-                                request_started_at=request_started_at,
-                                owner_post_started_at=owner_post_started_at,
-                                owner_response_headers_at=owner_response_headers_at,
-                                first_forward_event_at=first_forward_event_at,
-                                first_forward_text_at=event_at,
-                            )
-                        yield event_block
-                except _OwnerForwardStreamTimeoutError as exc:
-                    raise OwnerForwardRelayFailure(
-                        format_sse_event(
-                            response_failed_event(
-                                exc.error_code,
-                                exc.error_message,
-                                response_id=get_request_id(),
-                            )
+                    payload_text = await _await_operation_before_hard_timeout(
+                        response.text(),
+                        timeout_seconds=max(0.0, request_deadline_at - time.monotonic()),
+                        tasks=self._cleanup_tasks,
+                        label="HTTP bridge owner error body",
+                        late_completion_cleanup=close_resources,
+                        on_detach=mark_resources_detached,
+                    )
+                except TimeoutError as exc:
+                    raise ProxyResponseError(
+                        504,
+                        openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                    ) from exc
+                raise ProxyResponseError(
+                    response.status,
+                    _owner_forward_error_payload(status_code=response.status, payload_text=payload_text),
+                )
+            first_forward_event_at: float | None = None
+            first_forward_event_type: str | None = None
+            first_forward_text_logged = False
+            try:
+                async for event_block in _iter_sse_event_blocks(
+                    response,
+                    request_started_at=request_started_at,
+                    request_deadline_at=request_deadline_at,
+                    proxy_request_budget_seconds=(settings.http_responses_session_bridge_request_budget_seconds),
+                    stream_idle_timeout_seconds=settings.stream_idle_timeout_seconds,
+                    cleanup_tasks=self._cleanup_tasks,
+                    late_completion_cleanup=close_resources,
+                    on_detach=mark_resources_detached,
+                ):
+                    event_at = time.monotonic()
+                    event_type = _sse_event_type(event_block)
+                    if first_forward_event_at is None:
+                        first_forward_event_at = event_at
+                        first_forward_event_type = event_type
+                    if event_type in _TEXT_DELTA_EVENT_TYPES and not first_forward_text_logged:
+                        first_forward_text_logged = True
+                        _log_owner_forward_latency_breakdown(
+                            owner_endpoint=owner_endpoint,
+                            context=context,
+                            model=payload.model,
+                            event_type=event_type,
+                            first_forward_event_type=first_forward_event_type,
+                            request_started_at=request_started_at,
+                            owner_post_started_at=owner_post_started_at,
+                            owner_response_headers_at=owner_response_headers_at,
+                            first_forward_event_at=first_forward_event_at,
+                            first_forward_text_at=event_at,
+                        )
+                    yield event_block
+            except _OwnerForwardStreamTimeoutError as exc:
+                raise OwnerForwardRelayFailure(
+                    format_sse_event(
+                        response_failed_event(
+                            exc.error_code,
+                            exc.error_message,
+                            response_id=get_request_id(),
                         )
                     )
+                )
+        finally:
+            if not resources_detached:
+                await close_resources()
 
 
 def build_owner_forward_headers(
@@ -165,6 +243,8 @@ def build_owner_forward_headers(
         forwarded[HTTP_BRIDGE_RESERVATION_ID_HEADER] = context.reservation.reservation_id
         forwarded[HTTP_BRIDGE_RESERVATION_KEY_ID_HEADER] = context.reservation.key_id
         forwarded[HTTP_BRIDGE_RESERVATION_MODEL_HEADER] = context.reservation.model
+    if context.request_deadline_unix_ms is not None:
+        forwarded[HTTP_BRIDGE_REQUEST_DEADLINE_UNIX_MS_HEADER] = str(context.request_deadline_unix_ms)
     forwarded[HTTP_BRIDGE_SIGNATURE_HEADER] = _bridge_forward_signature(payload=payload, context=context)
     return forwarded
 
@@ -194,6 +274,16 @@ def parse_forwarded_request(
                 error_type="server_error",
             ),
         )
+    request_deadline_unix_ms = _request_deadline_unix_ms_from_headers(headers)
+    if request_deadline_unix_ms is None:
+        return None, ProxyResponseError(
+            400,
+            openai_error(
+                "bridge_forward_invalid",
+                "Internal bridge forward request deadline is required",
+                error_type="invalid_request_error",
+            ),
+        )
     context = HTTPBridgeForwardContext(
         origin_instance=headers.get(HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER, "").strip() or "unknown",
         target_instance=target_instance,
@@ -202,6 +292,7 @@ def parse_forwarded_request(
         original_affinity_kind=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KIND_HEADER)),
         original_affinity_key=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KEY_HEADER)),
         reservation=_reservation_from_headers(headers),
+        request_deadline_unix_ms=request_deadline_unix_ms,
     )
     signature = _optional_header(headers.get(HTTP_BRIDGE_SIGNATURE_HEADER))
     expected_signature = _bridge_forward_signature(payload=payload, context=context)
@@ -214,14 +305,31 @@ def parse_forwarded_request(
                 error_type="invalid_request_error",
             ),
         )
+    if _remaining_wall_clock_seconds(context.request_deadline_unix_ms) <= 0:
+        return None, ProxyResponseError(
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
     return HTTPBridgeForwardedRequest(context=context), None
 
 
-def _owner_forward_timeout(*, connect_timeout_seconds: float, idle_timeout_seconds: float) -> aiohttp.ClientTimeout:
+def _owner_forward_timeout(
+    *,
+    connect_timeout_seconds: float,
+    idle_timeout_seconds: float,
+    total_timeout_seconds: float | None = None,
+) -> aiohttp.ClientTimeout:
+    effective_total = None if total_timeout_seconds is None else max(0.001, total_timeout_seconds)
     return aiohttp.ClientTimeout(
-        total=None,
-        sock_connect=connect_timeout_seconds,
-        sock_read=max(0.001, idle_timeout_seconds),
+        total=effective_total,
+        sock_connect=(
+            connect_timeout_seconds if effective_total is None else min(connect_timeout_seconds, effective_total)
+        ),
+        sock_read=(
+            max(0.001, idle_timeout_seconds)
+            if effective_total is None
+            else min(max(0.001, idle_timeout_seconds), effective_total)
+        ),
     )
 
 
@@ -236,6 +344,17 @@ def _reservation_from_headers(headers: Mapping[str, str]) -> ApiKeyUsageReservat
         key_id=key_id,
         model=model,
     )
+
+
+def _request_deadline_unix_ms_from_headers(headers: Mapping[str, str]) -> int | None:
+    raw_value = _optional_header(headers.get(HTTP_BRIDGE_REQUEST_DEADLINE_UNIX_MS_HEADER))
+    if raw_value is None:
+        return None
+    try:
+        deadline_unix_ms = int(raw_value)
+    except ValueError:
+        return None
+    return deadline_unix_ms if deadline_unix_ms > 0 else None
 
 
 def _bool_header(value: str | None) -> bool:
@@ -270,6 +389,7 @@ def _bridge_forward_signature(*, payload: ResponsesRequest, context: HTTPBridgeF
             context.reservation.reservation_id if context.reservation is not None else "",
             context.reservation.key_id if context.reservation is not None else "",
             context.reservation.model if context.reservation is not None else "",
+            str(context.request_deadline_unix_ms or ""),
             body_digest,
         )
     )
@@ -281,22 +401,34 @@ async def _iter_sse_event_blocks(
     response: aiohttp.ClientResponse,
     *,
     request_started_at: float,
+    request_deadline_at: float,
     proxy_request_budget_seconds: float,
     stream_idle_timeout_seconds: float,
+    cleanup_tasks: set[asyncio.Task[None]] | None = None,
+    late_completion_cleanup: Callable[[], Awaitable[None]] | None = None,
+    on_detach: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     buffer = b""
     chunks = response.content.iter_chunked(65536)
     while True:
         receive_timeout = _owner_forward_receive_timeout(
             request_started_at=request_started_at,
+            request_deadline_at=request_deadline_at,
             proxy_request_budget_seconds=proxy_request_budget_seconds,
             stream_idle_timeout_seconds=stream_idle_timeout_seconds,
         )
         try:
-            chunk = await asyncio.wait_for(chunks.__anext__(), timeout=receive_timeout.timeout_seconds)
+            chunk = await _await_operation_before_hard_timeout(
+                chunks.__anext__(),
+                timeout_seconds=receive_timeout.timeout_seconds,
+                tasks=cleanup_tasks if cleanup_tasks is not None else _OWNER_FORWARD_CLEANUP_TASKS,
+                label="HTTP bridge owner response chunk",
+                late_completion_cleanup=late_completion_cleanup,
+                on_detach=on_detach,
+            )
         except StopAsyncIteration:
             break
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise _OwnerForwardStreamTimeoutError(
                 error_code=receive_timeout.error_code,
                 error_message=receive_timeout.error_message,
@@ -366,11 +498,13 @@ def _log_owner_forward_latency_breakdown(
 def _owner_forward_receive_timeout(
     *,
     request_started_at: float,
+    request_deadline_at: float | None = None,
     proxy_request_budget_seconds: float,
     stream_idle_timeout_seconds: float,
 ) -> _OwnerForwardReceiveTimeout:
     idle_timeout_seconds = max(0.001, stream_idle_timeout_seconds)
-    remaining_budget = _remaining_budget_seconds(request_started_at + proxy_request_budget_seconds)
+    deadline = request_deadline_at or (request_started_at + proxy_request_budget_seconds)
+    remaining_budget = _remaining_budget_seconds(deadline)
     if remaining_budget <= 0:
         return _OwnerForwardReceiveTimeout(
             timeout_seconds=0.0,
@@ -394,15 +528,30 @@ def _remaining_budget_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
+def _remaining_wall_clock_seconds(request_deadline_unix_ms: int | None) -> float:
+    if request_deadline_unix_ms is None:
+        return 0.0
+    return max(0.0, (request_deadline_unix_ms / 1000.0) - time.time())
+
+
+def is_owner_forward_accepted_event(event_block: str) -> bool:
+    return _sse_event_type(event_block) == HTTP_BRIDGE_OWNER_ACCEPTED_EVENT_TYPE
+
+
 def _owner_forward_error_payload(*, status_code: int, payload_text: str) -> OpenAIErrorEnvelope:
     try:
         payload = json.loads(payload_text)
     except json.JSONDecodeError:
         payload = None
-    if is_json_mapping(payload) and is_json_mapping(payload.get("error")):
-        return cast(OpenAIErrorEnvelope, payload)
+    error_payload = payload.get("error") if is_json_mapping(payload) else None
+    if is_json_mapping(error_payload):
+        logger.warning(
+            "Sanitized structured HTTP bridge owner error status_code=%s error_code=%s",
+            status_code,
+            error_payload.get("code"),
+        )
     return openai_error(
         "bridge_owner_forward_failed",
-        payload_text or f"HTTP bridge owner request failed with status {status_code}",
+        f"HTTP bridge owner request failed with status {status_code}",
         error_type="server_error",
     )

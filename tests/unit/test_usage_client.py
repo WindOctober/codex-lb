@@ -214,6 +214,9 @@ async def test_fetch_rate_limit_reset_credits_reads_usage_payload():
                             "id": "RateLimitResetCredit_test",
                             "status": "available",
                             "reset_type": "codex_rate_limits",
+                            "title": "Full reset (Weekly + 5 hr)",
+                            "granted_at": "2026-06-18T03:15:00Z",
+                            "expires_at": "2026-07-18T03:15:00Z",
                         }
                     ],
                     "available_count": 2,
@@ -235,6 +238,11 @@ async def test_fetch_rate_limit_reset_credits_reads_usage_payload():
 
     assert credits.available_count == 2
     assert credits.available_credits[0].id == "RateLimitResetCredit_test"
+    assert credits.available_credits[0].title == "Full reset (Weekly + 5 hr)"
+    assert credits.available_credits[0].granted_at is not None
+    assert credits.available_credits[0].granted_at.isoformat() == "2026-06-18T03:15:00+00:00"
+    assert credits.available_credits[0].expires_at is not None
+    assert credits.available_credits[0].expires_at.isoformat() == "2026-07-18T03:15:00+00:00"
     assert state.method == "GET"
     assert state.url == "http://usage.test/backend-api/wham/rate-limit-reset-credits"
 

@@ -8,6 +8,7 @@ export function buildSettingsUpdateRequest(
     stickyThreadsEnabled: settings.stickyThreadsEnabled,
     upstreamStreamTransport: settings.upstreamStreamTransport,
     preferEarlierResetAccounts: settings.preferEarlierResetAccounts,
+    ignoreFiveHourLimit: settings.ignoreFiveHourLimit,
     routingStrategy: settings.routingStrategy,
     openaiCacheAffinityMaxAgeSeconds: settings.openaiCacheAffinityMaxAgeSeconds,
     kycRoutingEnforcementEnabled: settings.kycRoutingEnforcementEnabled,

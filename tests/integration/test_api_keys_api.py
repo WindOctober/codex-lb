@@ -17,6 +17,7 @@ from app.core.openai.models import OpenAIResponsePayload
 from app.core.utils.time import utcnow
 from app.db.models import RequestLog
 from app.db.session import SessionLocal
+from app.dependencies import get_proxy_service_for_app
 from app.modules.api_keys.repository import ApiKeysRepository
 
 pytestmark = pytest.mark.integration
@@ -469,7 +470,7 @@ async def test_api_key_update_accepts_fast_service_tier_alias(async_client):
 
 
 @pytest.mark.asyncio
-async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, monkeypatch):
+async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, app_instance, monkeypatch):
     await _populate_test_registry()
     model_ids = sorted(_TEST_MODELS)
     forced_model = model_ids[0]
@@ -532,6 +533,7 @@ async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, 
 
     assert seen["model"] == forced_model
     assert seen["effort"] == "high"
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
@@ -674,7 +676,7 @@ async def test_api_key_enforces_model_and_reasoning_for_compact_responses(async_
 
 
 @pytest.mark.asyncio
-async def test_api_key_usage_tracking_and_request_log_link(async_client, monkeypatch):
+async def test_api_key_usage_tracking_and_request_log_link(async_client, app_instance, monkeypatch):
     enable = await async_client.put(
         "/api/settings",
         json={
@@ -722,6 +724,8 @@ async def test_api_key_usage_tracking_and_request_log_link(async_client, monkeyp
     ) as response:
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
+
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         repo = ApiKeysRepository(session)
@@ -823,7 +827,98 @@ async def test_api_key_usage_summary_cost_respects_service_tier(async_client, mo
 
 
 @pytest.mark.asyncio
-async def test_api_key_usage_summary_uses_persisted_request_log_cost(async_client, monkeypatch):
+async def test_gpt_5_6_explicit_cache_usage_updates_wire_log_and_api_key_cost(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "gpt-5.6-cache-write-cost",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 500_000},
+                {"limitType": "cost_usd", "limitWindow": "weekly", "maxValue": 10_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+    key_id = created.json()["id"]
+    await _import_account(async_client, "acc_gpt56_cache_cost", "gpt56-cache-cost@example.com")
+    monkeypatch.setattr(
+        load_balancer_module,
+        "_account_supports_required_upstream_wire_api",
+        lambda _account, _required: True,
+    )
+
+    async def fake_stream(_payload, _headers, _access_token, _account_id, **_kwargs):
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_gpt56_cache_cost",'
+            '"model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":100000,'
+            '"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":100000},'
+            '"output_tokens":0,"total_tokens":100000}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "semia:integration:shard-00",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "stable prefix",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["usage"]["input_tokens_details"]["cache_write_tokens"] == 100_000
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        token_limit = next(limit for limit in limits if limit.limit_type.value == "total_tokens")
+        cost_limit = next(limit for limit in limits if limit.limit_type.value == "cost_usd")
+        log = (await session.execute(select(RequestLog).where(RequestLog.api_key_id == key_id))).scalar_one()
+
+    assert token_limit.current_value == 100_000
+    assert cost_limit.current_value == 625_000
+    assert log.request_id == "resp_gpt56_cache_cost"
+    assert log.cache_write_tokens == 100_000
+    assert log.cost_usd == pytest.approx(0.625, abs=1e-9)
+
+    logs_response = await async_client.get(f"/api/request-logs?search={log.request_id}&limit=1")
+    assert logs_response.status_code == 200
+    assert logs_response.json()["requests"][0]["cacheWriteTokens"] == 100_000
+
+
+@pytest.mark.asyncio
+async def test_api_key_usage_summary_uses_persisted_request_log_cost(async_client, app_instance, monkeypatch):
     enable = await async_client.put(
         "/api/settings",
         json={
@@ -881,6 +976,7 @@ async def test_api_key_usage_summary_uses_persisted_request_log_cost(async_clien
     ) as response:
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         result = await session.execute(select(RequestLog).where(RequestLog.api_key_id == key_id))
@@ -932,7 +1028,7 @@ async def test_api_key_update_accepts_uppercase_enforced_reasoning(async_client)
 
 
 @pytest.mark.asyncio
-async def test_stream_usage_logs_actual_service_tier(async_client, monkeypatch):
+async def test_stream_usage_logs_actual_service_tier(async_client, app_instance, monkeypatch):
     enable = await async_client.put(
         "/api/settings",
         json={
@@ -993,6 +1089,8 @@ async def test_stream_usage_logs_actual_service_tier(async_client, monkeypatch):
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
 
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
+
     async with SessionLocal() as session:
         repo = ApiKeysRepository(session)
         limits = await repo.get_limits_by_key(key_id)
@@ -1009,7 +1107,11 @@ async def test_stream_usage_logs_actual_service_tier(async_client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_usage_logs_actual_service_tier_when_response_created_echoes_default(async_client, monkeypatch):
+async def test_stream_usage_logs_actual_service_tier_when_response_created_echoes_default(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
     enable = await async_client.put(
         "/api/settings",
         json={
@@ -1077,6 +1179,8 @@ async def test_stream_usage_logs_actual_service_tier_when_response_created_echoe
     ) as response:
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
+
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         repo = ApiKeysRepository(session)
@@ -2059,7 +2163,7 @@ async def test_allowed_but_unsupported_model_is_not_exposed(async_client):
 
 
 @pytest.mark.asyncio
-async def test_stream_401_retry_success_finalizes_once(async_client, monkeypatch):
+async def test_stream_401_retry_success_finalizes_once(async_client, app_instance, monkeypatch):
     """401 refresh retry 성공 시 finalize 1회만 호출되어 usage가 정확히 반영된다."""
     enable = await async_client.put(
         "/api/settings",
@@ -2118,6 +2222,8 @@ async def test_stream_401_retry_success_finalizes_once(async_client, monkeypatch
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
 
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
+
     assert call_count["value"] == 2  # first failed, second succeeded
 
     async with SessionLocal() as session:
@@ -2128,7 +2234,7 @@ async def test_stream_401_retry_success_finalizes_once(async_client, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_stream_no_accounts_releases_reservation(async_client, monkeypatch):
+async def test_stream_no_accounts_releases_reservation(async_client, app_instance, monkeypatch):
     """no_accounts 즉시 종료 시 reservation이 release되어 quota가 원복된다."""
     enable = await async_client.put(
         "/api/settings",
@@ -2166,6 +2272,7 @@ async def test_stream_no_accounts_releases_reservation(async_client, monkeypatch
         assert response.status_code == 200
         lines = [line async for line in response.aiter_lines() if line]
         assert any("no_accounts" in line for line in lines)
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         repo = ApiKeysRepository(session)

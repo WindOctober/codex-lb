@@ -134,6 +134,7 @@ class _FakeService(_UpstreamWebSocketRuntimeMixin):
     ) -> None:
         self._encryptor = encryptor
         self._admission = admission
+        self._proxy_cleanup_tasks: set[asyncio.Task[None]] = set()
         type(self)._active_factory = factory
 
     def _get_work_admission(self) -> WorkAdmissionController:
@@ -147,7 +148,9 @@ class _FakeService(_UpstreamWebSocketRuntimeMixin):
         *,
         base_url: str | None,
         wire_api: str,
+        cleanup_tasks: set[asyncio.Task[None]],
     ) -> UpstreamResponsesWebSocket:
+        assert cleanup_tasks is not None
         return await _FakeService._active_factory.connect(
             headers,
             access_token,
@@ -304,6 +307,7 @@ async def test_proxy_service_factory_compatibility_omits_unsupported_wire_api(
         "account-id",
         base_url="https://provider.example.test/v1",
         wire_api="responses",
+        cleanup_tasks=set(),
     )
 
     assert result is upstream
@@ -403,5 +407,78 @@ async def test_open_upstream_websocket_budget_timeout_maps_error_and_releases_le
     assert exc_info.value.payload["error"].get("code") == "upstream_unavailable"
     assert exc_info.value.payload["error"].get("message") == "Proxy request budget exhausted"
     assert admission.acquire_calls == 1
+    await asyncio.gather(*service._proxy_cleanup_tasks)
     assert lease.release_calls == 1
     assert len(factory.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_open_upstream_websocket_preserves_nested_connect_timeout_with_budget_remaining() -> None:
+    connect_timeout = TimeoutError("timed out during opening handshake")
+    service, _, admission, lease, factory, _ = _service(factory_error=connect_timeout)
+    account = _account(
+        provider_kind=ACCOUNT_PROVIDER_OPENAI_OAUTH,
+        chatgpt_account_id="workspace-account-1",
+        base_url=None,
+        wire_api=None,
+    )
+
+    with pytest.raises(TimeoutError) as exc_info:
+        await service._open_upstream_websocket_with_budget(
+            account,
+            {},
+            timeout_seconds=1.0,
+        )
+
+    assert exc_info.value is connect_timeout
+    assert admission.acquire_calls == 1
+    assert lease.release_calls == 1
+    assert len(factory.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_open_upstream_websocket_hard_timeout_closes_late_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _, _, _, _, _ = _service()
+    account = _account(
+        provider_kind=ACCOUNT_PROVIDER_OPENAI_OAUTH,
+        chatgpt_account_id="workspace-account-1",
+        base_url=None,
+        wire_api=None,
+    )
+    cancellation_seen = asyncio.Event()
+    allow_late_socket = asyncio.Event()
+
+    class LateSocket(_FakeUpstreamWebSocket):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    late_socket = LateSocket()
+
+    async def cancellation_suppressing_open(*args: object, **kwargs: object) -> UpstreamResponsesWebSocket:
+        del args, kwargs
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await allow_late_socket.wait()
+        return late_socket
+
+    monkeypatch.setattr(service, "_open_upstream_websocket", cancellation_suppressing_open)
+
+    started_at = asyncio.get_running_loop().time()
+    with pytest.raises(ProxyResponseError):
+        await service._open_upstream_websocket_with_budget(account, {}, timeout_seconds=0.01)
+
+    assert asyncio.get_running_loop().time() - started_at < 0.2
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=0.1)
+    assert late_socket.close_calls == 0
+    retained = tuple(service._proxy_cleanup_tasks)
+    assert retained
+    allow_late_socket.set()
+    await asyncio.gather(*retained)
+    assert late_socket.close_calls == 1

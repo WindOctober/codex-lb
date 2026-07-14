@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Protocol
 
 import anyio
@@ -32,7 +33,11 @@ from app.modules.proxy._service.affinity import (
 from app.modules.proxy._service.affinity import (
     _sticky_key_for_responses_request as _sticky_key_for_responses_request_impl,
 )
-from app.modules.proxy._service.budget import _set_request_budget
+from app.modules.proxy._service.budget import (
+    _ensure_request_budget_remaining,
+    _raise_proxy_budget_exhausted,
+    _set_request_budget,
+)
 from app.modules.proxy._service.observability import (
     _maybe_log_proxy_request_shape as _maybe_log_proxy_request_shape_impl,
 )
@@ -44,18 +49,20 @@ from app.modules.proxy._service.support import (
     _REQUEST_TRANSPORT_WEBSOCKET,
     _AffinityPolicy,
     _await_cancelled_task,
+    _await_operation_before_hard_timeout,
     _DownstreamWebSocketActivity,
     _PreparedWebSocketRequest,
     _release_websocket_response_create_gate,
     _routing_strategy,
+    _schedule_tracked_background_task,
     _WebSocketRequestState,
     _WebSocketUpstreamControl,
 )
+from app.modules.proxy._service.upstream_account import _account_supports_required_upstream_wire_api
 from app.modules.proxy._service.websocket.events import (
     _app_error_to_websocket_event,
     _is_websocket_response_create,
     _parse_websocket_payload,
-    _pop_replayable_precreated_websocket_request_state,
     _serialize_websocket_error_event,
     _wrapped_websocket_error_event,
 )
@@ -74,7 +81,90 @@ _DOWNSTREAM_WEBSOCKET_IDLE_CLOSE_REASON = "Idle downstream websocket timeout"
 _DOWNSTREAM_WEBSOCKET_RECEIVE_POLL_SECONDS = 1.0
 
 
+async def _send_upstream_websocket_before_deadline(
+    operation: Callable[[], Awaitable[None]],
+    *,
+    request_state: _WebSocketRequestState,
+    default_budget_seconds: float,
+    cleanup_tasks: set[asyncio.Task[None]],
+) -> None:
+    remaining = _ensure_request_budget_remaining(request_state, default_budget_seconds)
+    request_state.websocket_send_completed_at = None
+    request_state.websocket_send_started_at = time.monotonic()
+    try:
+        await _await_operation_before_hard_timeout(
+            operation(),
+            timeout_seconds=remaining,
+            tasks=cleanup_tasks,
+            label=f"direct WebSocket send request_id={request_state.request_id}",
+        )
+    except TimeoutError:
+        _raise_proxy_budget_exhausted()
+    request_state.websocket_send_completed_at = time.monotonic()
+
+
+def _schedule_late_direct_websocket_reader_cleanup(
+    *,
+    cleanup_tasks: set[asyncio.Task[None]],
+    reader: asyncio.Task[None],
+    upstream: UpstreamResponsesWebSocket | None,
+    reason: str,
+) -> None:
+    async def finish() -> None:
+        caller_cancellation: asyncio.CancelledError | None = None
+        try:
+            await asyncio.shield(reader)
+        except asyncio.CancelledError as cancellation:
+            if not reader.done():
+                caller_cancellation = cancellation
+                with anyio.CancelScope(shield=True):
+                    while not reader.done():
+                        try:
+                            await asyncio.shield(reader)
+                        except asyncio.CancelledError:
+                            if reader.done():
+                                break
+        except Exception:
+            logger.debug("Late direct WebSocket reader failed before socket close", exc_info=True)
+        if upstream is not None:
+            try:
+                await upstream.close()
+            except Exception:
+                logger.debug("Failed to close upstream WebSocket after late reader shutdown", exc_info=True)
+        if caller_cancellation is not None:
+            raise caller_cancellation
+
+    _schedule_tracked_background_task(
+        cleanup_tasks,
+        finish(),
+        name=f"direct-websocket-late-reader-{time.monotonic_ns()}",
+        label=f"late direct WebSocket reader cleanup reason={reason}",
+    )
+
+
+def _schedule_direct_websocket_close(
+    *,
+    cleanup_tasks: set[asyncio.Task[None]],
+    upstream: UpstreamResponsesWebSocket,
+    reason: str,
+) -> None:
+    async def close() -> None:
+        try:
+            await upstream.close()
+        except Exception:
+            logger.debug("Failed to close direct upstream WebSocket reason=%s", reason, exc_info=True)
+
+    _schedule_tracked_background_task(
+        cleanup_tasks,
+        close(),
+        name=f"direct-websocket-close-{time.monotonic_ns()}",
+        label=f"direct WebSocket close reason={reason}",
+    )
+
+
 class _WebSocketOrchestrationService(Protocol):
+    _proxy_cleanup_tasks: set[asyncio.Task[None]]
+
     @staticmethod
     def _proxy_runtime_settings() -> Settings: ...
 
@@ -84,6 +174,23 @@ class _WebSocketOrchestrationService(Protocol):
     async def _release_websocket_reservation(
         self,
         reservation: ApiKeyUsageReservationData | None,
+    ) -> None: ...
+
+    def _schedule_websocket_reservation_release(
+        self,
+        reservation: ApiKeyUsageReservationData | None,
+        *,
+        reason: str,
+    ) -> None: ...
+
+    def _schedule_websocket_terminal_cleanup(
+        self,
+        *,
+        account_id: str | None,
+        api_key: ApiKeyData | None,
+        request_state: _WebSocketRequestState,
+        error_code: str,
+        error_message: str,
     ) -> None: ...
 
     async def _emit_websocket_terminal_error(
@@ -180,6 +287,7 @@ class _WebSocketOrchestrationService(Protocol):
         proxy_request_budget_seconds: float,
         stream_idle_timeout_seconds: float,
         downstream_activity: _DownstreamWebSocketActivity,
+        pending_changed: asyncio.Event | None = None,
     ) -> None: ...
 
     async def _fail_pending_websocket_requests(
@@ -196,6 +304,14 @@ class _WebSocketOrchestrationService(Protocol):
         response_create_gate: asyncio.Semaphore | None = None,
         downstream_activity: _DownstreamWebSocketActivity | None = None,
     ) -> None: ...
+
+    async def _transfer_pending_websocket_request_accounting(
+        self,
+        pending_requests: deque[_WebSocketRequestState],
+        *,
+        pending_lock: anyio.Lock,
+        upstream_control: _WebSocketUpstreamControl,
+    ) -> deque[_WebSocketRequestState] | None: ...
 
     async def _refresh_websocket_api_key_policy(self, api_key: ApiKeyData | None) -> ApiKeyData | None: ...
 
@@ -242,6 +358,7 @@ class _WebSocketOrchestrationMixin:
         routing_strategy = _routing_strategy(settings)
         pending_requests: deque[_WebSocketRequestState] = deque()
         pending_lock = anyio.Lock()
+        pending_changed = asyncio.Event()
         client_send_lock = anyio.Lock()
         response_create_gate = asyncio.Semaphore(1)
         upstream: UpstreamResponsesWebSocket | None = None
@@ -261,13 +378,20 @@ class _WebSocketOrchestrationMixin:
                         pass
                     if replay_request_state is None and upstream_control is not None:
                         replay_request_state = upstream_control.replay_request_state
+                    detached_receive_owned = bool(
+                        upstream_control is not None
+                        and (upstream_control.detached_receive_pending or upstream_control.upstream_close_owned)
+                    )
                     upstream_reader = None
                     upstream_control = None
-                    if upstream is not None:
-                        try:
-                            await upstream.close()
-                        except Exception:
-                            logger.debug("Failed to close upstream websocket", exc_info=True)
+                    if detached_receive_owned:
+                        upstream = None
+                    elif upstream is not None:
+                        _schedule_direct_websocket_close(
+                            cleanup_tasks=self._proxy_cleanup_tasks,
+                            upstream=upstream,
+                            reason="reader-complete",
+                        )
                     upstream = None
                     account = None
 
@@ -281,15 +405,21 @@ class _WebSocketOrchestrationMixin:
                 if replay_request_state is not None:
                     request_state = replay_request_state
                     replay_request_state = None
-                    _set_request_budget(
-                        request_state,
-                        runtime_settings.proxy_reconnect_request_budget_seconds,
-                        restart_from_now=True,
-                    )
+                    if request_state.request_deadline_at is None:
+                        _set_request_budget(
+                            request_state,
+                            runtime_settings.proxy_request_budget_seconds,
+                        )
                     request_affinity = request_state.affinity_policy
                     text_data = request_state.request_text
                     if text_data is None:
-                        await self._release_websocket_reservation(request_state.api_key_reservation)
+                        self._schedule_websocket_terminal_cleanup(
+                            account_id=account.id if account else None,
+                            api_key=request_state.api_key or api_key,
+                            request_state=request_state,
+                            error_code="stream_incomplete",
+                            error_message="Upstream websocket closed before response.completed",
+                        )
                         await self._emit_websocket_terminal_error(
                             websocket,
                             client_send_lock=client_send_lock,
@@ -303,7 +433,13 @@ class _WebSocketOrchestrationMixin:
                         continue
                     payload = _parse_websocket_payload(text_data)
                     if payload is None:
-                        await self._release_websocket_reservation(request_state.api_key_reservation)
+                        self._schedule_websocket_terminal_cleanup(
+                            account_id=account.id if account else None,
+                            api_key=request_state.api_key or api_key,
+                            request_state=request_state,
+                            error_code="upstream_error",
+                            error_message="Invalid replay request payload",
+                        )
                         await self._emit_websocket_terminal_error(
                             websocket,
                             client_send_lock=client_send_lock,
@@ -316,7 +452,10 @@ class _WebSocketOrchestrationMixin:
                         _release_websocket_response_create_gate(request_state, response_create_gate)
                         continue
                     async with pending_lock:
+                        request_state.websocket_send_completed_at = None
+                        request_state.websocket_send_started_at = time.monotonic()
                         pending_requests.append(request_state)
+                        pending_changed.set()
                     request_state_registered = True
                 else:
                     downstream_idle_timeout_seconds = runtime_settings.proxy_downstream_websocket_idle_timeout_seconds
@@ -416,13 +555,20 @@ class _WebSocketOrchestrationMixin:
                         pass
                     if replay_request_state is None and upstream_control is not None:
                         replay_request_state = upstream_control.replay_request_state
+                    detached_receive_owned = bool(
+                        upstream_control is not None
+                        and (upstream_control.detached_receive_pending or upstream_control.upstream_close_owned)
+                    )
                     upstream_reader = None
                     upstream_control = None
-                    if upstream is not None:
-                        try:
-                            await upstream.close()
-                        except Exception:
-                            logger.debug("Failed to close upstream websocket", exc_info=True)
+                    if detached_receive_owned:
+                        upstream = None
+                    elif upstream is not None:
+                        _schedule_direct_websocket_close(
+                            cleanup_tasks=self._proxy_cleanup_tasks,
+                            upstream=upstream,
+                            reason="reader-complete-after-downstream-receive",
+                        )
                     upstream = None
                     account = None
 
@@ -435,13 +581,19 @@ class _WebSocketOrchestrationMixin:
                     await upstream_reader
                     if replay_request_state is None:
                         replay_request_state = upstream_control.replay_request_state
+                    detached_receive_owned = (
+                        upstream_control.detached_receive_pending or upstream_control.upstream_close_owned
+                    )
                     upstream_reader = None
                     upstream_control = None
-                    if upstream is not None:
-                        try:
-                            await upstream.close()
-                        except Exception:
-                            logger.debug("Failed to close upstream websocket", exc_info=True)
+                    if detached_receive_owned:
+                        upstream = None
+                    elif upstream is not None:
+                        _schedule_direct_websocket_close(
+                            cleanup_tasks=self._proxy_cleanup_tasks,
+                            upstream=upstream,
+                            reason="reconnect-reader-complete",
+                        )
                     upstream = None
                     account = None
 
@@ -451,12 +603,24 @@ class _WebSocketOrchestrationMixin:
                     and request_state.preferred_account_id is None
                 ):
                     try:
-                        request_state.preferred_account_id = await self._resolve_websocket_previous_response_owner(
-                            previous_response_id=request_state.previous_response_id,
-                            api_key=request_state.api_key or api_key,
-                            session_id=request_state.session_id,
-                            surface="websocket",
+                        owner_lookup_remaining = _ensure_request_budget_remaining(
+                            request_state,
+                            runtime_settings.proxy_request_budget_seconds,
                         )
+                        try:
+                            request_state.preferred_account_id = await _await_operation_before_hard_timeout(
+                                self._resolve_websocket_previous_response_owner(
+                                    previous_response_id=request_state.previous_response_id,
+                                    api_key=request_state.api_key or api_key,
+                                    session_id=request_state.session_id,
+                                    surface="websocket",
+                                ),
+                                timeout_seconds=owner_lookup_remaining,
+                                tasks=self._proxy_cleanup_tasks,
+                                label=f"direct WebSocket owner lookup request_id={request_state.request_id}",
+                            )
+                        except TimeoutError:
+                            _raise_proxy_budget_exhausted()
                     except ProxyResponseError as exc:
                         error = _parse_openai_error(exc.payload)
                         error_code = _normalize_error_code(
@@ -465,8 +629,7 @@ class _WebSocketOrchestrationMixin:
                         )
                         error_message = error.message if error and error.message else "Upstream error"
                         error_type = error.type if error and error.type else "server_error"
-                        await self._release_websocket_reservation(request_state.api_key_reservation)
-                        await self._write_websocket_connect_failure(
+                        self._schedule_websocket_terminal_cleanup(
                             account_id=None,
                             api_key=api_key,
                             request_state=request_state,
@@ -486,15 +649,93 @@ class _WebSocketOrchestrationMixin:
                         text_data = None
                         payload = None
                         continue
+                    except asyncio.CancelledError:
+                        if not request_state_registered:
+                            self._schedule_websocket_terminal_cleanup(
+                                account_id=account.id if account is not None else None,
+                                api_key=request_state.api_key or api_key,
+                                request_state=request_state,
+                                error_code="stream_incomplete",
+                                error_message="Previous response owner lookup was cancelled",
+                            )
+                        raise
+                    except Exception:
+                        if not request_state_registered:
+                            self._schedule_websocket_terminal_cleanup(
+                                account_id=account.id if account is not None else None,
+                                api_key=request_state.api_key or api_key,
+                                request_state=request_state,
+                                error_code="upstream_unavailable",
+                                error_message="Previous response owner lookup failed",
+                            )
+                        raise
+
+                if (
+                    request_state is not None
+                    and not request_state_registered
+                    and account is not None
+                    and not _account_supports_required_upstream_wire_api(
+                        account,
+                        request_affinity.required_upstream_wire_api,
+                    )
+                ):
+                    capability_message = (
+                        "The active upstream connection does not support GPT-5.6 prompt cache controls; "
+                        "open a new connection so the request can be routed to a compatible provider."
+                    )
+                    self._schedule_websocket_terminal_cleanup(
+                        account_id=account.id,
+                        api_key=api_key,
+                        request_state=request_state,
+                        error_code="upstream_capability_unavailable",
+                        error_message=capability_message,
+                    )
+                    await self._emit_websocket_terminal_error(
+                        websocket,
+                        client_send_lock=client_send_lock,
+                        request_state=request_state,
+                        error_code="upstream_capability_unavailable",
+                        error_message=capability_message,
+                        error_type="server_error",
+                        downstream_activity=downstream_activity,
+                    )
+                    request_state = None
+                    text_data = None
+                    payload = None
+                    continue
 
                 if request_state is not None and not request_state_registered:
                     try:
-                        await self._acquire_request_state_response_create_admission(
+                        admission_request_state = request_state
+
+                        async def release_late_admission(_result: None) -> None:
+                            _release_websocket_response_create_gate(
+                                admission_request_state,
+                                response_create_gate,
+                            )
+
+                        admission_remaining = _ensure_request_budget_remaining(
                             request_state,
-                            response_create_gate=response_create_gate,
+                            runtime_settings.proxy_request_budget_seconds,
                         )
+                        try:
+                            await _await_operation_before_hard_timeout(
+                                self._acquire_request_state_response_create_admission(
+                                    request_state,
+                                    response_create_gate=response_create_gate,
+                                ),
+                                timeout_seconds=admission_remaining,
+                                tasks=self._proxy_cleanup_tasks,
+                                label=f"direct WebSocket admission request_id={request_state.request_id}",
+                                late_result_cleanup=release_late_admission,
+                            )
+                        except TimeoutError:
+                            _raise_proxy_budget_exhausted()
                         async with pending_lock:
+                            request_state.websocket_send_completed_at = None
+                            request_state.websocket_send_started_at = time.monotonic()
                             pending_requests.append(request_state)
+                            pending_changed.set()
                         request_state_registered = True
                     except ProxyResponseError as exc:
                         error = _parse_openai_error(exc.payload)
@@ -504,8 +745,7 @@ class _WebSocketOrchestrationMixin:
                         )
                         error_message = error.message if error and error.message else "Upstream error"
                         error_type = error.type if error and error.type else "server_error"
-                        await self._release_websocket_reservation(request_state.api_key_reservation)
-                        await self._write_websocket_connect_failure(
+                        self._schedule_websocket_terminal_cleanup(
                             account_id=account.id if account else None,
                             api_key=api_key,
                             request_state=request_state,
@@ -522,9 +762,17 @@ class _WebSocketOrchestrationMixin:
                             downstream_activity=downstream_activity,
                         )
                         _release_websocket_response_create_gate(request_state, response_create_gate)
+                        request_state = None
+                        text_data = None
+                        payload = None
                         continue
                     except asyncio.CancelledError:
-                        await self._release_websocket_reservation(request_state.api_key_reservation)
+                        reservation = request_state.api_key_reservation
+                        request_state.api_key_reservation = None
+                        self._schedule_websocket_reservation_release(
+                            reservation,
+                            reason=f"websocket-admission-cancelled-{request_state.request_id}",
+                        )
                         if request_state_registered:
                             async with pending_lock:
                                 if request_state in pending_requests:
@@ -532,7 +780,12 @@ class _WebSocketOrchestrationMixin:
                         _release_websocket_response_create_gate(request_state, response_create_gate)
                         raise
                     except Exception:
-                        await self._release_websocket_reservation(request_state.api_key_reservation)
+                        reservation = request_state.api_key_reservation
+                        request_state.api_key_reservation = None
+                        self._schedule_websocket_reservation_release(
+                            reservation,
+                            reason=f"websocket-admission-failed-{request_state.request_id}",
+                        )
                         if request_state_registered:
                             async with pending_lock:
                                 if request_state in pending_requests:
@@ -603,10 +856,14 @@ class _WebSocketOrchestrationMixin:
                             proxy_request_budget_seconds=runtime_settings.proxy_request_budget_seconds,
                             stream_idle_timeout_seconds=runtime_settings.stream_idle_timeout_seconds,
                             downstream_activity=downstream_activity,
+                            pending_changed=pending_changed,
                         )
                     )
 
                 try:
+                    active_upstream = upstream
+                    if active_upstream is None:
+                        raise RuntimeError("Upstream websocket is unavailable")
                     if text_data is not None:
                         if account is not None and request_state is not None:
                             text_data, forwarded_service_tier = _http_bridge_text_with_account_service_tier(
@@ -617,39 +874,70 @@ class _WebSocketOrchestrationMixin:
                             if forwarded_service_tier is not None:
                                 request_state.service_tier = forwarded_service_tier
                                 request_state.requested_service_tier = forwarded_service_tier
-                        await upstream.send_text(text_data)
+                        if request_state is None:
+                            await active_upstream.send_text(text_data)
+                        else:
+                            await _send_upstream_websocket_before_deadline(
+                                lambda: active_upstream.send_text(text_data),
+                                request_state=request_state,
+                                default_budget_seconds=runtime_settings.proxy_request_budget_seconds,
+                                cleanup_tasks=self._proxy_cleanup_tasks,
+                            )
                     elif bytes_data is not None:
-                        await upstream.send_bytes(bytes_data)
+                        if request_state is None:
+                            await active_upstream.send_bytes(bytes_data)
+                        else:
+                            await _send_upstream_websocket_before_deadline(
+                                lambda: active_upstream.send_bytes(bytes_data),
+                                request_state=request_state,
+                                default_budget_seconds=runtime_settings.proxy_request_budget_seconds,
+                                cleanup_tasks=self._proxy_cleanup_tasks,
+                            )
                 except Exception:
-                    replay_candidate = await _pop_replayable_precreated_websocket_request_state(
-                        pending_requests,
-                        pending_lock=pending_lock,
-                    )
-                    if replay_candidate is not None:
-                        logger.info(
-                            "Transparent websocket replay after upstream send failure request_id=%s",
-                            replay_candidate.request_log_id or replay_candidate.request_id,
+                    reader_cleanup_owns_late_result = False
+                    requests_to_fail = pending_requests
+                    requests_to_fail_lock = pending_lock
+                    if upstream_control is not None:
+                        # This caller owns the public terminal below. Prevent
+                        # the cancelled reader's finalizer from closing the
+                        # downstream socket before that terminal is delivered.
+                        upstream_control.reconnect_requested = True
+                    if upstream_reader is not None:
+                        reader_stopped = await _await_cancelled_task(
+                            upstream_reader,
+                            label="proxy websocket upstream reader",
                         )
-                        replay_request_state = replay_candidate
-                        if upstream_reader is not None:
-                            await _await_cancelled_task(upstream_reader, label="proxy websocket upstream reader")
-                            upstream_reader = None
-                        upstream_control = None
-                        if upstream is not None:
-                            try:
-                                await upstream.close()
-                            except Exception:
-                                logger.debug(
-                                    "Failed to close upstream websocket after replayable send failure",
-                                    exc_info=True,
-                                )
-                        upstream = None
-                        account = None
-                        continue
+                        if not reader_stopped:
+                            _schedule_late_direct_websocket_reader_cleanup(
+                                cleanup_tasks=self._proxy_cleanup_tasks,
+                                reader=upstream_reader,
+                                upstream=upstream,
+                                reason="send-failure",
+                            )
+                            upstream = None
+                            reader_cleanup_owns_late_result = True
+                        elif upstream_control is not None and (
+                            upstream_control.detached_receive_pending or upstream_control.upstream_close_owned
+                        ):
+                            upstream = None
+                            reader_cleanup_owns_late_result = upstream_control.detached_receive_pending
+                        upstream_reader = None
+                    if upstream_control is not None and (
+                        reader_cleanup_owns_late_result
+                        or upstream_control.detached_receive_pending
+                    ):
+                        transferred_requests = await self._transfer_pending_websocket_request_accounting(
+                            pending_requests,
+                            pending_lock=pending_lock,
+                            upstream_control=upstream_control,
+                        )
+                        if transferred_requests is not None:
+                            requests_to_fail = transferred_requests
+                            requests_to_fail_lock = anyio.Lock()
                     await self._fail_pending_websocket_requests(
                         account_id_value=account.id if account else None,
-                        pending_requests=pending_requests,
-                        pending_lock=pending_lock,
+                        pending_requests=requests_to_fail,
+                        pending_lock=requests_to_fail_lock,
                         error_code="stream_incomplete",
                         error_message="Upstream websocket closed before response.completed",
                         api_key=api_key,
@@ -658,30 +946,66 @@ class _WebSocketOrchestrationMixin:
                         response_create_gate=response_create_gate,
                         downstream_activity=downstream_activity,
                     )
-                    if upstream_reader is not None:
-                        await _await_cancelled_task(upstream_reader, label="proxy websocket upstream reader")
-                        upstream_reader = None
                     upstream_control = None
                     if upstream is not None:
-                        try:
-                            await upstream.close()
-                        except Exception:
-                            logger.debug("Failed to close upstream websocket after send failure", exc_info=True)
+                        _schedule_direct_websocket_close(
+                            cleanup_tasks=self._proxy_cleanup_tasks,
+                            upstream=upstream,
+                            reason="initial-send-failure",
+                        )
                     upstream = None
                     account = None
                     continue
         finally:
+            reader_cleanup_owns_late_result = False
+            requests_to_fail = pending_requests
+            requests_to_fail_lock = pending_lock
+            if upstream_control is not None and (
+                upstream_control.detached_receive_pending or upstream_control.upstream_close_owned
+            ):
+                upstream = None
+                reader_cleanup_owns_late_result = upstream_control.detached_receive_pending
             if upstream_reader is not None:
-                await _await_cancelled_task(upstream_reader, label="proxy websocket upstream reader")
+                reader_stopped = await _await_cancelled_task(
+                    upstream_reader,
+                    label="proxy websocket upstream reader",
+                )
+                if not reader_stopped:
+                    _schedule_late_direct_websocket_reader_cleanup(
+                        cleanup_tasks=self._proxy_cleanup_tasks,
+                        reader=upstream_reader,
+                        upstream=upstream,
+                        reason="downstream-close",
+                    )
+                    upstream = None
+                    reader_cleanup_owns_late_result = True
+                elif upstream_control is not None and (
+                    upstream_control.detached_receive_pending or upstream_control.upstream_close_owned
+                ):
+                    upstream = None
+                    reader_cleanup_owns_late_result = upstream_control.detached_receive_pending
+            if upstream_control is not None and (
+                reader_cleanup_owns_late_result
+                or upstream_control.detached_receive_pending
+            ):
+                transferred_requests = await self._transfer_pending_websocket_request_accounting(
+                    pending_requests,
+                    pending_lock=pending_lock,
+                    upstream_control=upstream_control,
+                )
+                if transferred_requests is not None:
+                    requests_to_fail = transferred_requests
+                    requests_to_fail_lock = anyio.Lock()
             if upstream is not None:
-                try:
-                    await upstream.close()
-                except Exception:
-                    logger.debug("Failed to close upstream websocket", exc_info=True)
+                _schedule_direct_websocket_close(
+                    cleanup_tasks=self._proxy_cleanup_tasks,
+                    upstream=upstream,
+                    reason="downstream-close",
+                )
             await self._fail_pending_websocket_requests(
                 account_id_value=account.id if account else None,
-                pending_requests=pending_requests,
-                pending_lock=pending_lock,
+                pending_requests=requests_to_fail,
+                pending_lock=requests_to_fail_lock,
                 error_code="stream_incomplete",
                 error_message="Upstream websocket closed before response.completed",
                 api_key=api_key,
@@ -702,18 +1026,38 @@ class _WebSocketOrchestrationMixin:
         openai_cache_affinity_max_age_seconds: int,
         api_key: ApiKeyData | None,
     ) -> _PreparedWebSocketRequest:
-        refreshed_api_key = await self._refresh_websocket_api_key_policy(api_key)
+        request_started_at = time.monotonic()
+        request_budget_seconds = float(getattr(self._proxy_runtime_settings(), "proxy_request_budget_seconds", 480.0))
+        request_deadline_at = request_started_at + request_budget_seconds
+        try:
+            refreshed_api_key = await _await_operation_before_hard_timeout(
+                self._refresh_websocket_api_key_policy(api_key),
+                timeout_seconds=max(0.0, request_deadline_at - time.monotonic()),
+                tasks=self._proxy_cleanup_tasks,
+                label="direct WebSocket API-key policy refresh",
+            )
+        except TimeoutError:
+            _raise_proxy_budget_exhausted()
         client_metadata = _response_create_client_metadata(payload, headers=headers)
         responses_payload = normalize_responses_request_payload(payload, openai_compat=openai_cache_affinity)
         apply_api_key_enforcement(responses_payload, refreshed_api_key)
         validate_model_access(refreshed_api_key, responses_payload.model)
-        reservation = await self._reserve_websocket_api_key_usage(
-            refreshed_api_key,
-            request_model=responses_payload.model,
-            request_service_tier=_normalize_service_tier_value(
-                dict(responses_payload.to_payload()).get("service_tier")
-            ),
-        )
+        try:
+            reservation = await _await_operation_before_hard_timeout(
+                self._reserve_websocket_api_key_usage(
+                    refreshed_api_key,
+                    request_model=responses_payload.model,
+                    request_service_tier=_normalize_service_tier_value(
+                        dict(responses_payload.to_payload()).get("service_tier")
+                    ),
+                ),
+                timeout_seconds=max(0.0, request_deadline_at - time.monotonic()),
+                tasks=self._proxy_cleanup_tasks,
+                label="direct WebSocket API-key reservation",
+                late_result_cleanup=self._release_websocket_reservation,
+            )
+        except TimeoutError:
+            _raise_proxy_budget_exhausted()
         try:
             session_id = _owner_lookup_session_id_from_headers(headers)
             request_state, text_data = self._prepare_response_bridge_request_state(
@@ -727,7 +1071,10 @@ class _WebSocketOrchestrationMixin:
                 session_id=session_id,
             )
         except ProxyResponseError:
-            await self._release_websocket_reservation(reservation)
+            self._schedule_websocket_reservation_release(
+                reservation,
+                reason="websocket-request-preparation-failed",
+            )
             raise
         had_prompt_cache_key = _prompt_cache_key_from_request_model(responses_payload) is not None
         affinity_policy = _sticky_key_for_responses_request_impl(
@@ -757,6 +1104,8 @@ class _WebSocketOrchestrationMixin:
             prompt_cache_key_set=_prompt_cache_key_from_request_model(responses_payload) is not None,
         )
         request_state.affinity_policy = affinity_policy
+        request_state.started_at = request_started_at
+        _set_request_budget(request_state, request_budget_seconds)
 
         return _PreparedWebSocketRequest(
             text_data=text_data,

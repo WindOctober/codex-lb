@@ -14,7 +14,7 @@ from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.usage import updater as usage_updater_module
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
-from app.modules.usage.updater import UsageUpdater
+from app.modules.usage.updater import UsageUpdater, background_usage_refresh_repo_context
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,12 @@ class UsageRefreshScheduler:
                     additional_usage_repo = AdditionalUsageRepository(session)
                     latest_usage = await usage_repo.latest_by_account(window="primary")
                     accounts = await accounts_repo.list_accounts()
-                    updater = UsageUpdater(usage_repo, accounts_repo, additional_usage_repo)
+                    updater = UsageUpdater(
+                        usage_repo,
+                        accounts_repo,
+                        additional_usage_repo,
+                        repo_factory=background_usage_refresh_repo_context,
+                    )
                     await updater.refresh_accounts(accounts, latest_usage)
                     await get_rate_limit_headers_cache().invalidate()
                     get_account_selection_cache().invalidate()

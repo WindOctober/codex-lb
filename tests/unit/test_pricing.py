@@ -73,6 +73,38 @@ def test_get_pricing_for_model_gpt_5_5_alias():
     assert price.output_per_1m == 30.0
 
 
+@pytest.mark.parametrize(
+    ("model", "canonical", "input_rate", "cached_rate", "output_rate"),
+    [
+        ("gpt-5.6", "gpt-5.6-sol", 5.0, 0.5, 30.0),
+        ("gpt-5.6-sol-2026-07-01", "gpt-5.6-sol", 5.0, 0.5, 30.0),
+        ("gpt-5.6-terra-2026-07-01", "gpt-5.6-terra", 2.5, 0.25, 15.0),
+        ("gpt-5.6-luna-2026-07-01", "gpt-5.6-luna", 1.0, 0.1, 6.0),
+    ],
+)
+def test_get_pricing_for_model_gpt_5_6_aliases(
+    model: str,
+    canonical: str,
+    input_rate: float,
+    cached_rate: float,
+    output_rate: float,
+) -> None:
+    result = get_pricing_for_model(model, DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+
+    assert result is not None
+    resolved_model, price = result
+    assert resolved_model == canonical
+    assert price.input_per_1m == input_rate
+    assert price.cached_input_per_1m == cached_rate
+    assert price.output_per_1m == output_rate
+    assert price.cache_write_multiplier == 1.25
+
+
+def test_get_pricing_for_model_does_not_price_unknown_future_gpt_5_minor_as_legacy_gpt_5() -> None:
+    assert get_pricing_for_model("gpt-5.7", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES) is None
+    assert get_pricing_for_model("gpt-5.7-sol", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES) is None
+
+
 def test_get_pricing_for_model_gpt_5_4_mini_alias():
     result = get_pricing_for_model("gpt-5.4-mini-2026-03-17", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
     assert result is not None
@@ -162,6 +194,66 @@ def test_calculate_cost_from_usage_gpt_5_5_service_tiers():
     assert flex_cost == pytest.approx(1.75)
 
 
+@pytest.mark.parametrize(
+    ("model", "service_tier", "expected"),
+    [
+        ("gpt-5.6-sol", None, 0.625),
+        ("gpt-5.6-sol", "flex", 0.3125),
+        ("gpt-5.6-sol", "priority", 1.25),
+        ("gpt-5.6-terra", None, 0.3125),
+        ("gpt-5.6-terra", "flex", 0.15625),
+        ("gpt-5.6-terra", "priority", 0.625),
+        ("gpt-5.6-luna", None, 0.125),
+        ("gpt-5.6-luna", "flex", 0.0625),
+        ("gpt-5.6-luna", "priority", 0.25),
+    ],
+)
+def test_calculate_cost_from_usage_gpt_5_6_cache_write_rates(
+    model: str,
+    service_tier: str | None,
+    expected: float,
+) -> None:
+    usage = UsageTokens(input_tokens=100_000.0, output_tokens=0.0, cache_write_tokens=100_000.0)
+
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS[model], service_tier=service_tier)
+
+    assert cost == pytest.approx(expected)
+
+
+def test_calculate_cost_from_usage_gpt_5_6_combines_cached_and_write_tokens_without_double_charge() -> None:
+    usage = UsageTokens(
+        input_tokens=200_000.0,
+        output_tokens=20_000.0,
+        cached_input_tokens=40_000.0,
+        cache_write_tokens=60_000.0,
+    )
+
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5.6-sol"])
+
+    assert cost == pytest.approx(1.495)
+
+
+def test_calculate_cost_from_usage_clamps_overlapping_cached_and_write_tokens() -> None:
+    usage = UsageTokens(
+        input_tokens=200_000.0,
+        output_tokens=0.0,
+        cached_input_tokens=160_000.0,
+        cache_write_tokens=160_000.0,
+    )
+
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5.6-sol"])
+
+    assert cost == pytest.approx(0.33)
+
+
+def test_calculate_cost_from_usage_ignores_cache_write_premium_for_legacy_models() -> None:
+    usage = UsageTokens(input_tokens=100_000.0, output_tokens=0.0, cache_write_tokens=100_000.0)
+
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5.5"])
+
+    assert cost == pytest.approx(0.5)
+
+
 def test_calculate_cost_from_usage_legacy_gpt_5_service_tiers() -> None:
     usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
 
@@ -238,6 +330,20 @@ def test_calculate_cost_from_usage_gpt_5_5_long_context():
     cost = calculate_cost_from_usage(usage, price)
 
     expected = (250_000 / 1_000_000) * 10.0 + (50_000 / 1_000_000) * 1.0 + (100_000 / 1_000_000) * 45.0
+    assert cost == pytest.approx(expected)
+
+
+def test_calculate_cost_from_usage_gpt_5_6_long_context_cache_write_rate() -> None:
+    usage = UsageTokens(
+        input_tokens=300_000.0,
+        output_tokens=100_000.0,
+        cached_input_tokens=50_000.0,
+        cache_write_tokens=100_000.0,
+    )
+
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5.6-sol"])
+
+    expected = 2.5 + 0.25 + 0.05 + 4.5
     assert cost == pytest.approx(expected)
 
 

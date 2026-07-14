@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -41,6 +42,9 @@ class RateLimitResetCreditPayload(BaseModel):
     id: str
     status: str
     reset_type: str | None = None
+    title: str | None = None
+    granted_at: datetime | None = None
+    expires_at: datetime | None = None
 
 
 class RateLimitResetCreditBankPayload(BaseModel):

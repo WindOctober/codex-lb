@@ -15,6 +15,7 @@ from app.core.auth import generate_unique_account_id
 from app.core.config.settings import Settings
 from app.db.models import Account, DashboardSettings, RequestLog
 from app.db.session import SessionLocal
+from app.dependencies import get_proxy_service_for_app
 from app.modules.request_logs.repository import RequestLogsRepository
 
 pytestmark = pytest.mark.integration
@@ -345,6 +346,7 @@ async def test_v1_responses_previous_response_owner_lookup_failure_without_http_
 @pytest.mark.asyncio
 async def test_v1_responses_previous_response_followup_without_http_bridge_recovers_owner_from_request_logs(
     async_client,
+    app_instance,
     monkeypatch,
 ):
     owner_email = "prev-http-owner-anchor@example.com"
@@ -423,6 +425,7 @@ async def test_v1_responses_previous_response_followup_without_http_bridge_recov
 
     assert first_response.status_code == 200
     assert first_response.json()["id"] == "resp_prev_http_anchor"
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
     async with SessionLocal() as session:
         persisted_log = (
             await session.execute(select(RequestLog).where(RequestLog.request_id == "resp_prev_http_anchor").limit(1))
@@ -732,7 +735,7 @@ async def test_v1_responses_non_streaming_failed_returns_error(async_client):
 
 
 @pytest.mark.asyncio
-async def test_proxy_responses_streams_upstream(async_client, monkeypatch):
+async def test_proxy_responses_streams_upstream(async_client, app_instance, monkeypatch):
     email = "streamer@example.com"
     raw_account_id = "acc_live"
     auth_json = _make_auth_json(raw_account_id, email)
@@ -768,6 +771,7 @@ async def test_proxy_responses_streams_upstream(async_client, monkeypatch):
     assert event["type"] == "response.completed"
     assert seen["access_token"] == "access-token"
     assert seen["account_id"] == raw_account_id
+    await get_proxy_service_for_app(app_instance).close_proxy_cleanup_tasks()
 
     async with SessionLocal() as session:
         result = await session.execute(

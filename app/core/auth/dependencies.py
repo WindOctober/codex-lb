@@ -51,6 +51,13 @@ async def validate_proxy_api_key(
     return await validate_proxy_api_key_authorization(authorization, request=request)
 
 
+def proxy_authorization_header(
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> str | None:
+    """Parse Bearer credentials without performing settings or database I/O."""
+    return None if credentials is None else f"Bearer {credentials.credentials}"
+
+
 async def validate_proxy_api_key_authorization(
     authorization: str | None,
     *,

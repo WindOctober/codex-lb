@@ -94,7 +94,7 @@ export function AccountDetail({
   return (
     <div
       key={account.accountId}
-      className="animate-fade-in-up space-y-4 rounded-xl border bg-card p-5"
+      className="animate-fade-in-up min-w-0 space-y-4 rounded-xl border bg-card p-5"
     >
       {/* Account header */}
       <div className="flex items-start justify-between gap-3">

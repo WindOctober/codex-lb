@@ -120,6 +120,15 @@ class UsageRepository:
         await self._session.refresh(entry)
         return entry
 
+    async def delete_for_account_window(self, account_id: str, window: str) -> None:
+        await self._session.execute(
+            delete(UsageHistory).where(
+                UsageHistory.account_id == account_id,
+                _window_clause(window),
+            )
+        )
+        await self._session.commit()
+
     async def aggregate_since(
         self,
         since: datetime,

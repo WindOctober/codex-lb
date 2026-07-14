@@ -7,6 +7,7 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.utils.time import to_utc_naive
 from app.db.models import HttpBridgeSessionState
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeRepository,
@@ -40,7 +41,7 @@ class DurableBridgeLookup:
             return False
         if self.lease_expires_at is None:
             return False
-        return self.lease_expires_at > now
+        return to_utc_naive(self.lease_expires_at) > to_utc_naive(now)
 
 
 class DurableBridgeSessionCoordinator:
@@ -197,12 +198,16 @@ class DurableBridgeSessionCoordinator:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
             repository = DurableBridgeRepository(session)
-            await repository.upsert_alias(
+            registered = await repository.upsert_alias(
                 session_id=session_id,
                 alias_kind=_DURABLE_TURN_STATE_ALIAS,
                 alias_value=turn_state,
                 api_key_scope=api_key_scope,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
             )
+            if not registered:
+                return
             await repository.renew_session(
                 session_id=session_id,
                 instance_id=instance_id,
@@ -226,12 +231,16 @@ class DurableBridgeSessionCoordinator:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
             repository = DurableBridgeRepository(session)
-            await repository.upsert_alias(
+            registered = await repository.upsert_alias(
                 session_id=session_id,
                 alias_kind=_DURABLE_PREVIOUS_RESPONSE_ALIAS,
                 alias_value=response_id,
                 api_key_scope=api_key_scope,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
             )
+            if not registered:
+                return
             await repository.renew_session(
                 session_id=session_id,
                 instance_id=instance_id,
@@ -247,6 +256,8 @@ class DurableBridgeSessionCoordinator:
         *,
         session_id: str,
         api_key_id: str | None,
+        instance_id: str,
+        owner_epoch: int,
         session_header: str,
     ) -> None:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
@@ -256,6 +267,8 @@ class DurableBridgeSessionCoordinator:
                 alias_kind=_DURABLE_SESSION_HEADER_ALIAS,
                 alias_value=session_header,
                 api_key_scope=api_key_scope,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
             )
 
     @asynccontextmanager

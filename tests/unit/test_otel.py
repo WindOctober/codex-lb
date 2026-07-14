@@ -557,7 +557,7 @@ async def test_lifespan_shutdown_fails_bridge_capacity_waiter_and_cancels_usage_
         with pytest.raises(ProxyResponseError) as capacity_exc:
             await asyncio.wait_for(capacity_waiter, timeout=0.1)
         assert capacity_exc.value.status_code == 503
-        assert capacity_exc.value.payload["error"]["code"] == "upstream_unavailable"
+        assert capacity_exc.value.payload["error"]["code"] == "bridge_drain_active"
         create_http_bridge_session.assert_not_awaited()
 
         with pytest.raises(asyncio.CancelledError):

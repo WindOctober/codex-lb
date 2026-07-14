@@ -21,6 +21,7 @@ from typing import (
     Mapping,
     Protocol,
     TypeAlias,
+    TypedDict,
     TypeVar,
     cast,
 )
@@ -63,6 +64,10 @@ from app.core.openai.response_create import (
 from app.core.openai.response_create import (
     _slim_response_create_payload_for_upstream as _slim_response_create_payload_for_upstream,
 )
+from app.core.openai.upstream_error_sanitization import (
+    sanitize_upstream_openai_error_envelope,
+    sanitize_upstream_websocket_event_payload,
+)
 from app.core.resilience.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
@@ -100,16 +105,14 @@ _SSE_READ_CHUNK_SIZE = 1 * 1024
 _IMAGE_INLINE_MAX_BYTES = 8 * 1024 * 1024
 
 
-def _aiohttp_proxy_kwargs(proxy_url: str | None) -> dict[str, str]:
+class _AiohttpProxyKwargs(TypedDict, total=False):
+    proxy: str
+
+
+def _aiohttp_proxy_kwargs(proxy_url: str | None) -> _AiohttpProxyKwargs:
     if proxy_url is None:
         return {}
     return {"proxy": proxy_url}
-
-
-def _upstream_websocket_proxy_kwargs(proxy_url: str | None) -> dict[str, str]:
-    if proxy_url is None:
-        return {}
-    return {"proxy_url": proxy_url}
 
 
 _IMAGE_INLINE_CHUNK_SIZE = 64 * 1024
@@ -297,6 +300,10 @@ async def _release_bound_half_open_probe(websocket: aiohttp.ClientWebSocketRespo
 
 
 class StreamIdleTimeoutError(Exception):
+    pass
+
+
+class UpstreamWebSocketConnectTimeoutError(aiohttp.ConnectionTimeoutError):
     pass
 
 
@@ -564,16 +571,18 @@ def _error_payload_from_websocket_handshake_error(exc: aiohttp.WSServerHandshake
     if extracted is not None:
         error = parse_error_payload(extracted)
         if error is not None:
-            return {"error": _openai_error_detail(error)}
+            return sanitize_upstream_openai_error_envelope({"error": _openai_error_detail(error)})
 
     code = _infer_websocket_handshake_error_code(exc.status, message)
     if code == "invalid_api_key":
-        return openai_error(code, message, error_type="authentication_error")
-    if code == "not_found":
-        return openai_error(code, message, error_type="invalid_request_error")
-    if code == "rate_limit_exceeded":
-        return openai_error(code, message, error_type="rate_limit_error")
-    return openai_error(code, message)
+        raw = openai_error(code, message, error_type="authentication_error")
+    elif code == "not_found":
+        raw = openai_error(code, message, error_type="invalid_request_error")
+    elif code == "rate_limit_exceeded":
+        raw = openai_error(code, message, error_type="rate_limit_error")
+    else:
+        raw = openai_error(code, message)
+    return sanitize_upstream_openai_error_envelope(raw)
 
 
 def _maybe_log_upstream_request_start(
@@ -726,6 +735,91 @@ def _remaining_total_timeout(timeout_seconds: float | None, started_at: float, n
     return max(0.001, timeout_seconds - max(0.0, now - started_at))
 
 
+_DETACHED_DIRECT_TRANSPORT_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _track_direct_transport_task(
+    task: asyncio.Task[object],
+    *,
+    cleanup_tasks: set[asyncio.Task[None]] | None,
+    label: str,
+) -> None:
+    registry = cleanup_tasks if cleanup_tasks is not None else _DETACHED_DIRECT_TRANSPORT_TASKS
+    tracked = cast(asyncio.Task[None], task)
+    if tracked in registry:
+        return
+    registry.add(tracked)
+
+    def consume(completed: asyncio.Task[object]) -> None:
+        registry.discard(tracked)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("Detached direct transport %s failed", label, exc_info=True)
+
+    task.add_done_callback(consume)
+
+
+async def _await_direct_transport_before_hard_timeout(
+    operation: Awaitable[R],
+    *,
+    timeout_seconds: float | None,
+    cleanup_tasks: set[asyncio.Task[None]] | None,
+    label: str,
+    late_result_cleanup: Callable[[R], Awaitable[None]] | None = None,
+    late_completion_cleanup: Callable[[], Awaitable[None]] | None = None,
+    on_detach: Callable[[], None] | None = None,
+) -> R:
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        if asyncio.iscoroutine(operation):
+            operation.close()
+        raise asyncio.TimeoutError
+    task = asyncio.ensure_future(operation)
+
+    def retain_late_operation() -> None:
+        if on_detach is not None:
+            on_detach()
+        task.cancel()
+        if late_result_cleanup is None and late_completion_cleanup is None:
+            _track_direct_transport_task(
+                cast(asyncio.Task[object], task),
+                cleanup_tasks=cleanup_tasks,
+                label=label,
+            )
+            return
+
+        async def reconcile() -> None:
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                if late_result_cleanup is not None:
+                    await late_result_cleanup(result)
+            finally:
+                if late_completion_cleanup is not None:
+                    await late_completion_cleanup()
+
+        reconciliation = asyncio.create_task(reconcile())
+        _track_direct_transport_task(
+            cast(asyncio.Task[object], reconciliation),
+            cleanup_tasks=cleanup_tasks,
+            label=f"late {label} reconciliation",
+        )
+
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+    except BaseException:
+        retain_late_operation()
+        raise
+    if task not in done:
+        retain_late_operation()
+        raise asyncio.TimeoutError
+    return task.result()
+
+
 def _find_sse_separator(buffer: bytes | bytearray) -> tuple[int, int] | None:
     separators = (b"\r\n\r\n", b"\n\n")
     positions = [(buffer.find(separator), len(separator)) for separator in separators]
@@ -751,18 +845,24 @@ async def _iter_sse_events(
     idle_timeout_seconds: float,
     max_event_bytes: int,
     diagnostics: _HTTPStreamDiagnostics | None = None,
+    cleanup_tasks: set[asyncio.Task[None]] | None = None,
+    on_chunk_detach: Callable[[asyncio.Task[bytes]], None] | None = None,
 ) -> AsyncIterator[str]:
     async def _next_chunk() -> bytes:
         return await iterator.__anext__()
 
-    async def _cancel_pending_chunk(task: asyncio.Task[bytes]) -> None:
+    def _detach_pending_chunk(task: asyncio.Task[bytes]) -> None:
         if task.done():
             return
+        if on_chunk_detach is not None:
+            on_chunk_detach(task)
+            return
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        _track_direct_transport_task(
+            cast(asyncio.Task[object], task),
+            cleanup_tasks=cleanup_tasks,
+            label="HTTP SSE chunk read",
+        )
 
     buffer = bytearray()
     chunk_iterator = resp.content.iter_chunked(_SSE_READ_CHUNK_SIZE)
@@ -773,15 +873,15 @@ async def _iter_sse_events(
         try:
             done, _ = await asyncio.wait({next_chunk}, timeout=idle_timeout_seconds)
             if not done:
-                await _cancel_pending_chunk(next_chunk)
+                _detach_pending_chunk(next_chunk)
                 if diagnostics is not None:
                     diagnostics.partial_buffer_bytes = len(buffer)
                 raise StreamIdleTimeoutError()
-            chunk = await next_chunk
+            chunk = next_chunk.result()
         except StopAsyncIteration:
             break
         except asyncio.CancelledError:
-            await _cancel_pending_chunk(next_chunk)
+            _detach_pending_chunk(next_chunk)
             raise
 
         if not chunk:
@@ -1126,6 +1226,7 @@ async def _open_upstream_websocket(
     account_id: str | None = None,
     hold_half_open_probe: bool = False,
     proxy_url: str | None = None,
+    cleanup_tasks: set[asyncio.Task[None]] | None = None,
 ) -> tuple[AsyncContextManager[aiohttp.ClientWebSocketResponse], aiohttp.ClientWebSocketResponse]:
     settings = get_settings()
     circuit_breaker = get_circuit_breaker_for_account(account_id, settings) if account_id else None
@@ -1145,10 +1246,24 @@ async def _open_upstream_websocket(
                 max_msg_size=max_msg_size,
                 **_aiohttp_proxy_kwargs(proxy_url),
             )
-            websocket = await asyncio.wait_for(websocket_cm.__aenter__(), timeout=connect_timeout_seconds)
+
+            async def close_late_websocket_context(_websocket: aiohttp.ClientWebSocketResponse) -> None:
+                await websocket_cm.__aexit__(None, None, None)
+
+            websocket = await _await_direct_transport_before_hard_timeout(
+                websocket_cm.__aenter__(),
+                timeout_seconds=connect_timeout_seconds,
+                cleanup_tasks=cleanup_tasks,
+                label="native WebSocket connect",
+                late_result_cleanup=close_late_websocket_context,
+            )
             if hold_half_open_probe and is_probe and circuit_breaker is not None:
                 _bind_half_open_probe(websocket, circuit_breaker)
             return websocket_cm, websocket
+        except asyncio.TimeoutError as exc:
+            if circuit_breaker is not None:
+                await circuit_breaker._record_failure(exc)
+            raise UpstreamWebSocketConnectTimeoutError("Upstream WebSocket connect timed out") from exc
         except Exception as exc:
             if circuit_breaker is not None:
                 await circuit_breaker._record_failure(exc)
@@ -1165,17 +1280,32 @@ async def _open_upstream_websocket(
     sec_key = base64.b64encode(os.urandom(16)).decode()
     request_headers[hdrs.SEC_WEBSOCKET_KEY] = sec_key
 
+    connect_deadline_at = time.monotonic() + connect_timeout_seconds
     timeout = aiohttp.ClientTimeout(total=connect_timeout_seconds, sock_connect=connect_timeout_seconds)
     try:
         try:
-            resp = await request(
-                hdrs.METH_GET,
-                url,
-                headers=request_headers,
-                timeout=timeout,
-                read_until_eof=False,
-                **_aiohttp_proxy_kwargs(proxy_url),
+
+            async def close_late_response(response: aiohttp.ClientResponse) -> None:
+                response.close()
+
+            resp = await _await_direct_transport_before_hard_timeout(
+                request(
+                    hdrs.METH_GET,
+                    url,
+                    headers=request_headers,
+                    timeout=timeout,
+                    read_until_eof=False,
+                    **_aiohttp_proxy_kwargs(proxy_url),
+                ),
+                timeout_seconds=connect_timeout_seconds,
+                cleanup_tasks=cleanup_tasks,
+                label="aiohttp WebSocket connect",
+                late_result_cleanup=close_late_response,
             )
+        except asyncio.TimeoutError as exc:
+            if circuit_breaker is not None:
+                await circuit_breaker._record_failure(exc)
+            raise UpstreamWebSocketConnectTimeoutError("Upstream WebSocket connect timed out") from exc
         except Exception as exc:
             if circuit_breaker is not None:
                 await circuit_breaker._record_failure(exc)
@@ -1183,10 +1313,19 @@ async def _open_upstream_websocket(
 
         async def _raise_handshake_error(message: str) -> None:
             body_text = ""
-            try:
-                body_text = (await resp.text()).strip()
-            except Exception:
-                body_text = ""
+            remaining = connect_deadline_at - time.monotonic()
+            if remaining > 0:
+                try:
+                    body_text = (
+                        await _await_direct_transport_before_hard_timeout(
+                            resp.text(),
+                            timeout_seconds=remaining,
+                            cleanup_tasks=cleanup_tasks,
+                            label="aiohttp WebSocket handshake rejection body",
+                        )
+                    ).strip()
+                except Exception:
+                    body_text = ""
             raise aiohttp.WSServerHandshakeError(
                 resp.request_info,
                 resp.history,
@@ -1264,6 +1403,9 @@ async def _stream_websocket_events(
     idle_timeout_seconds: float,
     total_timeout_seconds: float | None,
     max_event_bytes: int,
+    cleanup_tasks: set[asyncio.Task[None]] | None = None,
+    late_receive_cleanup: Callable[[], Awaitable[None]] | None = None,
+    on_receive_detach: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
@@ -1276,7 +1418,14 @@ async def _stream_websocket_events(
             timeout_seconds = min(timeout_seconds, remaining)
 
         try:
-            message = await asyncio.wait_for(websocket.receive(), timeout=timeout_seconds)
+            message = await _await_direct_transport_before_hard_timeout(
+                websocket.receive(),
+                timeout_seconds=timeout_seconds,
+                cleanup_tasks=cleanup_tasks,
+                label="native WebSocket receive",
+                late_completion_cleanup=late_receive_cleanup,
+                on_detach=on_receive_detach,
+            )
         except asyncio.TimeoutError as exc:
             if deadline is not None and deadline - time.monotonic() <= 0:
                 raise
@@ -1307,8 +1456,9 @@ async def _stream_websocket_events(
         if not isinstance(payload, dict):
             continue
         normalized = _normalize_stream_event_payload(payload)
+        public_payload = sanitize_upstream_websocket_event_payload(normalized)
         event_type = payload.get("type")
-        yield format_sse_event(normalized)
+        yield format_sse_event(public_payload)
         if isinstance(event_type, str) and event_type in (
             "response.completed",
             "response.failed",
@@ -1330,6 +1480,7 @@ async def _stream_responses_via_websocket(
     raise_for_status: bool,
     account_id: str | None = None,
     proxy_url: str | None = None,
+    cleanup_tasks: set[asyncio.Task[None]] | None = None,
 ) -> AsyncIterator[str]:
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
@@ -1339,6 +1490,8 @@ async def _stream_responses_via_websocket(
     circuit_breaker = None
     lifecycle_recorded = False
     seen_terminal = False
+    websocket_operation_detached = False
+    websocket_context_close_started = False
     settings = get_settings()
     if account_id is not None:
         circuit_breaker = get_circuit_breaker_for_account(account_id, settings)
@@ -1357,6 +1510,22 @@ async def _stream_responses_via_websocket(
         await circuit_breaker._record_failure(exc)
         lifecycle_recorded = True
 
+    def mark_websocket_operation_detached() -> None:
+        nonlocal websocket_operation_detached
+        websocket_operation_detached = True
+
+    async def close_websocket_context() -> None:
+        nonlocal websocket_context_close_started
+        if websocket_context_close_started or websocket_cm is None:
+            return
+        websocket_context_close_started = True
+        await _await_direct_transport_before_hard_timeout(
+            websocket_cm.__aexit__(None, None, None),
+            timeout_seconds=1.0,
+            cleanup_tasks=cleanup_tasks,
+            label="native WebSocket close",
+        )
+
     connect_timeout_seconds = min(
         effective_connect_timeout,
         _remaining_total_timeout(effective_total_timeout, request_started_at, time.monotonic())
@@ -1370,7 +1539,8 @@ async def _stream_responses_via_websocket(
         max_msg_size=max_event_bytes,
         account_id=account_id,
         hold_half_open_probe=True,
-        **_upstream_websocket_proxy_kwargs(proxy_url),
+        proxy_url=proxy_url,
+        cleanup_tasks=cleanup_tasks,
     )
 
     try:
@@ -1381,14 +1551,22 @@ async def _stream_responses_via_websocket(
             time.monotonic(),
         )
         if callable(send_json):
-            await asyncio.wait_for(
+            await _await_direct_transport_before_hard_timeout(
                 cast(Callable[[JsonObject], Awaitable[None]], send_json)(request_payload),
-                timeout=remaining_total_timeout,
+                timeout_seconds=remaining_total_timeout,
+                cleanup_tasks=cleanup_tasks,
+                label="native WebSocket response.create send",
+                late_completion_cleanup=close_websocket_context,
+                on_detach=mark_websocket_operation_detached,
             )
         else:
-            await asyncio.wait_for(
+            await _await_direct_transport_before_hard_timeout(
                 websocket.send_str(json.dumps(request_payload, ensure_ascii=True, separators=(",", ":"))),
-                timeout=remaining_total_timeout,
+                timeout_seconds=remaining_total_timeout,
+                cleanup_tasks=cleanup_tasks,
+                label="aiohttp WebSocket response.create send",
+                late_completion_cleanup=close_websocket_context,
+                on_detach=mark_websocket_operation_detached,
             )
         remaining_total_timeout = _remaining_total_timeout(
             effective_total_timeout,
@@ -1400,6 +1578,9 @@ async def _stream_responses_via_websocket(
             idle_timeout_seconds=effective_idle_timeout,
             total_timeout_seconds=remaining_total_timeout,
             max_event_bytes=max_event_bytes,
+            cleanup_tasks=cleanup_tasks,
+            late_receive_cleanup=close_websocket_context,
+            on_receive_detach=mark_websocket_operation_detached,
         ):
             parsed_event = parse_sse_event(event)
             if parsed_event and parsed_event.type in ("response.completed", "response.failed", "response.incomplete"):
@@ -1413,8 +1594,8 @@ async def _stream_responses_via_websocket(
         raise
     finally:
         try:
-            if websocket_cm is not None:
-                await websocket_cm.__aexit__(None, None, None)
+            if not websocket_operation_detached:
+                await close_websocket_context()
         finally:
             await _release_bound_half_open_probe(websocket)
 
@@ -1746,6 +1927,8 @@ async def stream_responses(
     raise_for_status: bool = False,
     session: aiohttp.ClientSession | None = None,
     upstream_stream_transport_override: str | None = None,
+    cleanup_tasks: set[asyncio.Task[None]] | None = None,
+    on_response_started: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -1762,6 +1945,7 @@ async def stream_responses(
     effective_idle_timeout = _effective_stream_timeout(settings.stream_idle_timeout_seconds, "idle")
 
     seen_terminal = False
+    upstream_response_id: str | None = None
     status_code: int | None = None
     error_code: str | None = None
     error_message: str | None = None
@@ -1806,13 +1990,16 @@ async def stream_responses(
     started_at = time.monotonic()
     http_stream_diagnostics = _HTTPStreamDiagnostics(request_started_at=started_at)
 
+    def terminal_response_id() -> str | None:
+        return upstream_response_id or get_request_id()
+
     async def _stream_via_http(
         current_headers: Mapping[str, str],
         current_timeout: aiohttp.ClientTimeout,
     ) -> AsyncIterator[str]:
-        nonlocal status_code, error_code, error_message, seen_terminal
+        nonlocal status_code, error_code, error_message, seen_terminal, upstream_response_id
 
-        async with _service_circuit_breaker_context(
+        response_context = _service_circuit_breaker_context(
             client_session.post(
                 url,
                 json=payload_dict,
@@ -1822,7 +2009,41 @@ async def stream_responses(
             ),
             settings=settings,
             account_id=account_id,
-        ) as resp:
+        )
+        resp = await response_context.__aenter__()
+        if on_response_started is not None:
+            on_response_started()
+        response_context_exit_owned = False
+        response_context_exited = False
+
+        async def exit_response_context() -> None:
+            nonlocal response_context_exited
+            if response_context_exited:
+                return
+            response_context_exited = True
+            await response_context.__aexit__(None, None, None)
+
+        def transfer_chunk_read_and_response_close(task: asyncio.Task[bytes]) -> None:
+            nonlocal response_context_exit_owned
+            response_context_exit_owned = True
+            task.cancel()
+
+            async def reconcile() -> None:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    await exit_response_context()
+
+            reconciliation = asyncio.create_task(reconcile())
+            _track_direct_transport_task(
+                cast(asyncio.Task[object], reconciliation),
+                cleanup_tasks=cleanup_tasks,
+                label="late HTTP SSE chunk read and response close",
+            )
+
+        try:
             status_code = resp.status
             if resp.status >= 400:
                 if raise_for_status:
@@ -1839,17 +2060,24 @@ async def stream_responses(
                 effective_idle_timeout,
                 settings.max_sse_event_bytes,
                 diagnostics=http_stream_diagnostics,
+                cleanup_tasks=cleanup_tasks,
+                on_chunk_detach=transfer_chunk_read_and_response_close,
             ):
                 event_block = _normalize_sse_event_block(event_block)
                 event = parse_sse_event(event_block)
                 if event:
                     http_stream_diagnostics.last_event_type = event.type
                     event_type = event.type
+                    if event.response is not None and event.response.id:
+                        upstream_response_id = event.response.id
                     if event_type in ("response.completed", "response.failed", "response.incomplete"):
                         seen_terminal = True
                 yield event_block
                 if seen_terminal:
                     break
+        finally:
+            if not response_context_exit_owned:
+                await exit_response_context()
 
     _maybe_log_upstream_request_start(
         kind="responses",
@@ -1876,12 +2104,15 @@ async def stream_responses(
                     raise_for_status=raise_for_status,
                     account_id=account_id,
                     proxy_url=upstream_proxy_url,
+                    cleanup_tasks=cleanup_tasks,
                 ):
                     if status_code is None:
                         status_code = 101
                     event = parse_sse_event(event_block)
                     if event:
                         event_type = event.type
+                        if event.response is not None and event.response.id:
+                            upstream_response_id = event.response.id
                         if event_type in ("response.completed", "response.failed", "response.incomplete"):
                             seen_terminal = True
                     yield event_block
@@ -1899,7 +2130,7 @@ async def stream_responses(
                     if raise_for_status:
                         raise ProxyResponseError(exc.status, error_payload) from exc
                     yield format_sse_event(
-                        response_failed_event(error_code, error_message, response_id=get_request_id())
+                        response_failed_event(error_code, error_message, response_id=terminal_response_id())
                     )
                     return
 
@@ -1966,7 +2197,7 @@ async def stream_responses(
             response_failed_event(
                 "stream_idle_timeout",
                 "Upstream stream idle timeout",
-                response_id=get_request_id(),
+                response_id=terminal_response_id(),
             ),
         )
         return
@@ -1977,7 +2208,7 @@ async def stream_responses(
             response_failed_event(
                 "stream_event_too_large",
                 str(exc),
-                response_id=get_request_id(),
+                response_id=terminal_response_id(),
             ),
         )
         return
@@ -1985,14 +2216,20 @@ async def stream_responses(
         error_code = "upstream_unavailable"
         error_message = "Upstream circuit breaker is open"
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+            response_failed_event("upstream_unavailable", error_message, response_id=terminal_response_id()),
         )
         return
     except aiohttp.ClientError as exc:
-        error_code = "upstream_unavailable"
-        error_message = str(exc)
+        error_code = (
+            "upstream_connect_timeout"
+            if isinstance(exc, UpstreamWebSocketConnectTimeoutError)
+            else "upstream_unavailable"
+        )
+        logger.warning("Direct Responses upstream transport failed", exc_info=True)
+        error_message = "Upstream connection failed"
+        status_code = 502
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", str(exc), response_id=get_request_id()),
+            response_failed_event(error_code, error_message, response_id=terminal_response_id()),
         )
         return
     except asyncio.CancelledError:
@@ -2000,9 +2237,10 @@ async def stream_responses(
     except asyncio.TimeoutError as exc:
         if isinstance(exc, aiohttp.ClientError):
             error_code = "upstream_unavailable"
-            error_message = str(exc) or "Request to upstream timed out"
+            logger.warning("Direct Responses upstream transport timed out", exc_info=True)
+            error_message = "Upstream connection timed out"
             yield format_sse_event(
-                response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+                response_failed_event("upstream_unavailable", error_message, response_id=terminal_response_id()),
             )
             return
         error_code = "upstream_request_timeout"
@@ -2011,14 +2249,17 @@ async def stream_responses(
             response_failed_event(
                 "upstream_request_timeout",
                 "Proxy request budget exhausted",
-                response_id=get_request_id(),
+                response_id=terminal_response_id(),
             ),
         )
         return
-    except Exception as exc:
+    except Exception:
         error_code = "upstream_error"
-        error_message = str(exc)
-        yield format_sse_event(response_failed_event("upstream_error", str(exc), response_id=get_request_id()))
+        logger.warning("Direct Responses upstream stream failed", exc_info=True)
+        error_message = "Upstream request failed"
+        yield format_sse_event(
+            response_failed_event("upstream_error", error_message, response_id=terminal_response_id())
+        )
         return
     else:
         if not seen_terminal:
@@ -2028,7 +2269,7 @@ async def stream_responses(
                 response_failed_event(
                     "stream_incomplete",
                     "Upstream closed stream without completion",
-                    response_id=get_request_id(),
+                    response_id=terminal_response_id(),
                 ),
             )
     finally:
@@ -2174,10 +2415,7 @@ class _CompactCommandTransport:
     async def execute(self) -> CompactResponsePayload:
         settings = get_settings()
         upstream_base = (self.base_url or settings.upstream_base_url).rstrip("/")
-        if self.wire_api in {"responses", "v1"}:
-            url = build_responses_url(upstream_base, self.wire_api)
-        else:
-            url = build_compact_responses_url(upstream_base)
+        url = build_compact_responses_url(upstream_base, self.wire_api)
         upstream_headers = _build_upstream_headers(
             self.headers,
             self.access_token,

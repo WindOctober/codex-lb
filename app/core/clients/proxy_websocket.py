@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, cast
 from urllib.parse import urlparse, urlunparse
@@ -24,9 +25,15 @@ from app.core.clients.proxy import stream_responses as upstream_stream_responses
 from app.core.clients.upstream import build_responses_url
 from app.core.config.settings import get_settings
 from app.core.egress import select_upstream_egress
-from app.core.errors import OpenAIErrorEnvelope, openai_error
+from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope, openai_error
 from app.core.openai.parsing import parse_error_payload
 from app.core.openai.requests import ResponsesRequest
+from app.core.openai.upstream_error_sanitization import (
+    sanitize_upstream_openai_error_envelope,
+    sanitize_upstream_websocket_error_detail,
+    sanitize_upstream_websocket_event_text,
+)
+from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import extract_sse_data, parse_sse_data_json
 
@@ -48,6 +55,7 @@ _RESPONSES_WEBSOCKET_BETA_HEADER = "responses_websockets=2026-02-06"
 class UpstreamWebSocketMessage:
     kind: str
     text: str | None = None
+    raw_text: str | None = None
     data: bytes | None = None
     close_code: int | None = None
     error: str | None = None
@@ -84,11 +92,15 @@ class WebsocketsResponsesWebSocket:
             return UpstreamWebSocketMessage(
                 kind="error",
                 close_code=_close_code_from_exception(exc),
-                error=str(exc),
+                error="Upstream websocket connection failed",
             )
 
         if isinstance(message, str):
-            return UpstreamWebSocketMessage(kind="text", text=message)
+            return UpstreamWebSocketMessage(
+                kind="text",
+                text=sanitize_upstream_websocket_event_text(message),
+                raw_text=message,
+            )
         if isinstance(message, bytes):
             return UpstreamWebSocketMessage(kind="binary", data=message)
         return UpstreamWebSocketMessage(kind="error", error=f"Unexpected websocket message type: {type(message)!r}")
@@ -116,12 +128,14 @@ class HTTPResponsesWebSocket:
         account_id: str | None,
         base_url: str | None,
         wire_api: str,
+        cleanup_tasks: set[asyncio.Task[None]] | None,
     ) -> None:
         self._headers = dict(headers)
         self._access_token = access_token
         self._account_id = account_id
         self._base_url = base_url
         self._wire_api = wire_api
+        self._cleanup_tasks = cleanup_tasks
         self._queue: asyncio.Queue[UpstreamWebSocketMessage] = asyncio.Queue()
         self._stream_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -129,9 +143,18 @@ class HTTPResponsesWebSocket:
 
     async def send_text(self, text: str) -> None:
         request = _responses_request_from_websocket_text(text)
-        task = asyncio.create_task(self._stream_request(request))
+        submission_started: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        def consume_submission_result(completed: asyncio.Future[None]) -> None:
+            if completed.cancelled():
+                return
+            completed.exception()
+
+        submission_started.add_done_callback(consume_submission_result)
+        task = asyncio.create_task(self._stream_request(request, submission_started))
         self._stream_tasks.add(task)
         task.add_done_callback(self._stream_tasks.discard)
+        await asyncio.shield(submission_started)
 
     async def send_bytes(self, data: bytes) -> None:
         await self._enqueue_error_event(
@@ -163,7 +186,21 @@ class HTTPResponsesWebSocket:
     def response_header(self, name: str) -> str | None:
         return None
 
-    async def _stream_request(self, payload: ResponsesRequest) -> None:
+    async def _stream_request(
+        self,
+        payload: ResponsesRequest,
+        submission_started: asyncio.Future[None],
+    ) -> None:
+        def acknowledge_submission() -> None:
+            if not submission_started.done():
+                submission_started.set_result(None)
+
+        def fail_submission(exc: BaseException) -> bool:
+            if submission_started.done():
+                return False
+            submission_started.set_exception(exc)
+            return True
+
         try:
             async for line in upstream_stream_responses(
                 payload,
@@ -173,26 +210,62 @@ class HTTPResponsesWebSocket:
                 base_url=self._base_url,
                 wire_api=self._wire_api,
                 raise_for_status=True,
+                upstream_stream_transport_override="http",
+                cleanup_tasks=self._cleanup_tasks,
+                on_response_started=acknowledge_submission,
             ):
                 if self._closed:
+                    return
+                if fail_submission(
+                    ProxyResponseError(
+                        502,
+                        openai_error("upstream_unavailable", "Upstream request submission failed"),
+                    )
+                ):
                     return
                 text_payload = _websocket_text_from_sse_event(line)
                 if text_payload is None:
                     continue
-                await self._queue.put(UpstreamWebSocketMessage(kind="text", text=text_payload))
+                await self._queue.put(
+                    UpstreamWebSocketMessage(
+                        kind="text",
+                        text=sanitize_upstream_websocket_event_text(text_payload),
+                        raw_text=text_payload,
+                    )
+                )
         except ProxyResponseError as exc:
-            await self._enqueue_error_event(exc.payload)
+            if not fail_submission(exc):
+                await self._enqueue_error_event(exc.payload)
         except asyncio.CancelledError:
+            if not submission_started.done():
+                submission_started.cancel()
             raise
         except Exception as exc:
-            await self._enqueue_error_event(
-                openai_error("upstream_error", str(exc) or "HTTP responses transport failed")
+            if not fail_submission(exc):
+                await self._enqueue_error_event(openai_error("upstream_error", "Upstream request failed"))
+        finally:
+            fail_submission(
+                ProxyResponseError(
+                    502,
+                    openai_error("upstream_unavailable", "Upstream request submission failed"),
+                )
             )
 
     async def _enqueue_error_event(self, payload: OpenAIErrorEnvelope) -> None:
         if self._closed:
             return
-        await self._queue.put(UpstreamWebSocketMessage(kind="text", text=_serialize_error_event_payload(payload)))
+        sanitized_error = cast(
+            OpenAIErrorDetail,
+            sanitize_upstream_websocket_error_detail(
+                cast(Mapping[str, JsonValue], payload["error"]),
+            ),
+        )
+        sanitized_payload: OpenAIErrorEnvelope = {
+            "error": sanitized_error,
+        }
+        await self._queue.put(
+            UpstreamWebSocketMessage(kind="text", text=_serialize_error_event_payload(sanitized_payload))
+        )
 
     async def _enqueue_close(self) -> None:
         if self._close_enqueued:
@@ -261,6 +334,7 @@ async def connect_responses_websocket(
     base_url: str | None = None,
     wire_api: str = "codex",
     session: object | None = None,
+    cleanup_tasks: set[asyncio.Task[None]] | None = None,
 ) -> UpstreamResponsesWebSocket:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -271,6 +345,7 @@ async def connect_responses_websocket(
             account_id=account_id,
             base_url=base_url,
             wire_api=wire_api,
+            cleanup_tasks=cleanup_tasks,
         )
     url = _responses_websocket_url(upstream_base, wire_api)
     upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
@@ -302,21 +377,27 @@ async def connect_responses_websocket(
             _handshake_error_payload(response.status_code, message, response.headers, response.body),
         ) from exc
     except InvalidHandshake as exc:
-        message = str(exc) or "Invalid upstream websocket handshake"
         raise ProxyResponseError(
             502,
-            openai_error("upstream_unavailable", message, error_type="server_error"),
+            openai_error(
+                "upstream_unavailable",
+                "Upstream websocket handshake failed",
+                error_type="server_error",
+            ),
         ) from exc
     except InvalidProxy as exc:
-        message = str(exc) or "Invalid upstream websocket proxy configuration"
         raise ProxyResponseError(
             502,
-            openai_error("upstream_unavailable", message, error_type="server_error"),
+            openai_error(
+                "upstream_unavailable",
+                "Upstream websocket proxy connection failed",
+                error_type="server_error",
+            ),
         ) from exc
     except OSError as exc:
         raise ProxyResponseError(
             502,
-            openai_error("upstream_unavailable", str(exc)),
+            openai_error("upstream_unavailable", "Upstream websocket connection failed"),
         ) from exc
 
     return WebsocketsResponsesWebSocket(response)
@@ -392,16 +473,18 @@ def _handshake_error_payload(
 ) -> OpenAIErrorEnvelope:
     parsed = _try_parse_handshake_error_payload(headers, body)
     if parsed is not None:
-        return parsed
+        return sanitize_upstream_openai_error_envelope(parsed)
     if status_code == 401:
-        return openai_error("invalid_api_key", message, error_type="authentication_error")
-    if status_code == 429:
-        return openai_error("rate_limit_exceeded", message, error_type="rate_limit_error")
-    if status_code == 403:
-        return openai_error("forbidden", message, error_type="permission_error")
-    if status_code >= 500:
-        return openai_error("upstream_error", message, error_type="server_error")
-    return openai_error("invalid_request_error", message, error_type="invalid_request_error")
+        raw = openai_error("invalid_api_key", message, error_type="authentication_error")
+    elif status_code == 429:
+        raw = openai_error("rate_limit_exceeded", message, error_type="rate_limit_error")
+    elif status_code == 403:
+        raw = openai_error("forbidden", message, error_type="permission_error")
+    elif status_code >= 500:
+        raw = openai_error("upstream_error", message, error_type="server_error")
+    else:
+        raw = openai_error("invalid_request_error", message, error_type="invalid_request_error")
+    return sanitize_upstream_openai_error_envelope(raw)
 
 
 def _try_parse_handshake_error_payload(

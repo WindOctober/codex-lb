@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.utils.time import utcnow
-from app.db.models import Base, HttpBridgeSessionAlias
-from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
+from app.db.models import Base, HttpBridgeSessionAlias, HttpBridgeSessionState
+from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup, DurableBridgeSessionCoordinator
 
 pytestmark = pytest.mark.unit
 
@@ -55,6 +55,8 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
     await coordinator.register_session_header(
         session_id=claimed.session_id,
         api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
         session_header="sid-123",
     )
     await coordinator.register_turn_state(
@@ -110,7 +112,7 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
 
 
 @pytest.mark.asyncio
-async def test_durable_bridge_claim_renews_same_owner_epoch(
+async def test_durable_bridge_claim_fences_previous_same_instance_owner(
     coordinator: DurableBridgeSessionCoordinator,
 ) -> None:
     claimed = await coordinator.claim_live_session(
@@ -142,9 +144,47 @@ async def test_durable_bridge_claim_renews_same_owner_epoch(
     )
 
     assert renewed.session_id == claimed.session_id
-    assert renewed.owner_epoch == claimed.owner_epoch
+    assert renewed.owner_epoch == claimed.owner_epoch + 1
     assert renewed.latest_turn_state == "http_turn_2"
     assert renewed.latest_response_id == "resp_2"
+
+    stale_renewal = await coordinator.renew_live_session(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        lease_ttl_seconds=60.0,
+        latest_turn_state="http_turn_stale",
+    )
+    assert stale_renewal is None
+
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_stale_owner",
+        lease_ttl_seconds=60.0,
+    )
+    stale_alias = await coordinator.lookup_request_targets(
+        session_key_kind="request",
+        session_key_value="req-stale-owner",
+        api_key_id=None,
+        turn_state=None,
+        session_header=None,
+        previous_response_id="resp_stale_owner",
+    )
+    assert stale_alias is None
+
+    stale_release = await coordinator.release_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        draining=False,
+    )
+    assert stale_release is not None
+    assert stale_release.owner_instance_id == "instance-a"
+    assert stale_release.owner_epoch == renewed.owner_epoch
 
 
 @pytest.mark.asyncio
@@ -512,6 +552,24 @@ async def test_durable_bridge_lookup_active_lease_survives_request_lookup(
     assert lookup is not None
     assert lookup.owner_instance_id == "instance-a"
     assert lookup.latest_response_id == "resp_1"
+    assert lookup.lease_is_active(now=utcnow()) is True
+
+
+def test_durable_bridge_lookup_compares_aware_lease_with_naive_utc_now() -> None:
+    lookup = DurableBridgeLookup(
+        session_id="timezone-lookup",
+        canonical_kind="session_header",
+        canonical_key="timezone-key",
+        api_key_scope="__anonymous__",
+        account_id=None,
+        owner_instance_id="instance-a",
+        owner_epoch=1,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        state=HttpBridgeSessionState.ACTIVE,
+        latest_turn_state=None,
+        latest_response_id=None,
+    )
+
     assert lookup.lease_is_active(now=utcnow()) is True
 
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import gc
 from collections.abc import AsyncIterator
 
+import anyio
 import pytest
 
 import app.modules.proxy.api as proxy_api_module
@@ -12,6 +15,162 @@ pytestmark = pytest.mark.unit
 async def _iter_blocks(*blocks: str) -> AsyncIterator[str]:
     for block in blocks:
         yield block
+
+
+class _ClosableBlocks:
+    def __init__(self, *blocks: str) -> None:
+        self._blocks = iter(blocks)
+        self.close_calls = 0
+
+    def __aiter__(self) -> _ClosableBlocks:
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            return next(self._blocks)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _CancellationAwareClosableBlocks(_ClosableBlocks):
+    def __init__(self, *blocks: str) -> None:
+        super().__init__(*blocks)
+        self.close_started = False
+        self.close_finished = False
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started = True
+        await anyio.sleep(0)
+        self.close_finished = True
+
+
+class _DirectTaskCancellationClosableBlocks(_ClosableBlocks):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.allow_close = asyncio.Event()
+        self.close_finished = False
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.allow_close.wait()
+        self.close_finished = True
+
+
+@pytest.mark.asyncio
+async def test_public_responses_wrapper_chain_closes_child_once_after_first_event() -> None:
+    child = _ClosableBlocks(
+        'data: {"type":"response.created","response":{"id":"resp_wrapper"}}\n\n',
+    )
+    normalized = proxy_api_module._normalize_public_responses_stream(child)
+    first = await normalized.__anext__()
+    public_stream = proxy_api_module._prepend_first(first, normalized)
+
+    assert await public_stream.__anext__() == first
+    await public_stream.aclose()
+
+    assert child.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_public_responses_wrapper_chain_shields_child_close_from_cancellation_scope() -> None:
+    child = _CancellationAwareClosableBlocks(
+        'data: {"type":"response.created","response":{"id":"resp_cancelled_wrapper"}}\n\n',
+    )
+    normalized = proxy_api_module._normalize_public_responses_stream(child)
+    first = await normalized.__anext__()
+    public_stream = proxy_api_module._prepend_first(first, normalized)
+
+    assert await public_stream.__anext__() == first
+    with anyio.CancelScope() as cancel_scope:
+        cancel_scope.cancel()
+        await public_stream.aclose()
+
+    assert child.close_started is True
+    assert child.close_finished is True
+    assert child.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_public_responses_child_close_finishes_after_direct_task_cancellation() -> None:
+    child = _DirectTaskCancellationClosableBlocks()
+    close_task = asyncio.create_task(proxy_api_module._close_async_iterator(child))
+    await asyncio.wait_for(child.close_started.wait(), timeout=1.0)
+
+    close_task.cancel()
+    child.allow_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    assert child.close_finished is True
+    assert child.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_streaming_response_closes_wrapper_chain_on_asgi_disconnect() -> None:
+    child_closed = 0
+    send_started = anyio.Event()
+    loop_errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(dict(context)))
+
+    async def child_stream() -> AsyncIterator[str]:
+        nonlocal child_closed
+        try:
+            yield 'data: {"type":"response.created","response":{"id":"resp_disconnect"}}\n\n'
+            await anyio.sleep_forever()
+        finally:
+            with anyio.CancelScope(shield=True):
+                await anyio.sleep(0)
+                child_closed += 1
+
+    normalized = proxy_api_module._normalize_public_responses_stream(child_stream())
+    first = await anext(normalized)
+    public_stream = proxy_api_module._prepend_first(first, normalized)
+    response = proxy_api_module._OwnedStreamingResponse(public_stream)
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body" and message.get("more_body") is True:
+            send_started.set()
+            await anyio.sleep_forever()
+
+    async def receive() -> dict[str, str]:
+        await send_started.wait()
+        return {"type": "http.disconnect"}
+
+    try:
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.3"}},
+            receive,
+            send,
+        )
+        del response, public_stream, normalized
+        for _ in range(4):
+            gc.collect()
+            await anyio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert child_closed == 1
+    assert loop_errors == []
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_closes_child_after_normal_completion() -> None:
+    child = _ClosableBlocks(
+        'data: {"type":"response.completed","response":{"id":"resp_done","output":[]}}\n\n',
+    )
+
+    blocks = [block async for block in proxy_api_module._normalize_public_responses_stream(child)]
+
+    assert len(blocks) == 1
+    assert child.close_calls == 1
 
 
 @pytest.mark.asyncio

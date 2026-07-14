@@ -13,6 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { useDialogState } from "@/hooks/use-dialog-state";
 import { AccountDetail } from "@/features/accounts/components/account-detail";
 import { AccountList } from "@/features/accounts/components/account-list";
@@ -62,14 +63,14 @@ export function AccountsPage() {
   const updateSettingsMutation = useMutation({
     mutationFn: (payload: SettingsUpdateRequest) => updateSettings(payload),
     onSuccess: async () => {
-      toast.success("Routing strategy updated");
+      toast.success("Account routing settings updated");
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["settings", "detail"] }),
         queryClient.invalidateQueries({ queryKey: ["accounts", "list"] }),
       ]);
     },
     onError: (error: Error) => {
-      toast.error(error.message || "Routing strategy update failed");
+      toast.error(error.message || "Account routing settings update failed");
     },
   });
 
@@ -167,6 +168,26 @@ export function AccountsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <label
+            className="flex h-8 items-center gap-2 rounded-md border px-2.5 text-xs font-medium"
+            title="Ignore five-hour usage snapshots; weekly limits and upstream rate limits remain enforced."
+          >
+            <span>Ignore 5h</span>
+            <Switch
+              size="sm"
+              aria-label="Ignore five-hour limit"
+              checked={settingsQuery.data?.ignoreFiveHourLimit ?? false}
+              disabled={!settingsQuery.data || updateSettingsMutation.isPending}
+              onCheckedChange={(checked) => {
+                if (!settingsQuery.data) return;
+                void updateSettingsMutation.mutateAsync(
+                  buildSettingsUpdateRequest(settingsQuery.data, {
+                    ignoreFiveHourLimit: checked,
+                  }),
+                );
+              }}
+            />
+          </label>
           <span className="text-xs font-medium text-muted-foreground">
             Routing
           </span>
@@ -208,8 +229,8 @@ export function AccountsPage() {
       {!accountsQuery.data ? (
         <AccountsSkeleton />
       ) : (
-        <div className="grid gap-4 lg:grid-cols-[22rem_minmax(0,1fr)]">
-          <div className="rounded-xl border bg-card p-4">
+        <div className="grid min-w-0 gap-4 lg:grid-cols-[22rem_minmax(0,1fr)]">
+          <div className="min-w-0 rounded-xl border bg-card p-4">
             <AccountList
               accounts={accounts}
               resetCreditsByAccount={resetCreditsByAccount}

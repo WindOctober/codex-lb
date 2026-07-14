@@ -117,6 +117,7 @@ async def test_request_logging_preserves_fields_and_normalizes_session_id() -> N
             "input_tokens": 10,
             "output_tokens": 20,
             "cached_input_tokens": 4,
+            "cache_write_tokens": None,
             "reasoning_tokens": 3,
             "reasoning_effort": "high",
             "transport": "websocket",

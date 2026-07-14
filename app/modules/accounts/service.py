@@ -62,6 +62,7 @@ from app.modules.accounts.schemas import (
     AccountQuotaStatus,
     AccountQuotaWindow,
     AccountRateLimitResetConsumeResponse,
+    AccountRateLimitResetCredit,
     AccountRateLimitResetCreditsResponse,
     AccountRequestUsage,
     AccountRuntimeState,
@@ -75,7 +76,7 @@ from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
 from app.modules.usage.latest_model import get_latest_model_quota_key
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
-from app.modules.usage.updater import AdditionalUsageRepositoryPort, UsageUpdater
+from app.modules.usage.updater import AdditionalUsageRepositoryPort, UsageRefreshRepoFactory, UsageUpdater
 
 _SPARKLINE_DAYS = 7
 _DETAIL_BUCKET_SECONDS = 3600  # 1h → 168 points
@@ -140,11 +141,22 @@ class AccountsService:
         repo: AccountsRepository,
         usage_repo: UsageRepository | None = None,
         additional_usage_repo: AdditionalUsageRepository | AdditionalUsageRepositoryPort | None = None,
+        *,
+        usage_refresh_repo_factory: UsageRefreshRepoFactory | None = None,
     ) -> None:
         self._repo = repo
         self._usage_repo = usage_repo
         self._additional_usage_repo = additional_usage_repo
-        self._usage_updater = UsageUpdater(usage_repo, repo, additional_usage_repo) if usage_repo else None
+        self._usage_updater = (
+            UsageUpdater(
+                usage_repo,
+                repo,
+                additional_usage_repo,
+                repo_factory=usage_refresh_repo_factory,
+            )
+            if usage_repo
+            else None
+        )
         self._encryptor = TokenEncryptor()
         self._auth_manager = AuthManager(repo)
 
@@ -315,9 +327,25 @@ class AccountsService:
             return None
         account = await self._prepare_reset_credit_account(account)
         credits = await self._fetch_rate_limit_reset_credits(account)
+        available_credits = sorted(
+            credits.available_credits,
+            key=lambda credit: (
+                credit.expires_at is None,
+                credit.expires_at.timestamp() if credit.expires_at is not None else 0.0,
+            ),
+        )
         return AccountRateLimitResetCreditsResponse(
             account_id=account.id,
             available_count=credits.available_count,
+            credits=[
+                AccountRateLimitResetCredit(
+                    reset_type=credit.reset_type,
+                    title=credit.title,
+                    granted_at=credit.granted_at,
+                    expires_at=credit.expires_at,
+                )
+                for credit in available_credits
+            ],
         )
 
     async def consume_rate_limit_reset_credit(

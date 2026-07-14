@@ -200,7 +200,10 @@ async def test_select_account_excludes_locally_full_account(
 
     class FakeSettingsCache:
         async def get(self) -> SimpleNamespace:
-            return SimpleNamespace(sticky_reallocation_budget_threshold_pct=85.0)
+            return SimpleNamespace(
+                sticky_reallocation_budget_threshold_pct=85.0,
+                ignore_five_hour_limit=True,
+            )
 
     monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings(proxy_account_model_concurrency_limit=1))
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: FakeSettingsCache())
@@ -215,6 +218,7 @@ async def test_select_account_excludes_locally_full_account(
 
     assert captured[0]["exclude_account_ids"] == {"acc-full"}
     assert captured[1]["exclude_account_ids"] == set()
+    assert all(call["ignore_five_hour_limit"] is True for call in captured)
     assert selection.account is None
     assert selection.error_code == "proxy_overloaded"
 
@@ -781,6 +785,7 @@ async def test_http_bridge_submit_restores_unregistered_session_after_reconnect(
     monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
     monkeypatch.setattr(service, "_evict_http_bridge_pressure", AsyncMock())
     monkeypatch.setattr(service, "_retry_http_bridge_request_on_fresh_upstream", AsyncMock(return_value=True))
+    monkeypatch.setattr(service, "_relay_http_bridge_upstream_messages", AsyncMock())
 
     await service._submit_http_bridge_request(
         session,
@@ -793,6 +798,7 @@ async def test_http_bridge_submit_restores_unregistered_session_after_reconnect(
     assert session.account_model_session_lease is not None
     assert session.upstream.send_text.await_count == 1
     assert state in session.pending_requests
+    await service._close_http_bridge_session(session)
 
 
 @pytest.mark.asyncio
@@ -814,6 +820,7 @@ async def test_http_bridge_submit_waits_for_lifecycle_close_before_reconnect(
     monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
     monkeypatch.setattr(service, "_evict_http_bridge_pressure", AsyncMock())
     monkeypatch.setattr(service, "_retry_http_bridge_request_on_fresh_upstream", retry_reconnect)
+    monkeypatch.setattr(service, "_relay_http_bridge_upstream_messages", AsyncMock())
 
     await session.lifecycle_lock.acquire()
     submit_task = asyncio.create_task(
@@ -835,6 +842,7 @@ async def test_http_bridge_submit_waits_for_lifecycle_close_before_reconnect(
     assert service._http_bridge_sessions[session.key] is session
     assert session.account_model_session_lease is not None
     assert session.upstream.send_text.await_count == 1
+    await service._close_http_bridge_session(session)
 
 
 @pytest.mark.asyncio
@@ -858,16 +866,35 @@ async def test_http_bridge_restore_replaces_idle_hard_key_conflict() -> None:
     failure = await service._restore_http_bridge_session_after_reconnect(
         restored,
         request_id="req-hard-restore",
+        request_deadline_at=time.monotonic() + 1.0,
     )
 
     assert failure is None
     assert existing.closed is True
     assert service._http_bridge_sessions[key] is restored
     assert restored.account_model_session_lease is not None
+    await service._close_http_bridge_session(restored)
 
 
 @pytest.mark.asyncio
-async def test_http_bridge_submit_allows_detached_soft_prompt_cache_session(
+async def test_http_bridge_detachment_wait_obeys_original_request_deadline() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    detached = asyncio.get_running_loop().create_future()
+
+    with pytest.raises(proxy_service.ProxyResponseError) as exc_info:
+        await service._await_http_bridge_detachment_before_deadline(
+            [detached],
+            request_deadline_at=time.monotonic() + 0.01,
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.payload["error"]["message"] == "Proxy request budget exhausted"
+    assert not detached.cancelled()
+    detached.cancel()
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_submit_rejects_detached_soft_prompt_cache_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -883,16 +910,99 @@ async def test_http_bridge_submit_allows_detached_soft_prompt_cache_session(
     monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
     monkeypatch.setattr(service, "_evict_http_bridge_pressure", AsyncMock())
 
-    await service._submit_http_bridge_request(
-        session,
-        request_state=state,
-        text_data='{"type":"response.create"}',
-        queue_limit=0,
-    )
+    with pytest.raises(proxy_service.ProxyResponseError) as exc_info:
+        await service._submit_http_bridge_request(
+            session,
+            request_state=state,
+            text_data='{"type":"response.create"}',
+            queue_limit=0,
+        )
 
     assert service._http_bridge_sessions[session.key] is replacement
-    assert session.upstream.send_text.await_count == 1
-    assert state in session.pending_requests
+    assert exc_info.value.payload["error"]["code"] == "upstream_unavailable"
+    assert session.closed is True
+    assert session.upstream.send_text.await_count == 0
+    assert state not in session.pending_requests
+    await asyncio.gather(*tuple(service._http_bridge_background_close_tasks))
+    session.upstream.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_restore_soft_conflict_closes_unpublished_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _bridge_session()
+    session.closed = True
+    session.account_model_session_lease = None
+    replacement = _pressure_bridge_session(
+        session.key,
+        account_id="acc-replacement-race",
+        created_at=time.monotonic(),
+        last_used_at=time.monotonic(),
+    )
+    state = _request_state("req-soft-restore-race")
+    relay = AsyncMock()
+
+    async def reconnect_then_publish_competitor(*_args: object, **_kwargs: object) -> bool:
+        service._http_bridge_sessions[session.key] = replacement
+        session.closed = False
+        return True
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(service, "_evict_http_bridge_pressure", AsyncMock())
+    monkeypatch.setattr(service, "_retry_http_bridge_request_on_fresh_upstream", reconnect_then_publish_competitor)
+    monkeypatch.setattr(service, "_relay_http_bridge_upstream_messages", relay)
+
+    with pytest.raises(proxy_service.ProxyResponseError) as exc_info:
+        await service._submit_http_bridge_request(
+            session,
+            request_state=state,
+            text_data='{"type":"response.create"}',
+            queue_limit=0,
+        )
+
+    assert exc_info.value.payload["error"]["code"] == "upstream_unavailable"
+    assert service._http_bridge_sessions[session.key] is replacement
+    assert session.closed is True
+    assert session.account_model_session_lease is None
+    assert (
+        service._http_bridge_account_model_sessions.active_count(
+            account_id=session.account.id,
+            model=session.request_model,
+        )
+        == 0
+    )
+    relay.assert_not_awaited()
+    await asyncio.gather(*tuple(service._http_bridge_background_close_tasks))
+    session.upstream.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_detached_http_bridge_session_cannot_publish_continuity_aliases() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    detached = _bridge_session()
+    detached.durable_session_id = "durable-detached"
+    detached.durable_owner_epoch = 1
+    replacement = _pressure_bridge_session(
+        detached.key,
+        account_id="acc-alias-owner",
+        created_at=time.monotonic(),
+        last_used_at=time.monotonic(),
+    )
+    service._http_bridge_sessions[detached.key] = replacement
+    service._durable_bridge.register_turn_state = AsyncMock()
+    service._durable_bridge.register_previous_response_id = AsyncMock()
+
+    await service._register_http_bridge_turn_state(detached, "http_turn_detached")
+    await service._register_http_bridge_previous_response_id(detached, "resp_detached")
+
+    assert detached.downstream_turn_state_aliases == set()
+    assert detached.previous_response_ids == set()
+    assert service._http_bridge_turn_state_index == {}
+    assert service._http_bridge_previous_response_index == {}
+    service._durable_bridge.register_turn_state.assert_not_awaited()
+    service._durable_bridge.register_previous_response_id.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -916,6 +1026,7 @@ async def test_finalize_websocket_request_state_releases_account_model_budget(
         event_type="response.completed",
         payload=None,
         api_key=None,
+        api_key_reservation=None,
         upstream_control=proxy_service._WebSocketUpstreamControl(),
         response_create_gate=None,
     )

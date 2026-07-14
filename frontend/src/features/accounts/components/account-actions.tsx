@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ResetCreditDeadlines } from "@/features/accounts/components/reset-credit-deadlines";
 import type {
   AccountRateLimitResetCreditsResponse,
   AccountSummary,
@@ -51,54 +52,67 @@ export function AccountActions({
   return (
     <div className="space-y-3 border-t pt-4">
       {resetSupported ? (
-        <div className="flex flex-col gap-3 rounded-lg border border-emerald-500/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.12),rgba(59,130,246,0.08))] px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-emerald-500/25 bg-background/70 text-emerald-500">
-              <Sparkles className="h-4 w-4" />
-            </span>
-            <div className="min-w-0">
-              <p className="text-xs font-semibold text-foreground">
-                Rate-limit resets
-              </p>
-              <p className="text-xs text-muted-foreground">
-                {resetCreditsLoading
-                  ? "Checking available credits..."
-                  : resetCreditsError
-                    ? "Could not load available credits"
-                    : `${resetCreditCount} available`}
-              </p>
+        <div className="overflow-hidden rounded-lg border border-border bg-muted/20">
+          <div className="flex flex-col gap-3 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                <Sparkles className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <p className="text-xs font-semibold text-foreground">
+                  Rate-limit resets
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {resetCreditsLoading
+                    ? "Checking available credits..."
+                    : resetCreditsError
+                      ? "Could not load available credits"
+                      : `${resetCreditCount} available`}
+                </p>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                type="button"
+                size="icon-sm"
+                variant="outline"
+                className="h-8 w-8 bg-background/70"
+                onClick={onRefreshResetCredits}
+                disabled={busy || resetCreditsLoading}
+                title="Refresh reset credits"
+                aria-label="Refresh reset credits"
+              >
+                <RefreshCw
+                  className={
+                    resetCreditsLoading
+                      ? "h-3.5 w-3.5 animate-spin"
+                      : "h-3.5 w-3.5"
+                  }
+                />
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                className="h-8 gap-1.5 border border-emerald-400/30 bg-emerald-500 text-xs text-white shadow-sm hover:bg-emerald-500/90 dark:bg-emerald-500 dark:text-emerald-950 dark:hover:bg-emerald-400"
+                onClick={() => onUseRateLimitReset(account.accountId)}
+                disabled={resetDisabled}
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Use reset
+              </Button>
             </div>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <Button
-              type="button"
-              size="icon-sm"
-              variant="outline"
-              className="h-8 w-8 bg-background/70"
-              onClick={onRefreshResetCredits}
-              disabled={busy || resetCreditsLoading}
-              title="Refresh reset credits"
-              aria-label="Refresh reset credits"
-            >
-              <RefreshCw
-                className={
-                  resetCreditsLoading
-                    ? "h-3.5 w-3.5 animate-spin"
-                    : "h-3.5 w-3.5"
-                }
-              />
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              className="h-8 gap-1.5 border border-emerald-400/30 bg-emerald-500 text-xs text-white shadow-sm hover:bg-emerald-500/90 dark:bg-emerald-500 dark:text-emerald-950 dark:hover:bg-emerald-400"
-              onClick={() => onUseRateLimitReset(account.accountId)}
-              disabled={resetDisabled}
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Use reset
-            </Button>
-          </div>
+          {!resetCreditsLoading && !resetCreditsError ? (
+            <ResetCreditDeadlines credits={resetCredits?.credits ?? []} />
+          ) : null}
+          {!resetCreditsLoading &&
+          !resetCreditsError &&
+          resetCreditCount > 0 &&
+          (resetCredits?.credits.length ?? 0) === 0 ? (
+            <p className="border-t border-border/70 px-3 py-2.5 text-xs text-muted-foreground">
+              Deadline details unavailable
+            </p>
+          ) : null}
         </div>
       ) : null}
 

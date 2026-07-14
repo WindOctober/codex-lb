@@ -23,6 +23,7 @@ class SettingsRepository:
             sticky_threads_enabled=True,
             upstream_stream_transport="default",
             prefer_earlier_reset_accounts=True,
+            ignore_five_hour_limit=False,
             routing_strategy="high_waterline",
             openai_cache_affinity_max_age_seconds=get_settings().openai_cache_affinity_max_age_seconds,
             import_without_overwrite=True,
@@ -53,6 +54,7 @@ class SettingsRepository:
         sticky_threads_enabled: bool | None = None,
         upstream_stream_transport: str | None = None,
         prefer_earlier_reset_accounts: bool | None = None,
+        ignore_five_hour_limit: bool | None = None,
         routing_strategy: str | None = None,
         openai_cache_affinity_max_age_seconds: int | None = None,
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds: int | None = None,
@@ -70,6 +72,8 @@ class SettingsRepository:
             settings.upstream_stream_transport = upstream_stream_transport
         if prefer_earlier_reset_accounts is not None:
             settings.prefer_earlier_reset_accounts = prefer_earlier_reset_accounts
+        if ignore_five_hour_limit is not None:
+            settings.ignore_five_hour_limit = ignore_five_hour_limit
         if routing_strategy is not None:
             settings.routing_strategy = routing_strategy
         if openai_cache_affinity_max_age_seconds is not None:

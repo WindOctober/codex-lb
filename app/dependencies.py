@@ -38,6 +38,7 @@ from app.modules.settings.service import SettingsService
 from app.modules.sticky_sessions.service import StickySessionsService
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.service import UsageService
+from app.modules.usage.updater import background_usage_refresh_repo_context
 
 
 @dataclass(slots=True)
@@ -134,7 +135,12 @@ def get_accounts_context(
     repository = AccountsRepository(session)
     usage_repository = UsageRepository(session)
     additional_usage_repository = AdditionalUsageRepository(session)
-    service = AccountsService(repository, usage_repository, additional_usage_repository)
+    service = AccountsService(
+        repository,
+        usage_repository,
+        additional_usage_repository,
+        usage_refresh_repo_factory=background_usage_refresh_repo_context,
+    )
     return AccountsContext(
         session=session,
         repository=repository,

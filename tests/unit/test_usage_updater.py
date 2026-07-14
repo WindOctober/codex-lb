@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -68,6 +70,36 @@ async def test_usage_refresh_singleflight_cancel_all_cancels_inflight_task() -> 
         await task
     assert cancelled.is_set()
     assert usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_singleflight_cancel_all_is_bounded_when_task_suppresses_cancellation() -> None:
+    started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def factory():
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await allow_finish.wait()
+        return usage_updater_module.AccountRefreshResult(usage_written=False)
+
+    waiter = asyncio.create_task(usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT.run("acc_bounded", factory))
+    await started.wait()
+    started_at = time.monotonic()
+
+    await usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT.cancel_all(timeout_seconds=0.01)
+
+    assert time.monotonic() - started_at < 0.2
+    assert cancellation_seen.is_set()
+    assert usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT._detached
+    allow_finish.set()
+    assert await waiter == usage_updater_module.AccountRefreshResult(usage_written=False)
+    await asyncio.sleep(0)
+    assert usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT._detached == set()
 
 
 @pytest.mark.asyncio
@@ -211,6 +243,14 @@ class StubUsageRepository:
         )
         self._next_id += 1
         return entry
+
+    async def delete_for_account_window(self, account_id: str, window: str) -> None:
+        expected_window = window or "primary"
+        self.entries = [
+            entry
+            for entry in self.entries
+            if not (entry.account_id == account_id and (entry.window or "primary") == expected_window)
+        ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -772,6 +812,165 @@ async def test_usage_updater_persists_primary_and_secondary_usage(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_usage_updater_weekly_only_snapshot_retires_stale_primary(monkeypatch) -> None:
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        return UsagePayload.model_validate(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 1.0,
+                        "reset_at": 1736294400,
+                        "limit_window_seconds": 604800,
+                    },
+                    "secondary_window": None,
+                }
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    await usage_repo.add_entry(
+        "acc_weekly_only",
+        100.0,
+        window="primary",
+        reset_at=1735689600,
+        window_minutes=300,
+    )
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    acc = _make_account("acc_weekly_only", "workspace_weekly_only")
+
+    await updater.refresh_account_now(acc)
+
+    assert [entry for entry in usage_repo.entries if entry.window == "primary"] == []
+    secondary = [entry for entry in usage_repo.entries if entry.window == "secondary"][-1]
+    assert secondary.used_percent == 1.0
+    assert secondary.window_minutes == 10080
+
+
+@pytest.mark.asyncio
+async def test_usage_updater_weekly_replacement_failure_preserves_last_primary_snapshot(monkeypatch) -> None:
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        return UsagePayload.model_validate(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 1.0,
+                        "reset_at": 1736294400,
+                        "limit_window_seconds": 604800,
+                    },
+                    "secondary_window": None,
+                }
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+    usage_repo = StubUsageRepository()
+    await usage_repo.add_entry(
+        "acc_weekly_replace_failure",
+        100.0,
+        window="primary",
+        reset_at=1735689600,
+        window_minutes=300,
+    )
+    original_add_entry = usage_repo.add_entry
+
+    async def fail_secondary_add(*args: Any, **kwargs: Any):
+        if kwargs.get("window") == "secondary":
+            raise RuntimeError("transient insert failure")
+        return await original_add_entry(*args, **kwargs)
+
+    monkeypatch.setattr(usage_repo, "add_entry", fail_secondary_add)
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    account = _make_account("acc_weekly_replace_failure", "workspace_weekly_replace_failure")
+
+    with pytest.raises(RuntimeError, match="transient insert failure"):
+        await updater.refresh_account_now(account)
+
+    primary = [entry for entry in usage_repo.entries if entry.window == "primary"]
+    assert len(primary) == 1
+    assert primary[0].used_percent == 100.0
+
+
+@pytest.mark.asyncio
+async def test_usage_updater_records_primary_again_when_upstream_restores_it(monkeypatch) -> None:
+    payloads = iter(
+        [
+            UsagePayload.model_validate(
+                {
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 2.0,
+                            "reset_at": 1736294400,
+                            "limit_window_seconds": 604800,
+                        }
+                    }
+                }
+            ),
+            UsagePayload.model_validate(
+                {
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 3.0,
+                            "reset_at": 1735707600,
+                            "limit_window_seconds": 18000,
+                        },
+                        "secondary_window": {
+                            "used_percent": 4.0,
+                            "reset_at": 1736294400,
+                            "limit_window_seconds": 604800,
+                        },
+                    }
+                }
+            ),
+        ]
+    )
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        return next(payloads)
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    acc = _make_account("acc_primary_returns", "workspace_primary_returns")
+
+    await updater.refresh_account_now(acc)
+    await updater.refresh_account_now(acc)
+
+    primary = [entry for entry in usage_repo.entries if entry.window == "primary"][-1]
+    assert primary.used_percent == 3.0
+    assert primary.window_minutes == 300
+
+
+@pytest.mark.asyncio
+async def test_usage_updater_failure_does_not_retire_primary(monkeypatch) -> None:
+    from app.core.clients.usage import UsageFetchError
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        raise UsageFetchError(500, "temporary failure")
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    await usage_repo.add_entry(
+        "acc_failed_refresh",
+        75.0,
+        window="primary",
+        reset_at=1735689600,
+        window_minutes=300,
+    )
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    acc = _make_account("acc_failed_refresh", "workspace_failed_refresh")
+
+    await updater.refresh_account_now(acc)
+
+    primary = [entry for entry in usage_repo.entries if entry.window == "primary"]
+    assert len(primary) == 1
+    assert primary[0].used_percent == 75.0
+
+
+@pytest.mark.asyncio
 async def test_usage_updater_syncs_plan_type_from_usage_payload(monkeypatch) -> None:
     monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
     from app.core.config.settings import get_settings
@@ -1023,6 +1222,62 @@ async def test_usage_updater_singleflights_concurrent_refreshes(monkeypatch) -> 
     assert first_refreshed is True
     assert second_refreshed is True
     assert len(usage_repo.entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_updater_singleflight_task_owns_independent_repositories(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+    fetch_started = asyncio.Event()
+    release_fetch = asyncio.Event()
+
+    async def stub_fetch_usage(**_: Any) -> UsagePayload:
+        fetch_started.set()
+        await release_fetch.wait()
+        return UsagePayload.model_validate(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1735689600,
+                        "limit_window_seconds": 60,
+                    }
+                }
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+    caller_usage = StubUsageRepository(return_rows=True)
+    owned_usage = StubUsageRepository(return_rows=True)
+
+    class _OwnedRepoContext:
+        async def __aenter__(self):
+            return SimpleNamespace(usage=owned_usage, accounts=None, additional_usage=None)
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    updater = UsageUpdater(
+        caller_usage,
+        accounts_repo=None,
+        repo_factory=_OwnedRepoContext,
+    )
+    account = _make_account("acc_owned_refresh", "workspace_owned_refresh", email="owned@example.com")
+    waiter = asyncio.create_task(updater.refresh_accounts([account], latest_usage={}))
+    await fetch_started.wait()
+    child_task = usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT._inflight[account.id]
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release_fetch.set()
+    result = await child_task
+
+    assert result.usage_written is True
+    assert caller_usage.entries == []
+    assert len(owned_usage.entries) == 1
 
 
 # --- Additional rate limits tests ---

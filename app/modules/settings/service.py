@@ -11,6 +11,7 @@ class DashboardSettingsData:
     sticky_threads_enabled: bool
     upstream_stream_transport: str
     prefer_earlier_reset_accounts: bool
+    ignore_five_hour_limit: bool
     routing_strategy: str
     openai_cache_affinity_max_age_seconds: int
     http_responses_session_bridge_prompt_cache_idle_ttl_seconds: int
@@ -28,6 +29,7 @@ class DashboardSettingsUpdateData:
     sticky_threads_enabled: bool
     upstream_stream_transport: str
     prefer_earlier_reset_accounts: bool
+    ignore_five_hour_limit: bool
     routing_strategy: str
     openai_cache_affinity_max_age_seconds: int
     http_responses_session_bridge_prompt_cache_idle_ttl_seconds: int
@@ -50,6 +52,7 @@ class SettingsService:
             sticky_threads_enabled=row.sticky_threads_enabled,
             upstream_stream_transport=row.upstream_stream_transport,
             prefer_earlier_reset_accounts=row.prefer_earlier_reset_accounts,
+            ignore_five_hour_limit=row.ignore_five_hour_limit,
             routing_strategy=row.routing_strategy,
             openai_cache_affinity_max_age_seconds=row.openai_cache_affinity_max_age_seconds,
             http_responses_session_bridge_prompt_cache_idle_ttl_seconds=(
@@ -72,6 +75,7 @@ class SettingsService:
             sticky_threads_enabled=payload.sticky_threads_enabled,
             upstream_stream_transport=payload.upstream_stream_transport,
             prefer_earlier_reset_accounts=payload.prefer_earlier_reset_accounts,
+            ignore_five_hour_limit=payload.ignore_five_hour_limit,
             routing_strategy=payload.routing_strategy,
             openai_cache_affinity_max_age_seconds=payload.openai_cache_affinity_max_age_seconds,
             http_responses_session_bridge_prompt_cache_idle_ttl_seconds=(
@@ -88,6 +92,7 @@ class SettingsService:
             sticky_threads_enabled=row.sticky_threads_enabled,
             upstream_stream_transport=row.upstream_stream_transport,
             prefer_earlier_reset_accounts=row.prefer_earlier_reset_accounts,
+            ignore_five_hour_limit=row.ignore_five_hour_limit,
             routing_strategy=row.routing_strategy,
             openai_cache_affinity_max_age_seconds=row.openai_cache_affinity_max_age_seconds,
             http_responses_session_bridge_prompt_cache_idle_ttl_seconds=(

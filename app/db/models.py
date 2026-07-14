@@ -25,6 +25,8 @@ from sqlalchemy import (
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from app.db.types import UTCDateTime
+
 
 class Base(DeclarativeBase):
     pass
@@ -191,6 +193,7 @@ class RequestLog(Base):
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cached_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -389,6 +392,12 @@ class DashboardSettings(Base):
     )
     prefer_earlier_reset_accounts: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
+    )
+    ignore_five_hour_limit: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        nullable=False,
     )
     routing_strategy: Mapped[str] = mapped_column(
         String,
@@ -712,8 +721,8 @@ class BridgeRingMember(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     instance_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
-    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
-    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    registered_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=func.now())
+    last_heartbeat_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False, default=func.now())
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -733,7 +742,7 @@ class HttpBridgeSessionRecord(Base):
     api_key_scope: Mapped[str] = mapped_column(String(255), nullable=False)
     owner_instance_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     owner_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     state: Mapped[HttpBridgeSessionState] = mapped_column(
         SqlEnum(
             HttpBridgeSessionState,
@@ -755,25 +764,25 @@ class HttpBridgeSessionRecord(Base):
     latest_input_item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     latest_input_full_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        UTCDateTime(),
         nullable=False,
         default=func.now(),
         server_default=func.now(),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        UTCDateTime(),
         nullable=False,
         default=func.now(),
         server_default=func.now(),
         onupdate=func.now(),
     )
     last_seen_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        UTCDateTime(),
         nullable=False,
         default=func.now(),
         server_default=func.now(),
     )
-    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     aliases: Mapped[list["HttpBridgeSessionAlias"]] = relationship(
         "HttpBridgeSessionAlias",
@@ -805,13 +814,13 @@ class HttpBridgeSessionAlias(Base):
     alias_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     api_key_scope: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        UTCDateTime(),
         nullable=False,
         default=func.now(),
         server_default=func.now(),
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        UTCDateTime(),
         nullable=False,
         default=func.now(),
         server_default=func.now(),

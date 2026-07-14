@@ -54,13 +54,24 @@ def build_responses_url(base_url: str, wire_api: str) -> str:
     return f"{normalized}/backend-api/codex/responses"
 
 
-def build_compact_responses_url(base_url: str) -> str:
+def build_compact_responses_url(base_url: str, wire_api: str = "codex") -> str:
     normalized = normalize_upstream_base_url(base_url)
+    if wire_api in {"responses", "v1"}:
+        return f"{normalized}/v1/responses/compact"
     if normalized.endswith("/backend-api/codex") or normalized.endswith("/codex"):
         return f"{normalized}/responses/compact"
     if normalized.endswith("/backend-api"):
         return f"{normalized}/codex/responses/compact"
     return f"{normalized}/backend-api/codex/responses/compact"
+
+
+def build_codex_search_url(base_url: str) -> str:
+    normalized = normalize_upstream_base_url(base_url)
+    if normalized.endswith("/backend-api/codex") or normalized.endswith("/codex"):
+        return f"{normalized}/alpha/search"
+    if normalized.endswith("/backend-api"):
+        return f"{normalized}/codex/alpha/search"
+    return f"{normalized}/backend-api/codex/alpha/search"
 
 
 async def probe_upstream_provider(*, base_url: str, api_key: str) -> UpstreamProbeResult:

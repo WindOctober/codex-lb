@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -13,9 +14,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.types import Receive, Scope, Send
 
 from app.core import usage as usage_core
 from app.core.auth.dependencies import (
+    proxy_authorization_header,
     set_openai_error_format,
     validate_codex_usage_identity,
     validate_proxy_api_key,
@@ -23,7 +26,7 @@ from app.core.auth.dependencies import (
     validate_usage_api_key,
 )
 from app.core.clients.proxy import ProxyResponseError
-from app.core.config.settings import get_settings
+from app.core.config.settings import Settings, get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.errors import OpenAIErrorEnvelope, openai_error, response_failed_event
 from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
@@ -31,6 +34,7 @@ from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, bridge_public_cont
 from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, resolve_connection_client_ip
 from app.core.openai.chat_requests import ChatCompletionsRequest
 from app.core.openai.chat_responses import ChatCompletionResult, collect_chat_completion, stream_chat_chunks
+from app.core.openai.codex_search import CodexSearchRequest, CodexSearchResponse
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.images import V1ImageResponse, V1ImagesEditsForm, V1ImagesGenerationsRequest
 from app.core.openai.model_registry import UpstreamModel, get_model_registry, is_public_model
@@ -45,6 +49,10 @@ from app.core.openai.models import (
 )
 from app.core.openai.parsing import parse_response_payload
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
+from app.core.openai.response_create import (
+    _responses_request_contains_input_image,
+    _responses_request_uses_image_generation,
+)
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
 from app.core.resilience.overload import is_local_overload_error_code, merge_retry_after_headers
 from app.core.runtime_logging import log_error_response
@@ -70,6 +78,11 @@ from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
 from app.modules.proxy import images_service as images_service_module
 from app.modules.proxy import service as proxy_service_module
+from app.modules.proxy._service.support import (
+    _await_operation_before_hard_timeout,
+    _await_shielded_cleanup,
+    _CompactReservationOwnership,
+)
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.request_policy import (
@@ -99,6 +112,15 @@ from app.modules.usage.repository import AdditionalUsageRepository, UsageReposit
 
 logger = logging.getLogger(__name__)
 
+
+class _OwnedStreamingResponse(StreamingResponse):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await _close_async_iterator(cast(AsyncIterator[str], self.body_iterator))
+
+
 _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
     {
         "message",
@@ -120,7 +142,7 @@ _REMOTE_COMPACTION_V2_OUTPUT_ITEM_TYPES = frozenset({"context_compaction"})
 router = APIRouter(
     prefix="/backend-api/codex",
     tags=["proxy"],
-    dependencies=[Security(validate_proxy_api_key), Depends(set_openai_error_format)],
+    dependencies=[Depends(set_openai_error_format)],
 )
 ws_router = APIRouter(
     prefix="/backend-api/codex",
@@ -129,7 +151,7 @@ ws_router = APIRouter(
 v1_router = APIRouter(
     prefix="/v1",
     tags=["proxy"],
-    dependencies=[Security(validate_proxy_api_key), Depends(set_openai_error_format)],
+    dependencies=[Depends(set_openai_error_format)],
 )
 v1_ws_router = APIRouter(
     prefix="/v1",
@@ -156,6 +178,7 @@ _UNAVAILABLE_SELECTION_ERROR_CODES = {
     "no_plan_support_for_model",
     "additional_quota_data_unavailable",
     "no_additional_quota_eligible_accounts",
+    "upstream_capability_unavailable",
 }
 
 
@@ -175,8 +198,21 @@ async def responses(
     request: Request,
     payload: ResponsesRequest = Body(...),
     context: ProxyContext = Depends(get_proxy_context),
-    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+    authorization: str | None = Security(proxy_authorization_header),
 ) -> Response:
+    request_started_at, request_deadline_at = _public_responses_request_timing(
+        payload,
+        prefer_http_bridge=True,
+    )
+    api_key, auth_error = await _authenticate_responses_request_before_deadline(
+        request,
+        authorization,
+        context,
+        request_deadline_at=request_deadline_at,
+        label="Codex Responses authentication preflight",
+    )
+    if auth_error is not None:
+        return auth_error
     return await _stream_responses(
         request,
         payload,
@@ -186,7 +222,53 @@ async def responses(
         openai_cache_affinity=True,
         prefer_http_bridge=True,
         enforce_openai_sdk_contract=False,
+        request_started_at=request_started_at,
+        request_deadline_at=request_deadline_at,
     )
+
+
+@router.post("/alpha/search", response_model=CodexSearchResponse)
+async def codex_alpha_search(
+    request: Request,
+    payload: CodexSearchRequest = Body(...),
+    context: ProxyContext = Depends(get_proxy_context),
+    authorization: str | None = Security(proxy_authorization_header),
+) -> Response:
+    request_started_at = time.monotonic()
+    request_deadline_at = request_started_at + get_settings().codex_search_request_budget_seconds
+    api_key, auth_error = await _authenticate_responses_request_before_deadline(
+        request,
+        authorization,
+        context,
+        request_deadline_at=request_deadline_at,
+        label="Codex alpha search authentication preflight",
+    )
+    if auth_error is not None:
+        return auth_error
+    effective_model = _effective_model_for_api_key(api_key, payload.model)
+    model_access_error = await _validate_model_access_before_deadline(
+        request,
+        api_key,
+        effective_model,
+        context,
+        request_deadline_at=request_deadline_at,
+        label="Codex alpha search model-access preflight",
+    )
+    if model_access_error is not None:
+        return model_access_error
+    if effective_model != payload.model:
+        payload = payload.model_copy(update={"model": effective_model})
+    try:
+        result = await context.service.search_codex(
+            payload,
+            request.headers,
+            api_key=api_key,
+            request_started_at=request_started_at,
+            request_deadline_at=request_deadline_at,
+        )
+    except ProxyResponseError as exc:
+        return _logged_error_json_response(request, exc.status_code, exc.payload)
+    return JSONResponse(content=result.to_payload())
 
 
 @ws_router.websocket("/responses")
@@ -228,7 +310,7 @@ async def v1_responses(
     request: Request,
     payload: V1ResponsesRequest = Body(...),
     context: ProxyContext = Depends(get_proxy_context),
-    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+    authorization: str | None = Security(proxy_authorization_header),
 ) -> Response:
     try:
         responses_payload = payload.to_responses_request()
@@ -238,6 +320,19 @@ async def v1_responses(
     except ValidationError as exc:
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
+    request_started_at, request_deadline_at = _public_responses_request_timing(
+        responses_payload,
+        prefer_http_bridge=True,
+    )
+    api_key, auth_error = await _authenticate_responses_request_before_deadline(
+        request,
+        authorization,
+        context,
+        request_deadline_at=request_deadline_at,
+        label="V1 Responses authentication preflight",
+    )
+    if auth_error is not None:
+        return auth_error
     if responses_payload.stream:
         return await _stream_responses(
             request,
@@ -247,6 +342,8 @@ async def v1_responses(
             codex_session_affinity=False,
             openai_cache_affinity=True,
             prefer_http_bridge=True,
+            request_started_at=request_started_at,
+            request_deadline_at=request_deadline_at,
         )
     return await _collect_responses(
         request,
@@ -256,6 +353,8 @@ async def v1_responses(
         codex_session_affinity=False,
         openai_cache_affinity=True,
         prefer_http_bridge=True,
+        request_started_at=request_started_at,
+        request_deadline_at=request_deadline_at,
     )
 
 
@@ -285,7 +384,29 @@ async def internal_bridge_responses(
     if internal_error is not None or forwarded_request_context is None:
         assert internal_error is not None
         return _logged_error_json_response(request, internal_error.status_code, internal_error.payload)
-    api_key, auth_error = await _validate_internal_bridge_api_key(request)
+    request_started_at = time.monotonic()
+    forwarded_remaining = (forwarded_request_context.context.request_deadline_unix_ms / 1000.0) - time.time()
+    request_deadline_at = request_started_at + max(0.0, forwarded_remaining)
+    auth_remaining = request_deadline_at - time.monotonic()
+    if auth_remaining <= 0:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        api_key, auth_error = await _await_operation_before_hard_timeout(
+            _validate_internal_bridge_api_key(request),
+            timeout_seconds=auth_remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label="internal bridge authentication preflight",
+        )
+    except TimeoutError:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
     if auth_error is not None:
         return auth_error
     skip_limit_enforcement = api_key is None or forwarded_request_context.context.reservation is not None
@@ -306,7 +427,10 @@ async def internal_bridge_responses(
         forwarded_downstream_turn_state=forwarded_request_context.context.downstream_turn_state,
         forwarded_affinity_kind=forwarded_request_context.context.original_affinity_kind,
         forwarded_affinity_key=forwarded_request_context.context.original_affinity_key,
+        forwarded_request_deadline_unix_ms=forwarded_request_context.context.request_deadline_unix_ms,
         enforce_openai_sdk_contract=False,
+        request_started_at=request_started_at,
+        request_deadline_at=request_deadline_at,
     )
 
 
@@ -964,7 +1088,7 @@ async def _proxy_images_upstream_result(
             finally:
                 await _finalize_image_request_accounting(context, reservation, public_model, captured)
 
-        return StreamingResponse(
+        return _OwnedStreamingResponse(
             _stream_with_accounting(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", **rate_limit_headers},
@@ -1306,7 +1430,7 @@ async def v1_chat_completions(
     if payload.stream:
         stream_options = payload.stream_options
         include_usage = bool(stream_options and stream_options.include_usage)
-        return StreamingResponse(
+        return _OwnedStreamingResponse(
             stream_chat_chunks(stream_with_first, model=responses_payload.model, include_usage=include_usage),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", **rate_limit_headers},
@@ -1330,6 +1454,113 @@ async def v1_chat_completions(
     )
 
 
+def _public_responses_request_timing(
+    payload: ResponsesRequest,
+    *,
+    prefer_http_bridge: bool,
+) -> tuple[float, float]:
+    request_started_at = time.monotonic()
+    runtime_settings = get_settings()
+    bridge_will_handle_request = _responses_request_uses_http_bridge(
+        payload,
+        settings=runtime_settings,
+        prefer_http_bridge=prefer_http_bridge,
+    )
+    request_budget_seconds = (
+        runtime_settings.http_responses_session_bridge_request_budget_seconds
+        if bridge_will_handle_request
+        else runtime_settings.http_responses_stream_request_budget_seconds
+    )
+    return request_started_at, request_started_at + request_budget_seconds
+
+
+async def _validate_proxy_api_key_authorization_compatible(
+    authorization: str | None,
+    *,
+    request: Request,
+) -> ApiKeyData | None:
+    if "request" in inspect.signature(validate_proxy_api_key_authorization).parameters:
+        return await validate_proxy_api_key_authorization(authorization, request=request)
+    return await validate_proxy_api_key_authorization(authorization)
+
+
+async def _authenticate_responses_request_before_deadline(
+    request: Request,
+    authorization: str | None,
+    context: ProxyContext,
+    *,
+    request_deadline_at: float,
+    label: str,
+) -> tuple[ApiKeyData | None, Response | None]:
+    remaining = request_deadline_at - time.monotonic()
+    if remaining <= 0:
+        return None, _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        api_key = await _await_operation_before_hard_timeout(
+            _validate_proxy_api_key_authorization_compatible(authorization, request=request),
+            timeout_seconds=remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label=label,
+        )
+    except TimeoutError:
+        return None, _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    return api_key, None
+
+
+async def _validate_model_access_before_deadline(
+    request: Request,
+    api_key: ApiKeyData | None,
+    model: str,
+    context: ProxyContext,
+    *,
+    request_deadline_at: float,
+    label: str,
+) -> Response | None:
+    remaining = request_deadline_at - time.monotonic()
+    if remaining <= 0:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        await _await_operation_before_hard_timeout(
+            _validate_model_access_for_request(api_key, model),
+            timeout_seconds=remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label=label,
+        )
+    except TimeoutError:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    return None
+
+
+def _responses_request_uses_http_bridge(
+    payload: ResponsesRequest,
+    *,
+    settings: Settings,
+    prefer_http_bridge: bool,
+) -> bool:
+    return (
+        prefer_http_bridge
+        and settings.http_responses_session_bridge_enabled
+        and not _responses_request_contains_input_image(payload)
+        and not _responses_request_uses_image_generation(payload)
+    )
+
+
 async def _stream_responses(
     request: Request,
     payload: ResponsesRequest,
@@ -1348,63 +1579,228 @@ async def _stream_responses(
     forwarded_downstream_turn_state: str | None = None,
     forwarded_affinity_kind: str | None = None,
     forwarded_affinity_key: str | None = None,
+    forwarded_request_deadline_unix_ms: int | None = None,
     enforce_openai_sdk_contract: bool = True,
+    request_started_at: float | None = None,
+    request_deadline_at: float | None = None,
 ) -> Response:
-    apply_api_key_enforcement(payload, api_key)
-    await _validate_model_access_for_request(api_key, payload.model)
-    owns_reservation = api_key_reservation_override is None
-    reservation = (
-        api_key_reservation_override
-        if skip_limit_enforcement
-        else await _enforce_request_limits(
-            api_key,
-            request_model=payload.model,
-            request_service_tier=payload.service_tier,
-        )
-    )
-
-    rate_limit_headers = await context.service.rate_limit_headers() if include_rate_limit_headers else {}
-    bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
-    effective_headers = forwarded_headers or request.headers
-    downstream_turn_state = (
-        forwarded_downstream_turn_state
-        if bridge_active and forwarded_downstream_turn_state is not None
-        else proxy_service_module.ensure_http_downstream_turn_state(effective_headers)
-        if bridge_active
-        else None
-    )
-    turn_state_headers = (
-        proxy_service_module.build_downstream_turn_state_response_headers(downstream_turn_state)
-        if downstream_turn_state is not None
-        else {}
-    )
-    payload.stream = True
-    if prefer_http_bridge:
-        stream = context.service.stream_http_responses(
-            payload,
-            effective_headers,
-            codex_session_affinity=codex_session_affinity,
-            propagate_http_errors=True,
-            openai_cache_affinity=openai_cache_affinity,
-            api_key=api_key,
-            api_key_reservation=reservation,
-            suppress_text_done_events=suppress_text_done_events,
-            downstream_turn_state=downstream_turn_state,
-            forwarded_request=forwarded_request,
-            forwarded_affinity_kind=forwarded_affinity_kind,
-            forwarded_affinity_key=forwarded_affinity_key,
-        )
+    request_started_at = time.monotonic() if request_started_at is None else request_started_at
+    bridge_will_handle_request = prefer_http_bridge
+    if forwarded_request:
+        if forwarded_request_deadline_unix_ms is None:
+            return _logged_error_json_response(
+                request,
+                400,
+                openai_error(
+                    "bridge_forward_invalid",
+                    "Internal bridge forward request deadline is required",
+                    error_type="invalid_request_error",
+                ),
+            )
+        if request_deadline_at is None:
+            forwarded_remaining = (forwarded_request_deadline_unix_ms / 1000.0) - time.time()
+            request_deadline_at = request_started_at + max(0.0, forwarded_remaining)
     else:
-        stream = context.service.stream_responses(
+        runtime_settings = get_settings()
+        bridge_will_handle_request = _responses_request_uses_http_bridge(
             payload,
-            request.headers,
-            codex_session_affinity=codex_session_affinity,
-            propagate_http_errors=True,
-            openai_cache_affinity=openai_cache_affinity,
-            api_key=api_key,
-            api_key_reservation=reservation,
-            suppress_text_done_events=suppress_text_done_events,
+            settings=runtime_settings,
+            prefer_http_bridge=prefer_http_bridge,
         )
+        request_budget_seconds = (
+            runtime_settings.http_responses_session_bridge_request_budget_seconds
+            if bridge_will_handle_request
+            else runtime_settings.http_responses_stream_request_budget_seconds
+        )
+        if request_deadline_at is None:
+            request_deadline_at = request_started_at + request_budget_seconds
+
+    assert request_deadline_at is not None
+
+    apply_api_key_enforcement(payload, api_key)
+    model_access_remaining = request_deadline_at - time.monotonic()
+    if model_access_remaining <= 0:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        await _await_operation_before_hard_timeout(
+            _validate_model_access_for_request(api_key, payload.model),
+            timeout_seconds=model_access_remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label="streaming Responses model-access preflight",
+        )
+    except TimeoutError:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    if skip_limit_enforcement:
+        reservation = api_key_reservation_override
+    else:
+        preflight_remaining = request_deadline_at - time.monotonic()
+        if preflight_remaining <= 0:
+            return _logged_error_json_response(
+                request,
+                504,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+            )
+        try:
+            reservation = await _await_operation_before_hard_timeout(
+                _enforce_request_limits(
+                    api_key,
+                    request_model=payload.model,
+                    request_service_tier=payload.service_tier,
+                ),
+                timeout_seconds=preflight_remaining,
+                tasks=context.service._proxy_cleanup_tasks,
+                label="streaming Responses reservation preflight",
+                late_result_cleanup=context.service._release_websocket_reservation,
+            )
+        except TimeoutError:
+            return _logged_error_json_response(
+                request,
+                504,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+            )
+    forwarded_reservation_claimed = False
+    if forwarded_request and reservation is not None:
+        claim_remaining = request_deadline_at - time.monotonic()
+        if claim_remaining <= 0:
+            return _logged_error_json_response(
+                request,
+                504,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+            )
+        claim_task = asyncio.create_task(
+            context.service._claim_forwarded_websocket_reservation(reservation),
+            name=f"forwarded-reservation-claim-{reservation.reservation_id}",
+        )
+        try:
+            done, _pending = await asyncio.wait({claim_task}, timeout=claim_remaining)
+        except BaseException:
+            context.service._schedule_forwarded_reservation_claim_reconciliation(claim_task, reservation)
+            raise
+        if not done:
+            context.service._schedule_forwarded_reservation_claim_reconciliation(claim_task, reservation)
+            return _logged_error_json_response(
+                request,
+                504,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+            )
+        try:
+            forwarded_reservation_claimed = claim_task.result()
+        except Exception:
+            context.service._schedule_forwarded_reservation_claim_reconciliation(claim_task, reservation)
+            return _logged_error_json_response(
+                request,
+                503,
+                openai_error(
+                    "bridge_forward_reservation_unavailable",
+                    "Forwarded API-key reservation claim could not be confirmed",
+                    error_type="server_error",
+                ),
+            )
+        if not forwarded_reservation_claimed:
+            return _logged_error_json_response(
+                request,
+                409,
+                openai_error(
+                    "bridge_forward_reservation_unavailable",
+                    "Forwarded API-key reservation is no longer available",
+                    error_type="server_error",
+                ),
+            )
+    owns_reservation = api_key_reservation_override is None or forwarded_reservation_claimed
+
+    try:
+        if include_rate_limit_headers:
+            header_remaining = request_deadline_at - time.monotonic()
+            if header_remaining <= 0:
+                context.service._schedule_websocket_reservation_release(
+                    reservation if owns_reservation else None,
+                    reason="responses-preflight-deadline",
+                )
+                return _logged_error_json_response(
+                    request,
+                    504,
+                    openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                )
+            try:
+                rate_limit_headers = await _await_operation_before_hard_timeout(
+                    context.service.rate_limit_headers(),
+                    timeout_seconds=header_remaining,
+                    tasks=context.service._proxy_cleanup_tasks,
+                    label="streaming Responses rate-limit header preflight",
+                )
+            except TimeoutError:
+                context.service._schedule_websocket_reservation_release(
+                    reservation if owns_reservation else None,
+                    reason="responses-rate-limit-headers-timeout",
+                )
+                return _logged_error_json_response(
+                    request,
+                    504,
+                    openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                )
+        else:
+            rate_limit_headers = {}
+        bridge_active = bridge_will_handle_request
+        effective_headers = forwarded_headers or request.headers
+        downstream_turn_state = (
+            forwarded_downstream_turn_state
+            if bridge_active and forwarded_downstream_turn_state is not None
+            else proxy_service_module.ensure_http_downstream_turn_state(effective_headers)
+            if bridge_active
+            else None
+        )
+        turn_state_headers = (
+            proxy_service_module.build_downstream_turn_state_response_headers(downstream_turn_state)
+            if downstream_turn_state is not None
+            else {}
+        )
+        payload.stream = True
+        if prefer_http_bridge:
+            stream = context.service.stream_http_responses(
+                payload,
+                effective_headers,
+                codex_session_affinity=codex_session_affinity,
+                propagate_http_errors=True,
+                openai_cache_affinity=openai_cache_affinity,
+                api_key=api_key,
+                api_key_reservation=reservation,
+                suppress_text_done_events=suppress_text_done_events,
+                downstream_turn_state=downstream_turn_state,
+                forwarded_request=forwarded_request,
+                forwarded_affinity_kind=forwarded_affinity_kind,
+                forwarded_affinity_key=forwarded_affinity_key,
+                forwarded_request_deadline_unix_ms=forwarded_request_deadline_unix_ms,
+                request_started_at=request_started_at,
+                request_deadline_at=request_deadline_at,
+            )
+        else:
+            stream = context.service.stream_responses(
+                payload,
+                request.headers,
+                codex_session_affinity=codex_session_affinity,
+                propagate_http_errors=True,
+                openai_cache_affinity=openai_cache_affinity,
+                api_key=api_key,
+                api_key_reservation=reservation,
+                suppress_text_done_events=suppress_text_done_events,
+                request_started_at=request_started_at,
+                request_deadline_at=request_deadline_at,
+            )
+    except BaseException:
+        if owns_reservation:
+            context.service._schedule_websocket_reservation_release(
+                reservation,
+                reason="responses-pre-stream-failure",
+            )
+        raise
     allow_remote_compaction_v2 = _allows_remote_compaction_v2_output(effective_headers)
     stream = _normalize_public_responses_stream(
         stream,
@@ -1414,21 +1810,39 @@ async def _stream_responses(
     try:
         first = await stream.__anext__()
     except StopAsyncIteration:
-        return StreamingResponse(
+        return _OwnedStreamingResponse(
             _prepend_first(None, stream),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", **rate_limit_headers},
         )
     except ProxyResponseError as exc:
-        if owns_reservation:
-            await _release_reservation(reservation)
         return _logged_error_json_response(
             request,
             exc.status_code,
             exc.payload,
             headers=rate_limit_headers,
         )
-    return StreamingResponse(
+    except (asyncio.CancelledError, GeneratorExit):
+
+        async def cleanup_cancelled_startup() -> None:
+            await _close_async_iterator(stream)
+
+        await _await_shielded_cleanup(
+            cleanup_cancelled_startup(),
+            label="cancelled Responses startup cleanup",
+        )
+        raise
+    except BaseException:
+
+        async def cleanup_failed_startup() -> None:
+            await _close_async_iterator(stream)
+
+        await _await_shielded_cleanup(
+            cleanup_failed_startup(),
+            label="failed Responses startup cleanup",
+        )
+        raise
+    return _OwnedStreamingResponse(
         _prepend_first(first, stream),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", **turn_state_headers, **rate_limit_headers},
@@ -1449,17 +1863,108 @@ async def _collect_responses(
     openai_cache_affinity: bool = False,
     suppress_text_done_events: bool = False,
     prefer_http_bridge: bool = False,
+    request_started_at: float | None = None,
+    request_deadline_at: float | None = None,
 ) -> Response:
-    apply_api_key_enforcement(payload, api_key)
-    await _validate_model_access_for_request(api_key, payload.model)
-    reservation = await _enforce_request_limits(
-        api_key,
-        request_model=payload.model,
-        request_service_tier=payload.service_tier,
+    request_started_at = time.monotonic() if request_started_at is None else request_started_at
+    runtime_settings = get_settings()
+    bridge_will_handle_request = _responses_request_uses_http_bridge(
+        payload,
+        settings=runtime_settings,
+        prefer_http_bridge=prefer_http_bridge,
     )
+    request_budget_seconds = (
+        runtime_settings.http_responses_session_bridge_request_budget_seconds
+        if bridge_will_handle_request
+        else runtime_settings.http_responses_stream_request_budget_seconds
+    )
+    if request_deadline_at is None:
+        request_deadline_at = request_started_at + request_budget_seconds
+    apply_api_key_enforcement(payload, api_key)
+    model_access_remaining = request_deadline_at - time.monotonic()
+    if model_access_remaining <= 0:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        await _await_operation_before_hard_timeout(
+            _validate_model_access_for_request(api_key, payload.model),
+            timeout_seconds=model_access_remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label="non-streaming Responses model-access preflight",
+        )
+    except TimeoutError:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
 
-    rate_limit_headers = await context.service.rate_limit_headers()
-    bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
+    reservation_remaining = request_deadline_at - time.monotonic()
+    if reservation_remaining <= 0:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        reservation = await _await_operation_before_hard_timeout(
+            _enforce_request_limits(
+                api_key,
+                request_model=payload.model,
+                request_service_tier=payload.service_tier,
+            ),
+            timeout_seconds=reservation_remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label="non-streaming Responses reservation preflight",
+            late_result_cleanup=context.service._release_websocket_reservation,
+        )
+    except TimeoutError:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+
+    try:
+        header_remaining = request_deadline_at - time.monotonic()
+        if header_remaining <= 0:
+            context.service._schedule_websocket_reservation_release(
+                reservation,
+                reason="non-streaming-responses-preflight-deadline",
+            )
+            return _logged_error_json_response(
+                request,
+                504,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+            )
+        try:
+            rate_limit_headers = await _await_operation_before_hard_timeout(
+                context.service.rate_limit_headers(),
+                timeout_seconds=header_remaining,
+                tasks=context.service._proxy_cleanup_tasks,
+                label="non-streaming Responses rate-limit header preflight",
+            )
+        except TimeoutError:
+            context.service._schedule_websocket_reservation_release(
+                reservation,
+                reason="non-streaming-responses-rate-header-timeout",
+            )
+            return _logged_error_json_response(
+                request,
+                504,
+                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+            )
+    except BaseException:
+        context.service._schedule_websocket_reservation_release(
+            reservation,
+            reason="non-streaming-responses-preflight-failure",
+        )
+        raise
+
+    bridge_active = bridge_will_handle_request
     downstream_turn_state = (
         proxy_service_module.ensure_http_downstream_turn_state(request.headers) if bridge_active else None
     )
@@ -1469,36 +1974,46 @@ async def _collect_responses(
         else {}
     )
     payload.stream = True
-    if prefer_http_bridge:
-        stream = context.service.stream_http_responses(
-            payload,
-            request.headers,
-            codex_session_affinity=codex_session_affinity,
-            propagate_http_errors=True,
-            openai_cache_affinity=openai_cache_affinity,
-            api_key=api_key,
-            api_key_reservation=reservation,
-            suppress_text_done_events=suppress_text_done_events,
-            downstream_turn_state=downstream_turn_state,
+    try:
+        if prefer_http_bridge:
+            stream = context.service.stream_http_responses(
+                payload,
+                request.headers,
+                codex_session_affinity=codex_session_affinity,
+                propagate_http_errors=True,
+                openai_cache_affinity=openai_cache_affinity,
+                api_key=api_key,
+                api_key_reservation=reservation,
+                suppress_text_done_events=suppress_text_done_events,
+                downstream_turn_state=downstream_turn_state,
+                request_started_at=request_started_at,
+                request_deadline_at=request_deadline_at,
+            )
+        else:
+            stream = context.service.stream_responses(
+                payload,
+                request.headers,
+                codex_session_affinity=codex_session_affinity,
+                propagate_http_errors=True,
+                openai_cache_affinity=openai_cache_affinity,
+                api_key=api_key,
+                api_key_reservation=reservation,
+                suppress_text_done_events=suppress_text_done_events,
+                request_started_at=request_started_at,
+                request_deadline_at=request_deadline_at,
+            )
+    except BaseException:
+        context.service._schedule_websocket_reservation_release(
+            reservation,
+            reason="non-streaming-responses-stream-creation-failure",
         )
-    else:
-        stream = context.service.stream_responses(
-            payload,
-            request.headers,
-            codex_session_affinity=codex_session_affinity,
-            propagate_http_errors=True,
-            openai_cache_affinity=openai_cache_affinity,
-            api_key=api_key,
-            api_key_reservation=reservation,
-            suppress_text_done_events=suppress_text_done_events,
-        )
+        raise
     try:
         response_payload = await _collect_responses_payload(
             stream,
             allow_remote_compaction_v2=_allows_remote_compaction_v2_output(request.headers),
         )
     except ProxyResponseError as exc:
-        await _release_reservation(reservation)
         error = _parse_error_envelope(exc.payload)
         return _logged_error_json_response(
             request,
@@ -1506,6 +2021,16 @@ async def _collect_responses(
             error.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
         )
+    except BaseException:
+
+        async def cleanup_interrupted_collection() -> None:
+            await _close_async_iterator(stream)
+
+        await _await_shielded_cleanup(
+            cleanup_interrupted_collection(),
+            label="non-streaming Responses collection interruption cleanup",
+        )
+        raise
     if isinstance(response_payload, OpenAIResponsePayload):
         if response_payload.status == "failed":
             error_payload = _error_envelope_from_response(response_payload.error)
@@ -1534,10 +2059,28 @@ async def responses_compact(
     request: Request,
     payload: ResponsesCompactRequest = Body(...),
     context: ProxyContext = Depends(get_proxy_context),
-    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+    authorization: str | None = Security(proxy_authorization_header),
 ) -> JSONResponse:
+    request_started_at = time.monotonic()
+    request_deadline_at = request_started_at + get_settings().compact_request_budget_seconds
+    api_key, auth_error = await _authenticate_responses_request_before_deadline(
+        request,
+        authorization,
+        context,
+        request_deadline_at=request_deadline_at,
+        label="Codex Compact authentication preflight",
+    )
+    if auth_error is not None:
+        return cast(JSONResponse, auth_error)
     return await _compact_responses(
-        request, payload, context, api_key, codex_session_affinity=True, openai_cache_affinity=True
+        request,
+        payload,
+        context,
+        api_key,
+        codex_session_affinity=True,
+        openai_cache_affinity=True,
+        request_started_at=request_started_at,
+        request_deadline_at=request_deadline_at,
     )
 
 
@@ -1546,7 +2089,7 @@ async def v1_responses_compact(
     request: Request,
     payload: V1ResponsesCompactRequest = Body(...),
     context: ProxyContext = Depends(get_proxy_context),
-    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+    authorization: str | None = Security(proxy_authorization_header),
 ) -> JSONResponse:
     try:
         compact_payload = payload.to_compact_request()
@@ -1556,6 +2099,17 @@ async def v1_responses_compact(
     except ValidationError as exc:
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
+    request_started_at = time.monotonic()
+    request_deadline_at = request_started_at + get_settings().compact_request_budget_seconds
+    api_key, auth_error = await _authenticate_responses_request_before_deadline(
+        request,
+        authorization,
+        context,
+        request_deadline_at=request_deadline_at,
+        label="V1 Compact authentication preflight",
+    )
+    if auth_error is not None:
+        return cast(JSONResponse, auth_error)
     return await _compact_responses(
         request,
         compact_payload,
@@ -1563,6 +2117,8 @@ async def v1_responses_compact(
         api_key,
         codex_session_affinity=False,
         openai_cache_affinity=True,
+        request_started_at=request_started_at,
+        request_deadline_at=request_deadline_at,
     )
 
 
@@ -1573,16 +2129,89 @@ async def _compact_responses(
     api_key: ApiKeyData | None,
     codex_session_affinity: bool = False,
     openai_cache_affinity: bool = False,
+    request_started_at: float | None = None,
+    request_deadline_at: float | None = None,
 ) -> JSONResponse:
+    request_started_at = time.monotonic() if request_started_at is None else request_started_at
+    if request_deadline_at is None:
+        request_deadline_at = request_started_at + get_settings().compact_request_budget_seconds
     apply_api_key_enforcement(payload, api_key)
-    await _validate_model_access_for_request(api_key, payload.model)
-    reservation = await _enforce_request_limits(
-        api_key,
-        request_model=payload.model,
-        request_service_tier=_compact_request_service_tier(payload),
-    )
+    model_access_remaining = request_deadline_at - time.monotonic()
+    if model_access_remaining <= 0:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        await _await_operation_before_hard_timeout(
+            _validate_model_access_for_request(api_key, payload.model),
+            timeout_seconds=model_access_remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label="Compact model-access preflight",
+        )
+    except TimeoutError:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
 
-    rate_limit_headers = await context.service.rate_limit_headers()
+    reservation_remaining = request_deadline_at - time.monotonic()
+    if reservation_remaining <= 0:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        reservation = await _await_operation_before_hard_timeout(
+            _enforce_request_limits(
+                api_key,
+                request_model=payload.model,
+                request_service_tier=_compact_request_service_tier(payload),
+            ),
+            timeout_seconds=reservation_remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label="Compact reservation preflight",
+            late_result_cleanup=context.service._release_websocket_reservation,
+        )
+    except TimeoutError:
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+
+    header_remaining = request_deadline_at - time.monotonic()
+    if header_remaining <= 0:
+        context.service._schedule_websocket_reservation_release(
+            reservation,
+            reason="compact-preflight-deadline",
+        )
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    try:
+        rate_limit_headers = await _await_operation_before_hard_timeout(
+            context.service.rate_limit_headers(),
+            timeout_seconds=header_remaining,
+            tasks=context.service._proxy_cleanup_tasks,
+            label="Compact rate-limit header preflight",
+        )
+    except TimeoutError:
+        context.service._schedule_websocket_reservation_release(
+            reservation,
+            reason="compact-rate-limit-headers-timeout",
+        )
+        return _logged_error_json_response(
+            request,
+            504,
+            openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+        )
+    reservation_ownership = _CompactReservationOwnership()
     try:
         result = await context.service.compact_responses(
             payload,
@@ -1591,6 +2220,9 @@ async def _compact_responses(
             openai_cache_affinity=openai_cache_affinity,
             api_key=api_key,
             api_key_reservation=reservation,
+            reservation_ownership=reservation_ownership,
+            request_started_at=request_started_at,
+            request_deadline_at=request_deadline_at,
         )
     except NotImplementedError:
         error = OpenAIErrorEnvelopeModel(
@@ -1615,7 +2247,8 @@ async def _compact_responses(
             headers=rate_limit_headers,
         )
     finally:
-        await _release_reservation(reservation)
+        if not reservation_ownership.transferred:
+            await _release_reservation(reservation)
     return JSONResponse(
         content=result.model_dump(mode="json", exclude_none=True),
         headers=rate_limit_headers,
@@ -1675,10 +2308,19 @@ async def codex_usage(
 
 
 async def _prepend_first(first: str | None, stream: AsyncIterator[str]) -> AsyncIterator[str]:
-    if first is not None:
-        yield first
-    async for line in stream:
-        yield line
+    try:
+        if first is not None:
+            yield first
+        async for line in stream:
+            yield line
+    finally:
+        await _close_async_iterator(stream)
+
+
+async def _close_async_iterator(stream: AsyncIterator[str]) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if callable(aclose):
+        await _await_shielded_cleanup(aclose(), label="public Responses child iterator close")
 
 
 def _parse_sse_payload(line: str) -> dict[str, JsonValue] | None:
@@ -1997,22 +2639,44 @@ async def _normalize_public_responses_stream(
     done_seen = False
     contract_violation_kind: str | None = None
     output_items: dict[int, dict[str, JsonValue]] = {}
-    async for event_block in stream:
-        if event_block.strip() == "data: [DONE]":
-            done_seen = True
-            if terminal_seen:
-                yield event_block
-            continue
-        payload = _parse_sse_payload(event_block)
-        if payload is None:
-            if not _looks_like_sse_data_block(event_block):
+    try:
+        async for event_block in stream:
+            if event_block.strip() == "data: [DONE]":
+                done_seen = True
+                if terminal_seen:
+                    yield event_block
+                continue
+            payload = _parse_sse_payload(event_block)
+            if payload is None:
+                if not _looks_like_sse_data_block(event_block):
+                    yield event_block
+                    continue
+                if _looks_like_sse_data_block(event_block):
+                    contract_violation_kind = contract_violation_kind or "invalid_json"
+                continue
+            event_type = payload.get("type")
+            if not enforce_openai_sdk_contract:
+                if isinstance(event_type, str) and event_type in {
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                    "error",
+                }:
+                    terminal_seen = True
                 yield event_block
                 continue
-            if _looks_like_sse_data_block(event_block):
-                contract_violation_kind = contract_violation_kind or "invalid_json"
-            continue
-        event_type = payload.get("type")
-        if not enforce_openai_sdk_contract:
+            if allow_remote_compaction_v2:
+                _collect_output_item_event(payload, output_items)
+            normalized_payload, violation_kind = _normalize_public_stream_payload(
+                payload,
+                output_items=output_items,
+                allow_remote_compaction_v2=allow_remote_compaction_v2,
+            )
+            if violation_kind is not None:
+                contract_violation_kind = contract_violation_kind or violation_kind
+            if normalized_payload is None:
+                continue
+            event_type = normalized_payload.get("type")
             if isinstance(event_type, str) and event_type in {
                 "response.completed",
                 "response.incomplete",
@@ -2020,39 +2684,20 @@ async def _normalize_public_responses_stream(
                 "error",
             }:
                 terminal_seen = True
-            yield event_block
-            continue
-        if allow_remote_compaction_v2:
-            _collect_output_item_event(payload, output_items)
-        normalized_payload, violation_kind = _normalize_public_stream_payload(
-            payload,
-            output_items=output_items,
-            allow_remote_compaction_v2=allow_remote_compaction_v2,
+            yield format_sse_event(normalized_payload)
+        if terminal_seen:
+            if not done_seen and not enforce_openai_sdk_contract:
+                yield "data: [DONE]\n\n"
+            return
+        error_kind = contract_violation_kind or "upstream_stream_truncated"
+        yield format_sse_event(
+            response_failed_event(
+                error_kind,
+                _public_contract_error_message(error_kind),
+            )
         )
-        if violation_kind is not None:
-            contract_violation_kind = contract_violation_kind or violation_kind
-        if normalized_payload is None:
-            continue
-        event_type = normalized_payload.get("type")
-        if isinstance(event_type, str) and event_type in {
-            "response.completed",
-            "response.incomplete",
-            "response.failed",
-            "error",
-        }:
-            terminal_seen = True
-        yield format_sse_event(normalized_payload)
-    if terminal_seen:
-        if not done_seen and not enforce_openai_sdk_contract:
-            yield "data: [DONE]\n\n"
-        return
-    error_kind = contract_violation_kind or "upstream_stream_truncated"
-    yield format_sse_event(
-        response_failed_event(
-            error_kind,
-            _public_contract_error_message(error_kind),
-        )
-    )
+    finally:
+        await _close_async_iterator(stream)
 
 
 def _normalize_public_stream_payload(
@@ -2319,7 +2964,7 @@ def _status_for_error(error_value: OpenAIError | None) -> int:
 
 
 def _status_for_image_error_envelope(envelope: object) -> int:
-    if not isinstance(envelope, Mapping):
+    if not is_json_mapping(envelope):
         return 502
     error = envelope.get("error")
     if not is_json_mapping(error):

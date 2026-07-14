@@ -5,19 +5,20 @@ import inspect
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from datetime import datetime
+from typing import Any, Literal, TypeVar, cast
 
 import anyio
 
 from app.core.balancer import DEFAULT_ROUTING_STRATEGY, PERMANENT_FAILURE_CODES, RoutingStrategy
 from app.core.balancer.types import ClassifiedFailure, UpstreamError
-from app.core.clients.proxy_websocket import UpstreamResponsesWebSocket
-from app.core.openai.models import OpenAIEvent
+from app.core.clients.proxy_websocket import UpstreamResponsesWebSocket, UpstreamWebSocketMessage
+from app.core.openai.models import OpenAIEvent, ResponseUsage, normalize_response_usage
 from app.core.types import JsonValue
 from app.db.models import Account, DashboardSettings, StickySessionKind
-from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
+from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageCharge, ApiKeyUsageReservationData
 from app.modules.proxy.account_concurrency import AccountModelConcurrencyLease
 from app.modules.proxy.load_balancer import AccountSelection
 from app.modules.proxy.work_admission import AdmissionLease
@@ -44,6 +45,8 @@ _ACCOUNT_SELECTION_RECOVERABLE_WAIT_CODE = "account_rate_limit_wait"
 _ACCOUNT_SELECTION_RECOVERABLE_WAIT_REASON = "waiting for account rate-limit recovery"
 _WEBSOCKET_MAX_ACCOUNT_ATTEMPTS = 3
 _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES = 3
+_CleanupResultT = TypeVar("_CleanupResultT")
+_DiscardedAccountingResolution = Literal["fallback"] | Callable[[], Awaitable[None]]
 
 
 async def _await_cancelled_task(
@@ -53,14 +56,181 @@ async def _await_cancelled_task(
     label: str,
 ) -> bool:
     task.cancel()
-    try:
-        await asyncio.wait_for(task, timeout=timeout_seconds)
-    except asyncio.CancelledError:
-        return True
-    except TimeoutError:
+    done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+    if task not in done:
         logger.warning("Timed out waiting for %s cancellation", label)
         return False
+    try:
+        await task
+    except asyncio.CancelledError:
+        return True
     return True
+
+
+def _track_existing_background_task(
+    tasks: set[asyncio.Task[None]],
+    task: asyncio.Task[Any],
+    *,
+    label: str,
+) -> None:
+    """Retain and observe an already-created task until it really finishes."""
+    tracked_task = cast(asyncio.Task[None], task)
+    if tracked_task in tasks:
+        return
+    tasks.add(tracked_task)
+
+    def consume_result(completed: asyncio.Task[Any]) -> None:
+        tasks.discard(tracked_task)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("Tracked %s failed after detachment", label, exc_info=True)
+
+    task.add_done_callback(consume_result)
+
+
+async def _await_operation_before_hard_timeout(
+    operation: Awaitable[_CleanupResultT],
+    *,
+    timeout_seconds: float,
+    tasks: set[asyncio.Task[None]],
+    label: str,
+    late_result_cleanup: Callable[[_CleanupResultT], Awaitable[None]] | None = None,
+    late_completion_cleanup: Callable[[], Awaitable[None]] | None = None,
+    on_detach: Callable[[], None] | None = None,
+) -> _CleanupResultT:
+    """Observe an operation for a bounded time without waiting for cancellation."""
+    if timeout_seconds <= 0:
+        if inspect.iscoroutine(operation):
+            operation.close()
+        raise TimeoutError
+    task = asyncio.ensure_future(operation)
+
+    def retain_late_operation() -> None:
+        if on_detach is not None:
+            on_detach()
+        task.cancel()
+        if late_result_cleanup is None and late_completion_cleanup is None:
+            _track_existing_background_task(tasks, task, label=label)
+            return
+
+        async def reconcile() -> None:
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                if late_result_cleanup is not None:
+                    await late_result_cleanup(result)
+            finally:
+                if late_completion_cleanup is not None:
+                    await late_completion_cleanup()
+
+        _schedule_tracked_background_task(
+            tasks,
+            reconcile(),
+            name=f"hard-timeout-reconcile-{time.monotonic_ns()}",
+            label=f"late {label} reconciliation",
+        )
+
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+    except BaseException:
+        retain_late_operation()
+        if not task.done():
+            pass
+        else:
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        raise
+    if task not in done:
+        retain_late_operation()
+        raise TimeoutError
+    return task.result()
+
+
+async def _await_shielded_cleanup(
+    cleanup: Awaitable[_CleanupResultT],
+    *,
+    label: str,
+) -> _CleanupResultT:
+    cleanup_task = asyncio.ensure_future(cleanup)
+    try:
+        return await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError as cancellation:
+        with anyio.CancelScope(shield=True):
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    if cleanup_task.done():
+                        break
+        if cleanup_task.cancelled():
+            raise cancellation
+        try:
+            cleanup_task.result()
+        except Exception:
+            logger.exception("%s failed after caller cancellation", label)
+        raise cancellation
+
+
+def _schedule_tracked_background_task(
+    tasks: set[asyncio.Task[None]],
+    operation: Awaitable[None],
+    *,
+    name: str,
+    label: str,
+) -> None:
+    async def run() -> None:
+        try:
+            await operation
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Background %s failed", label, exc_info=True)
+
+    task = asyncio.create_task(run(), name=name)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _close_tracked_background_tasks(
+    tasks: set[asyncio.Task[None]],
+    *,
+    label: str,
+    timeout_seconds: float = 5.0,
+) -> None:
+    cancelled_once: set[asyncio.Task[None]] = set()
+    for _round in range(2):
+        tasks.difference_update(task for task in tuple(tasks) if task.done())
+        active = tuple(task for task in tasks if not task.done())
+        if not active:
+            return
+        _done, pending = await asyncio.wait(active, timeout=timeout_seconds)
+        if not pending:
+            continue
+        newly_pending = tuple(task for task in pending if task not in cancelled_once)
+        if not newly_pending:
+            continue
+        logger.warning("Timed out waiting for %s; cancelling %s task(s)", label, len(newly_pending))
+        for task in newly_pending:
+            cancelled_once.add(task)
+            task.cancel()
+        _cancelled, still_pending = await asyncio.wait(newly_pending, timeout=timeout_seconds)
+        if still_pending:
+            logger.error(
+                "Hard timeout waiting for %s cancellation; leaving %s task(s) tracked",
+                label,
+                len(still_pending),
+            )
+    tasks.difference_update(task for task in tuple(tasks) if task.done())
+    remaining = sum(not task.done() for task in tasks)
+    if remaining:
+        logger.error("Tracked %s shutdown ended with %s unfinished task(s)", label, remaining)
 
 
 def _is_recoverable_account_selection_wait(selection: AccountSelection) -> bool:
@@ -122,6 +292,23 @@ class _AffinityPolicy:
     kind: StickySessionKind | None = None
     reallocate_sticky: bool = False
     max_age_seconds: int | None = None
+    required_upstream_wire_api: str | None = None
+
+
+def _merge_affinity_required_wire_api(
+    current: _AffinityPolicy,
+    incoming: _AffinityPolicy,
+) -> _AffinityPolicy:
+    required_wire_api = incoming.required_upstream_wire_api or current.required_upstream_wire_api
+    if required_wire_api == current.required_upstream_wire_api:
+        return current
+    return _AffinityPolicy(
+        key=current.key,
+        kind=current.kind,
+        reallocate_sticky=current.reallocate_sticky,
+        max_age_seconds=current.max_age_seconds,
+        required_upstream_wire_api=required_wire_api,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,11 +350,66 @@ class _StreamSettlement:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    usage_charges: tuple[ApiKeyUsageCharge, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
     error: UpstreamError | None = None
     account_health_error: bool = False
     record_success: bool = True
+    late_usage_reconciliation: asyncio.Future[_StreamSettlement | None] | None = None
+
+
+@dataclass(slots=True)
+class _CompactReservationOwnership:
+    """Mutable handoff marker between the HTTP route and compact runtime."""
+
+    transferred: bool = False
+
+
+def _stream_settlement_has_authoritative_usage(settlement: _StreamSettlement) -> bool:
+    return bool(settlement.usage_charges) or any(
+        value is not None
+        for value in (
+            settlement.input_tokens,
+            settlement.output_tokens,
+            settlement.cached_input_tokens,
+            settlement.cache_write_tokens,
+        )
+    )
+
+
+def _usage_charge_from_response_usage(
+    usage: ResponseUsage | None,
+    *,
+    model: str,
+    service_tier: str | None,
+) -> ApiKeyUsageCharge | None:
+    normalized = normalize_response_usage(usage)
+    if normalized is None:
+        return None
+    return ApiKeyUsageCharge(
+        model=model,
+        input_tokens=normalized.input_tokens,
+        output_tokens=normalized.output_tokens,
+        cached_input_tokens=normalized.cached_input_tokens,
+        cache_write_tokens=normalized.cache_write_tokens,
+        service_tier=service_tier,
+    )
+
+
+def _apply_usage_charges_to_settlement(
+    settlement: _StreamSettlement,
+    charges: Sequence[ApiKeyUsageCharge],
+) -> bool:
+    if not charges:
+        return False
+    settlement.input_tokens = sum(charge.input_tokens for charge in charges)
+    settlement.output_tokens = sum(charge.output_tokens for charge in charges)
+    settlement.cached_input_tokens = sum(charge.cached_input_tokens for charge in charges)
+    settlement.cache_write_tokens = sum(charge.cache_write_tokens for charge in charges)
+    settlement.usage_charges = tuple(charges)
+    return True
 
 
 def _stream_settlement_error_payload(settlement: _StreamSettlement) -> UpstreamError:
@@ -243,13 +485,47 @@ class _WebSocketRequestState:
     http_bridge_gate_wait_started_at: float | None = None
     http_bridge_gate_acquired_at: float | None = None
     http_bridge_admission_acquired_at: float | None = None
+    websocket_send_started_at: float | None = None
+    websocket_send_completed_at: float | None = None
+    http_bridge_send_started_at: float | None = None
     http_bridge_send_completed_at: float | None = None
     http_bridge_upstream_first_event_at: float | None = None
     http_bridge_upstream_first_event_type: str | None = None
+    usage_charges: list[ApiKeyUsageCharge] = field(default_factory=list)
+    discarded_accounting_resolution_future: asyncio.Future[
+        _DiscardedAccountingResolution
+    ] | None = None
     http_bridge_upstream_first_text_at: float | None = None
     http_bridge_downstream_first_event_at: float | None = None
     http_bridge_downstream_first_text_at: float | None = None
     http_bridge_latency_breakdown_logged: bool = False
+
+
+@dataclass(slots=True)
+class _DiscardedRequestAccounting:
+    request_state: _WebSocketRequestState
+    api_key_reservation: ApiKeyUsageReservationData | None
+    resolution_future: asyncio.Future[_DiscardedAccountingResolution] | None = None
+
+
+def _anonymous_terminal_candidate_count(
+    pending_requests: Sequence[_WebSocketRequestState],
+    *,
+    discarded_response_ids: set[str],
+    discarded_request_accounting: Mapping[str, _DiscardedRequestAccounting],
+    anonymous_discarded_request_accounting: Mapping[str, _DiscardedRequestAccounting],
+) -> int:
+    """Count distinct requests that could own an identity-free terminal."""
+    request_identities = {id(request_state) for request_state in pending_requests}
+    request_identities.update(
+        id(accounting.request_state) for accounting in discarded_request_accounting.values()
+    )
+    request_identities.update(
+        id(accounting.request_state)
+        for accounting in anonymous_discarded_request_accounting.values()
+    )
+    orphaned_response_ids = discarded_response_ids.difference(discarded_request_accounting)
+    return len(request_identities) + len(orphaned_response_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,14 +573,28 @@ class _HTTPBridgeSession:
     downstream_turn_state: str | None = None
     downstream_turn_state_aliases: set[str] = field(default_factory=set)
     previous_response_ids: set[str] = field(default_factory=set)
+    discarded_response_ids: set[str] = field(default_factory=set)
+    discarded_request_accounting: dict[str, _DiscardedRequestAccounting] = field(default_factory=dict)
+    anonymous_discarded_request_accounting: dict[str, _DiscardedRequestAccounting] = field(
+        default_factory=dict
+    )
+    discarded_accounting_reconciliation_owned: bool = False
+    pending_changed: asyncio.Event = field(default_factory=asyncio.Event)
     last_completed_input_count: int = 0
     last_completed_response_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
+    durable_lease_expires_at: datetime | None = None
+    durable_ownership_lost: bool = False
+    durable_ownership_retirement_scheduled: bool = False
     durable_renew_after: float = 0.0
     durable_renew_task: asyncio.Task[None] | None = None
+    durable_renew_lock: anyio.Lock = field(default_factory=anyio.Lock)
     upstream_reader: asyncio.Task[None] | None = None
+    defer_reader_start: bool = False
+    detached_upstream_receive: asyncio.Task[UpstreamWebSocketMessage] | None = None
+    upstream_close_owned: bool = False
     upstream_reconnect_count: int = 0
     account_model_session_lease: AccountModelConcurrencyLease | None = None
     submit_lease_count: int = 0
@@ -316,9 +606,24 @@ class _HTTPBridgeSession:
 @dataclass(slots=True)
 class _WebSocketUpstreamControl:
     reconnect_requested: bool = False
+    retire_ambiguous_transport: bool = False
     suppress_downstream_event: bool = False
     replay_request_state: _WebSocketRequestState | None = None
     downstream_texts: list[str] | None = None
+    discarded_response_ids: set[str] = field(default_factory=set)
+    discarded_request_accounting: dict[str, _DiscardedRequestAccounting] = field(default_factory=dict)
+    anonymous_discarded_request_accounting: dict[str, _DiscardedRequestAccounting] = field(
+        default_factory=dict
+    )
+    detached_receive_pending: bool = False
+    discarded_accounting_sealed: bool = False
+    upstream_close_owned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _HTTPBridgeExpiryResult:
+    expired_requests: tuple[_WebSocketRequestState, ...]
+    retire_ambiguous_transport: bool = False
 
 
 @dataclass(slots=True)

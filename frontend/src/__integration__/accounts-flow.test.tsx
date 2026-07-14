@@ -6,6 +6,28 @@ import App from "@/App";
 import { renderWithProviders } from "@/test/utils";
 
 describe("accounts flow integration", () => {
+  it("updates the five-hour routing override", async () => {
+    const user = userEvent.setup({ delay: null });
+
+    window.history.pushState({}, "", "/accounts");
+    renderWithProviders(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Accounts" }),
+    ).toBeInTheDocument();
+    const toggle = await screen.findByRole("switch", {
+      name: "Ignore five-hour limit",
+    });
+    expect(toggle).not.toBeChecked();
+
+    await user.click(toggle);
+
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(
+      await screen.findByText("Account routing settings updated"),
+    ).toBeInTheDocument();
+  });
+
   it("supports account selection and pause/resume actions", async () => {
     const user = userEvent.setup({ delay: null });
 
@@ -57,6 +79,10 @@ describe("accounts flow integration", () => {
       await screen.findByRole("heading", { name: "Accounts" }),
     ).toBeInTheDocument();
     expect(await screen.findByText("1 available")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Full reset (Weekly + 5 hr)"),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/^Expires /)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Use reset" }));
     expect(
@@ -71,6 +97,9 @@ describe("accounts flow integration", () => {
 
     await waitFor(() => {
       expect(screen.getByText("0 available")).toBeInTheDocument();
+      expect(
+        screen.queryByText("Full reset (Weekly + 5 hr)"),
+      ).not.toBeInTheDocument();
     });
   });
 });

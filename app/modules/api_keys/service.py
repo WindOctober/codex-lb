@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import secrets
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -36,6 +36,7 @@ from app.modules.api_keys.repository import (
 
 _SPARKLINE_DAYS = 7
 _DETAIL_BUCKET_SECONDS = 3600
+_UNKNOWN_MODEL_COST_MICRODOLLARS = 2_000_000
 _SQLITE_API_KEY_USAGE_WRITE_LOCK = anyio.Lock()
 
 
@@ -311,6 +312,18 @@ class ApiKeyUsageReservationData:
     reservation_id: str
     key_id: str
     model: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyUsageCharge:
+    """One authoritative upstream attempt priced at its own model and tier."""
+
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    service_tier: str | None = None
 
 
 class ApiKeysService:
@@ -643,7 +656,9 @@ class ApiKeysService:
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        cache_write_tokens: int = 0,
         service_tier: str | None = None,
+        usage_charges: Sequence[ApiKeyUsageCharge] | None = None,
     ) -> None:
         await self._settle_usage_reservation(
             reservation_id,
@@ -651,7 +666,9 @@ class ApiKeysService:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
+            cache_write_tokens=cache_write_tokens,
             service_tier=service_tier,
+            usage_charges=usage_charges,
             status="finalized",
         )
 
@@ -663,7 +680,9 @@ class ApiKeysService:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
         service_tier: str | None = None,
+        usage_charges: Sequence[ApiKeyUsageCharge] | None = None,
     ) -> None:
         await self._settle_usage_reservation(
             reservation_id,
@@ -671,7 +690,9 @@ class ApiKeysService:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
+            cache_write_tokens=cache_write_tokens,
             service_tier=service_tier,
+            usage_charges=usage_charges,
             status="failed",
         )
 
@@ -683,33 +704,58 @@ class ApiKeysService:
         input_tokens: int | None,
         output_tokens: int | None,
         cached_input_tokens: int | None,
+        cache_write_tokens: int | None,
         service_tier: str | None,
+        usage_charges: Sequence[ApiKeyUsageCharge] | None,
         status: str,
     ) -> None:
         async with _api_key_usage_write_section():
             reservation = await self._repository.get_usage_reservation(reservation_id)
-            if reservation is None or reservation.status != "reserved":
+            if reservation is None or reservation.status not in {"reserved", "owner_accepted"}:
                 return
 
             claimed = await self._repository.transition_usage_reservation_status(
                 reservation_id,
-                expected_status="reserved",
+                expected_status=reservation.status,
                 new_status="settling",
             )
             if not claimed:
                 await self._repository.rollback()
                 return
 
-            effective_input_tokens = input_tokens or 0
-            effective_output_tokens = output_tokens or 0
-            effective_cached_input_tokens = cached_input_tokens or 0
-            cost_microdollars = _calculate_cost_microdollars(
-                model,
-                effective_input_tokens,
-                effective_output_tokens,
-                effective_cached_input_tokens,
-                service_tier,
-            )
+            if usage_charges is None:
+                effective_input_tokens = input_tokens or 0
+                effective_output_tokens = output_tokens or 0
+                effective_cached_input_tokens = cached_input_tokens or 0
+                effective_cache_write_tokens = cache_write_tokens or 0
+                cost_microdollars = _calculate_cost_microdollars(
+                    model,
+                    effective_input_tokens,
+                    effective_output_tokens,
+                    effective_cached_input_tokens,
+                    service_tier,
+                    cache_write_tokens=effective_cache_write_tokens,
+                )
+            else:
+                effective_input_tokens = sum(charge.input_tokens for charge in usage_charges)
+                effective_output_tokens = sum(charge.output_tokens for charge in usage_charges)
+                effective_cached_input_tokens = sum(charge.cached_input_tokens for charge in usage_charges)
+                effective_cache_write_tokens = sum(charge.cache_write_tokens for charge in usage_charges)
+                input_tokens = effective_input_tokens
+                output_tokens = effective_output_tokens
+                cached_input_tokens = effective_cached_input_tokens
+                cache_write_tokens = effective_cache_write_tokens
+                cost_microdollars = sum(
+                    _calculate_cost_microdollars(
+                        charge.model,
+                        charge.input_tokens,
+                        charge.output_tokens,
+                        charge.cached_input_tokens,
+                        charge.service_tier,
+                        cache_write_tokens=charge.cache_write_tokens,
+                    )
+                    for charge in usage_charges
+                )
 
             try:
                 for item in reservation.items:
@@ -746,15 +792,49 @@ class ApiKeysService:
                 await self._repository.rollback()
                 raise
 
+    async def claim_usage_reservation_for_forwarding(self, reservation_id: str) -> bool:
+        async with _api_key_usage_write_section():
+            claimed = await self._repository.transition_usage_reservation_status(
+                reservation_id,
+                expected_status="reserved",
+                new_status="owner_accepted",
+            )
+            if claimed:
+                await self._repository.commit()
+            else:
+                await self._repository.rollback()
+            return claimed
+
+    async def usage_reservation_status(self, reservation_id: str) -> str | None:
+        reservation = await self._repository.get_usage_reservation(reservation_id)
+        return reservation.status if reservation is not None else None
+
+    async def release_unclaimed_usage_reservation(self, reservation_id: str) -> None:
+        await self._release_usage_reservation(
+            reservation_id,
+            releasable_statuses=frozenset({"reserved"}),
+        )
+
     async def release_usage_reservation(self, reservation_id: str) -> None:
+        await self._release_usage_reservation(
+            reservation_id,
+            releasable_statuses=frozenset({"reserved", "owner_accepted"}),
+        )
+
+    async def _release_usage_reservation(
+        self,
+        reservation_id: str,
+        *,
+        releasable_statuses: frozenset[str],
+    ) -> None:
         async with _api_key_usage_write_section():
             reservation = await self._repository.get_usage_reservation(reservation_id)
-            if reservation is None or reservation.status != "reserved":
+            if reservation is None or reservation.status not in releasable_statuses:
                 return
 
             claimed = await self._repository.transition_usage_reservation_status(
                 reservation_id,
-                expected_status="reserved",
+                expected_status=reservation.status,
                 new_status="released",
             )
             if not claimed:
@@ -794,6 +874,7 @@ class ApiKeysService:
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        cache_write_tokens: int = 0,
         service_tier: str | None = None,
     ) -> None:
         cost_microdollars = _calculate_cost_microdollars(
@@ -802,6 +883,7 @@ class ApiKeysService:
             output_tokens,
             cached_input_tokens,
             service_tier,
+            cache_write_tokens=cache_write_tokens,
         )
         await self._repository.increment_limit_usage(
             key_id,
@@ -1180,15 +1262,16 @@ def _reserve_budget_for_limit_type(
 
 def _reserve_cost_budget_microdollars(model: str | None, service_tier: str | None) -> int:
     if not model:
-        return 2_000_000
+        return _UNKNOWN_MODEL_COST_MICRODOLLARS
     cost_microdollars = _calculate_cost_microdollars(
         model,
         8_192,
         8_192,
         0,
         service_tier,
+        cache_write_tokens=8_192,
     )
-    return cost_microdollars if cost_microdollars > 0 else 2_000_000
+    return cost_microdollars if cost_microdollars > 0 else _UNKNOWN_MODEL_COST_MICRODOLLARS
 
 
 def _compute_increment_for_limit_type(
@@ -1419,19 +1502,22 @@ def _calculate_cost_microdollars(
     output_tokens: int,
     cached_input_tokens: int,
     service_tier: str | None = None,
+    *,
+    cache_write_tokens: int = 0,
 ) -> int:
     resolved = get_pricing_for_model(model)
     if resolved is None:
-        return 0
+        return _UNKNOWN_MODEL_COST_MICRODOLLARS
     _, price = resolved
     usage = UsageTokens(
         input_tokens=float(input_tokens),
         output_tokens=float(output_tokens),
         cached_input_tokens=float(cached_input_tokens),
+        cache_write_tokens=float(cache_write_tokens),
     )
     cost_usd = calculate_cost_from_usage(usage, price, service_tier=service_tier)
     if cost_usd is None:
-        return 0
+        return _UNKNOWN_MODEL_COST_MICRODOLLARS
     return int(cost_usd * 1_000_000)
 
 

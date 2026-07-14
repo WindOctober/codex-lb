@@ -82,14 +82,47 @@ def _resolve_prompt_cache_key(
     if isinstance(cache_key, str):
         stripped = cache_key.strip()
         if stripped:
-            if stripped != cache_key:
-                payload.prompt_cache_key = stripped
             return stripped, "payload"
     if not openai_cache_affinity or not settings.openai_prompt_cache_key_derivation_enabled:
         return None, "none"
     cache_key = _derive_prompt_cache_key(payload, api_key)
     payload.prompt_cache_key = cache_key
     return cache_key, "derived"
+
+
+def _prompt_cache_affinity_key_for_values(
+    *,
+    cache_key: str | None,
+    model: str,
+    api_key: ApiKeyData | None,
+) -> str | None:
+    if cache_key is None:
+        return None
+    tenant = api_key.id if api_key is not None else "shared"
+    material = json.dumps(
+        [tenant, model.strip().lower(), cache_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"prompt-cache:v2:{sha256(material.encode()).hexdigest()}"
+
+
+def _prompt_cache_affinity_key(
+    payload: ResponsesRequest | ResponsesCompactRequest,
+    cache_key: str | None,
+    api_key: ApiKeyData | None,
+) -> str | None:
+    return _prompt_cache_affinity_key_for_values(
+        cache_key=cache_key,
+        model=payload.model,
+        api_key=api_key,
+    )
+
+
+def _required_prompt_cache_wire_api(
+    payload: ResponsesRequest | ResponsesCompactRequest,
+) -> str | None:
+    return "responses" if payload.uses_prompt_cache_controls() else None
 
 
 def _sticky_key_for_responses_request(
@@ -103,32 +136,46 @@ def _sticky_key_for_responses_request(
     settings: Settings,
     api_key: ApiKeyData | None = None,
 ) -> _AffinityPolicy:
-    cache_key, _ = _resolve_prompt_cache_key(
+    required_wire_api = _required_prompt_cache_wire_api(payload)
+    cache_key, cache_key_source = _resolve_prompt_cache_key(
         payload,
         openai_cache_affinity=openai_cache_affinity,
         api_key=api_key,
         settings=settings,
     )
     turn_state_key = _sticky_key_from_turn_state_header(headers)
-    if turn_state_key:
-        return _AffinityPolicy(key=turn_state_key, kind=StickySessionKind.CODEX_SESSION)
+    explicit_cache_affinity_precedes_turn_state = (
+        not codex_session_affinity and openai_cache_affinity and cache_key_source == "payload"
+    )
+    if turn_state_key and not explicit_cache_affinity_precedes_turn_state:
+        return _AffinityPolicy(
+            key=turn_state_key,
+            kind=StickySessionKind.CODEX_SESSION,
+            required_upstream_wire_api=required_wire_api,
+        )
     if codex_session_affinity:
         session_key = _sticky_key_from_session_header(headers)
         if session_key:
-            return _AffinityPolicy(key=session_key, kind=StickySessionKind.CODEX_SESSION)
+            return _AffinityPolicy(
+                key=session_key,
+                kind=StickySessionKind.CODEX_SESSION,
+                required_upstream_wire_api=required_wire_api,
+            )
     if openai_cache_affinity:
         return _AffinityPolicy(
-            key=cache_key,
+            key=_prompt_cache_affinity_key(payload, cache_key, api_key),
             kind=StickySessionKind.PROMPT_CACHE,
             max_age_seconds=openai_cache_affinity_max_age_seconds,
+            required_upstream_wire_api=required_wire_api,
         )
     if sticky_threads_enabled:
         return _AffinityPolicy(
             key=cache_key,
             kind=StickySessionKind.STICKY_THREAD,
             reallocate_sticky=True,
+            required_upstream_wire_api=required_wire_api,
         )
-    return _AffinityPolicy()
+    return _AffinityPolicy(required_upstream_wire_api=required_wire_api)
 
 
 def _sticky_key_for_compact_request(
@@ -142,6 +189,7 @@ def _sticky_key_for_compact_request(
     settings: Settings,
     api_key: ApiKeyData | None = None,
 ) -> _AffinityPolicy:
+    required_wire_api = _required_prompt_cache_wire_api(payload)
     cache_key, _ = _resolve_prompt_cache_key(
         payload,
         openai_cache_affinity=openai_cache_affinity,
@@ -151,20 +199,26 @@ def _sticky_key_for_compact_request(
     if codex_session_affinity:
         session_key = _sticky_key_from_session_header(headers)
         if session_key:
-            return _AffinityPolicy(key=session_key, kind=StickySessionKind.CODEX_SESSION)
+            return _AffinityPolicy(
+                key=session_key,
+                kind=StickySessionKind.CODEX_SESSION,
+                required_upstream_wire_api=required_wire_api,
+            )
     if openai_cache_affinity:
         return _AffinityPolicy(
-            key=cache_key,
+            key=_prompt_cache_affinity_key(payload, cache_key, api_key),
             kind=StickySessionKind.PROMPT_CACHE,
             max_age_seconds=openai_cache_affinity_max_age_seconds,
+            required_upstream_wire_api=required_wire_api,
         )
     if sticky_threads_enabled:
         return _AffinityPolicy(
             key=cache_key,
             kind=StickySessionKind.STICKY_THREAD,
             reallocate_sticky=True,
+            required_upstream_wire_api=required_wire_api,
         )
-    return _AffinityPolicy()
+    return _AffinityPolicy(required_upstream_wire_api=required_wire_api)
 
 
 def _extract_first_user_input(payload: ResponsesRequest | ResponsesCompactRequest) -> str | None:

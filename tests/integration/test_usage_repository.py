@@ -79,6 +79,28 @@ async def test_latest_by_account_respects_window_filter(db_setup):
 
 
 @pytest.mark.asyncio
+async def test_delete_for_account_window_removes_only_requested_window(db_setup):
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        repo = UsageRepository(session)
+        await accounts_repo.upsert(_make_account("acc1"))
+        await accounts_repo.upsert(_make_account("acc2"))
+
+        await repo.add_entry("acc1", 10.0, window=None)
+        await repo.add_entry("acc1", 20.0, window="primary")
+        await repo.add_entry("acc1", 30.0, window="secondary")
+        await repo.add_entry("acc2", 40.0, window="primary")
+
+        await repo.delete_for_account_window("acc1", "primary")
+
+        primary = await repo.latest_by_account(window="primary")
+        secondary = await repo.latest_by_account(window="secondary")
+        assert "acc1" not in primary
+        assert primary["acc2"].used_percent == 40.0
+        assert secondary["acc1"].used_percent == 30.0
+
+
+@pytest.mark.asyncio
 async def test_latest_by_account_default_includes_primary_and_none(db_setup):
     now = utcnow()
     async with SessionLocal() as session:

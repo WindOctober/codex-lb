@@ -5,7 +5,7 @@ import logging
 from pydantic import ValidationError
 
 from app.core.errors import OpenAIErrorEnvelope, openai_error
-from app.core.exceptions import ProxyModelNotAllowed
+from app.core.exceptions import ProxyInvalidRequest, ProxyModelNotAllowed
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesReasoning, ResponsesRequest
 from app.core.openai.v1_requests import V1ResponsesRequest
 from app.core.types import JsonValue
@@ -36,18 +36,30 @@ def apply_api_key_enforcement(
     payload: ResponsesRequest | ResponsesCompactRequest,
     api_key: ApiKeyData | None,
 ) -> None:
-    if api_key is None:
-        return
-
-    if api_key.enforced_model and payload.model != api_key.enforced_model:
+    enforced_model = api_key.enforced_model if api_key is not None else None
+    model_was_enforced = enforced_model is not None and payload.model != enforced_model
+    if model_was_enforced:
+        assert enforced_model is not None
         logger.info(
             "api_key_model_enforced request_id=%s key_id=%s requested_model=%s enforced_model=%s",
             get_request_id(),
-            api_key.id,
+            api_key.id if api_key is not None else None,
             payload.model,
-            api_key.enforced_model,
+            enforced_model,
         )
-        payload.model = api_key.enforced_model
+        payload.model = enforced_model
+
+    try:
+        payload.ensure_prompt_cache_model_compatibility()
+    except ValueError as exc:
+        if enforced_model is not None:
+            raise ProxyModelNotAllowed(
+                f"The enforced model '{payload.model}' does not support GPT-5.6 prompt cache controls"
+            ) from exc
+        raise ProxyInvalidRequest(str(exc)) from exc
+
+    if api_key is None:
+        return
 
     if api_key.enforced_reasoning_effort is not None:
         requested_effort = payload.reasoning.effort if payload.reasoning else None

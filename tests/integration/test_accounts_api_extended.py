@@ -660,6 +660,31 @@ async def test_accounts_list_maps_weekly_only_primary_to_secondary(async_client,
 
 
 @pytest.mark.asyncio
+async def test_accounts_list_omits_primary_for_secondary_only_weekly_snapshot(async_client, db_setup):
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_weekly_secondary", "weekly-secondary@example.com"))
+        await usage_repo.add_entry(
+            "acc_weekly_secondary",
+            3.0,
+            window="secondary",
+            window_minutes=10080,
+        )
+
+    response = await async_client.get("/api/accounts")
+    assert response.status_code == 200
+    accounts = {item["accountId"]: item for item in response.json()["accounts"]}
+
+    account = accounts["acc_weekly_secondary"]
+    assert account["usage"]["primaryRemainingPercent"] is None
+    assert account["usage"]["secondaryRemainingPercent"] == pytest.approx(97.0)
+    assert account["windowMinutesPrimary"] is None
+    assert account["windowMinutesSecondary"] == 10080
+
+
+@pytest.mark.asyncio
 async def test_accounts_list_prefers_newer_weekly_primary_over_stale_secondary(async_client, db_setup):
     now = utcnow()
     stale_reset = 1735689600

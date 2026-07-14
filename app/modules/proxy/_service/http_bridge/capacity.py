@@ -16,6 +16,7 @@ from app.core.errors import openai_error
 from app.db.models import Account, AccountStatus, DashboardSettings
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy._service.affinity import _extract_model_class
+from app.modules.proxy._service.budget import _raise_proxy_budget_exhausted, _remaining_budget_seconds
 from app.modules.proxy._service.http_bridge.keys import (
     _http_bridge_busy_parallel_key,
     _http_bridge_parallel_batch_key,
@@ -34,6 +35,7 @@ from app.modules.proxy._service.http_bridge.policy import (
 from app.modules.proxy._service.http_bridge.runtime import _HTTPBridgePressureCapacityHint
 from app.modules.proxy._service.observability import _log_http_bridge_event
 from app.modules.proxy._service.support import (
+    _await_operation_before_hard_timeout,
     _HTTPBridgeSession,
     _HTTPBridgeSessionKey,
     _routing_strategy,
@@ -57,6 +59,7 @@ class _HTTPBridgeCapacityService(Protocol):
     _http_bridge_previous_response_index: dict[tuple[str, str | None], _HTTPBridgeSessionKey]
     _http_bridge_sessions: dict[_HTTPBridgeSessionKey, _HTTPBridgeSession]
     _http_bridge_turn_state_index: dict[tuple[str, str | None], _HTTPBridgeSessionKey]
+    _proxy_cleanup_tasks: set[asyncio.Task[None]]
 
     @staticmethod
     def _http_bridge_runtime_settings() -> Settings: ...
@@ -73,6 +76,7 @@ class _HTTPBridgeCapacityService(Protocol):
         preferred_group_priorities: dict[str, int] | None,
         budget_threshold_pct: float,
         routing_strategy: RoutingStrategy,
+        ignore_five_hour_limit: bool = False,
     ) -> set[str]: ...
 
     def _try_acquire_http_bridge_session_account_model_concurrency(
@@ -85,19 +89,36 @@ class _HTTPBridgeCapacityService(Protocol):
 
     async def _close_http_bridge_session(self, session: _HTTPBridgeSession, **kwargs: object) -> None: ...
 
+    def _schedule_http_bridge_session_close(
+        self,
+        session: _HTTPBridgeSession,
+        *,
+        reason: str,
+    ) -> asyncio.Future[None]: ...
+
     def _unregister_http_bridge_turn_states_locked(self, session: _HTTPBridgeSession) -> None: ...
 
     def _unregister_http_bridge_previous_response_ids_locked(self, session: _HTTPBridgeSession) -> None: ...
 
+    def _detach_http_bridge_session_indexes_locked(self, session: _HTTPBridgeSession) -> bool: ...
+
     async def _http_bridge_pending_count(self, session: _HTTPBridgeSession) -> int: ...
 
     async def _http_bridge_replacement_busy_count(self, session: _HTTPBridgeSession) -> int: ...
+
+    @staticmethod
+    async def _await_http_bridge_detachment_before_deadline(
+        detached: list[asyncio.Future[None]],
+        *,
+        request_deadline_at: float,
+    ) -> None: ...
 
     async def _evict_http_bridge_idle_session_for_account_model_capacity(
         self,
         *,
         model: str | None,
         protected_key: _HTTPBridgeSessionKey,
+        request_deadline_at: float,
         account_ids: set[str] | None = None,
     ) -> bool: ...
 
@@ -144,6 +165,23 @@ class _HTTPBridgeCapacityService(Protocol):
 
 
 class _HTTPBridgeCapacityMixin:
+    @staticmethod
+    async def _await_http_bridge_detachment_before_deadline(
+        detached: list[asyncio.Future[None]],
+        *,
+        request_deadline_at: float,
+    ) -> None:
+        if not detached:
+            return
+        remaining = _remaining_budget_seconds(request_deadline_at)
+        if remaining <= 0:
+            _raise_proxy_budget_exhausted()
+        done, pending = await asyncio.wait(detached, timeout=remaining)
+        for future in done:
+            future.result()
+        if pending:
+            _raise_proxy_budget_exhausted()
+
     async def _reserve_http_bridge_creation_slot_locked(
         self: _HTTPBridgeCapacityService,
         *,
@@ -177,7 +215,7 @@ class _HTTPBridgeCapacityMixin:
                 cache_key_family=lru_key.affinity_kind,
                 model_class=_extract_model_class(lru_session.request_model) if lru_session.request_model else None,
             )
-            self._http_bridge_sessions.pop(lru_key, None)
+            self._detach_http_bridge_session_indexes_locked(lru_session)
             evicted_sessions.append(lru_session)
 
         if (
@@ -223,7 +261,12 @@ class _HTTPBridgeCapacityMixin:
         session: _HTTPBridgeSession,
     ) -> int:
         async with session.pending_lock:
-            return max(len(session.pending_requests), session.queued_request_count)
+            return max(
+                len(session.pending_requests),
+                session.queued_request_count,
+                len(session.discarded_request_accounting)
+                + len(session.anonymous_discarded_request_accounting),
+            )
 
     async def _http_bridge_replacement_busy_count(
         self: _HTTPBridgeCapacityService,
@@ -251,6 +294,7 @@ class _HTTPBridgeCapacityMixin:
         session: "_HTTPBridgeSession",
         *,
         request_id: str,
+        request_deadline_at: float,
     ) -> str | None:
         sessions_to_close: list[_HTTPBridgeSession] = []
         if session.account_model_session_lease is None:
@@ -263,6 +307,7 @@ class _HTTPBridgeCapacityMixin:
                 reclaimed = await self._evict_http_bridge_idle_session_for_account_model_capacity(
                     model=session.request_model,
                     protected_key=session.key,
+                    request_deadline_at=request_deadline_at,
                     account_ids={session.account.id},
                 )
                 if reclaimed:
@@ -279,14 +324,11 @@ class _HTTPBridgeCapacityMixin:
             current_session = self._http_bridge_sessions.get(session.key)
             if current_session is not None and current_session is not session:
                 if session.key.strength == "soft":
-                    return None
+                    return "key_conflict_soft"
                 current_busy_count = await self._http_bridge_replacement_busy_count(current_session)
                 if current_busy_count:
                     return "key_conflict_busy"
-                self._http_bridge_sessions.pop(session.key, None)
-                self._unregister_http_bridge_turn_states_locked(current_session)
-                self._unregister_http_bridge_previous_response_ids_locked(current_session)
-                current_session.closed = True
+                self._detach_http_bridge_session_indexes_locked(current_session)
                 sessions_to_close.append(current_session)
             self._http_bridge_sessions[session.key] = session
             if session.downstream_turn_state is not None:
@@ -299,8 +341,15 @@ class _HTTPBridgeCapacityMixin:
                 self._http_bridge_previous_response_index[
                     _http_bridge_previous_response_alias_key(response_id, session.key.api_key_id)
                 ] = session.key
-        for old_session in sessions_to_close:
-            await self._close_http_bridge_session(old_session)
+        detached = [
+            self._schedule_http_bridge_session_close(old_session, reason="capacity-reassignment")
+            for old_session in sessions_to_close
+        ]
+        if detached:
+            await self._await_http_bridge_detachment_before_deadline(
+                detached,
+                request_deadline_at=request_deadline_at,
+            )
         return None
 
     async def _evict_http_bridge_idle_session_for_account_model_capacity(
@@ -308,6 +357,7 @@ class _HTTPBridgeCapacityMixin:
         *,
         model: str | None,
         protected_key: "_HTTPBridgeSessionKey",
+        request_deadline_at: float,
         account_ids: set[str] | None = None,
     ) -> bool:
         async with self._http_bridge_lock:
@@ -333,9 +383,10 @@ class _HTTPBridgeCapacityMixin:
                     item[0].affinity_key,
                 ),
             )
-            removed = self._http_bridge_sessions.pop(evict_key, None)
+            removed = self._http_bridge_sessions.get(evict_key)
             if removed is None:
                 return False
+            self._detach_http_bridge_session_indexes_locked(removed)
             _log_http_bridge_event(
                 "evict_account_model_session_capacity",
                 evict_key,
@@ -345,7 +396,11 @@ class _HTTPBridgeCapacityMixin:
                 cache_key_family=evict_key.affinity_kind,
                 model_class=_extract_model_class(removed.request_model) if removed.request_model else None,
             )
-        await self._close_http_bridge_session(removed)
+        detached = self._schedule_http_bridge_session_close(removed, reason="account-model-capacity-eviction")
+        await self._await_http_bridge_detachment_before_deadline(
+            [detached],
+            request_deadline_at=request_deadline_at,
+        )
         return True
 
     async def _resolve_http_bridge_pressure_capacity_hint(
@@ -381,6 +436,7 @@ class _HTTPBridgeCapacityMixin:
                 preferred_group_priorities=preferred_group_priorities,
                 budget_threshold_pct=dashboard_settings.sticky_reallocation_budget_threshold_pct,
                 routing_strategy=_routing_strategy(dashboard_settings),
+                ignore_five_hour_limit=bool(getattr(dashboard_settings, "ignore_five_hour_limit", False)),
             )
         except Exception:
             logger.warning(
@@ -439,17 +495,29 @@ class _HTTPBridgeCapacityMixin:
         max_sessions: int,
         protected_key: "_HTTPBridgeSessionKey",
         request_model: str | None,
+        request_deadline_at: float,
         api_key: ApiKeyData | None = None,
     ) -> list["_HTTPBridgeSession"]:
         settings = self._http_bridge_runtime_settings()
         if not settings.http_responses_session_bridge_pressure_eviction_enabled:
             return []
-        capacity_hint = await self._resolve_http_bridge_pressure_capacity_hint(
-            settings=settings,
-            max_sessions=max_sessions,
-            api_key=api_key,
-            request_model=request_model,
-        )
+        remaining = _remaining_budget_seconds(request_deadline_at)
+        if remaining <= 0:
+            _raise_proxy_budget_exhausted()
+        try:
+            capacity_hint = await _await_operation_before_hard_timeout(
+                self._resolve_http_bridge_pressure_capacity_hint(
+                    settings=settings,
+                    max_sessions=max_sessions,
+                    api_key=api_key,
+                    request_model=request_model,
+                ),
+                timeout_seconds=remaining,
+                tasks=self._proxy_cleanup_tasks,
+                label="HTTP bridge pressure capacity resolution",
+            )
+        except TimeoutError:
+            _raise_proxy_budget_exhausted()
         async with self._http_bridge_lock:
             sessions_to_close = await self._evict_http_bridge_parallel_prompt_cache_pressure_locked(
                 settings=settings,
@@ -458,8 +526,15 @@ class _HTTPBridgeCapacityMixin:
                 request_model=request_model,
                 capacity_hint=capacity_hint,
             )
-        for stale_session in sessions_to_close:
-            await self._close_http_bridge_session(stale_session)
+        detached = [
+            self._schedule_http_bridge_session_close(stale_session, reason="pressure-eviction")
+            for stale_session in sessions_to_close
+        ]
+        if detached:
+            await self._await_http_bridge_detachment_before_deadline(
+                detached,
+                request_deadline_at=request_deadline_at,
+            )
         return sessions_to_close
 
     async def _evict_http_bridge_parallel_prompt_cache_pressure_locked(
@@ -542,9 +617,10 @@ class _HTTPBridgeCapacityMixin:
         )
         evicted_sessions: list[_HTTPBridgeSession] = []
         for evict_key, evict_session, batch_key in eligible[:evict_count]:
-            removed = self._http_bridge_sessions.pop(evict_key, None)
+            removed = self._http_bridge_sessions.get(evict_key)
             if removed is None:
                 continue
+            self._detach_http_bridge_session_indexes_locked(removed)
             _log_http_bridge_event(
                 "pressure_evict_parallel_prompt_cache",
                 evict_key,
@@ -633,6 +709,8 @@ class _HTTPBridgeCapacityMixin:
                 and session.submit_lease_count <= 0
                 and not session.pending_requests
                 and session.queued_request_count <= 0
+                and not session.discarded_request_accounting
+                and not session.anonymous_discarded_request_accounting
             ):
                 idle_existing_key = parallel_key
         if idle_existing_key is not None:

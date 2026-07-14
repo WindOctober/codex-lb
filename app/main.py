@@ -291,6 +291,16 @@ async def lifespan(app: FastAPI):
                 await proxy_service.close_all_http_bridge_sessions()
             except Exception:
                 logger.warning("Failed to close HTTP bridge sessions during shutdown", exc_info=True)
+        if proxy_service is not None and hasattr(proxy_service, "close_search_background_tasks"):
+            try:
+                await proxy_service.close_search_background_tasks()
+            except Exception:
+                logger.warning("Failed to close Codex search background tasks during shutdown", exc_info=True)
+        if proxy_service is not None and hasattr(proxy_service, "close_proxy_cleanup_tasks"):
+            try:
+                await proxy_service.close_proxy_cleanup_tasks()
+            except Exception:
+                logger.warning("Failed to close proxy cleanup tasks during shutdown", exc_info=True)
 
         # Cancel heartbeat and age the shared ring row near expiry.
         if heartbeat_task is not None:

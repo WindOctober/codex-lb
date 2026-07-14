@@ -202,9 +202,17 @@ class AccountDeleteResponse(DashboardModel):
     status: str
 
 
+class AccountRateLimitResetCredit(DashboardModel):
+    reset_type: str | None = None
+    title: str | None = None
+    granted_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
 class AccountRateLimitResetCreditsResponse(DashboardModel):
     account_id: str
     available_count: int
+    credits: list[AccountRateLimitResetCredit] = Field(default_factory=list)
 
 
 class AccountRateLimitResetConsumeRequest(DashboardModel):

@@ -15,6 +15,7 @@ from app.modules.proxy._service.support import (
     _HTTPBridgeSession,
     _HTTPBridgeSessionKey,
 )
+from app.modules.proxy._service.upstream_account import _account_supports_required_upstream_wire_api
 from app.modules.proxy.load_balancer import AccountSelection
 
 logger = logging.getLogger("app.modules.proxy.service")
@@ -140,8 +141,11 @@ def _http_bridge_session_reusable_for_request(
     incoming_turn_state: str | None,
     previous_response_id: str | None,
     request_model: str | None,
+    required_upstream_wire_api: str | None = None,
     model_registry: _ModelPlanRegistry | None = None,
 ) -> bool:
+    if not _account_supports_required_upstream_wire_api(session.account, required_upstream_wire_api):
+        return False
     if not _http_bridge_session_account_supports_request_model(
         session,
         request_model,

@@ -14,6 +14,10 @@ from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope, openai_error
 from app.core.exceptions import AppError
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import parse_sse_event
+from app.core.openai.upstream_error_sanitization import (
+    sanitize_upstream_openai_error_envelope,
+    sanitize_upstream_websocket_error_detail,
+)
 from app.core.types import JsonValue
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.modules.proxy._service.affinity import _normalize_session_id as _normalize_session_id
@@ -33,6 +37,13 @@ _WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES = frozenset(
         "insufficient_quota",
         "usage_not_included",
         "quota_exceeded",
+    }
+)
+_STABLE_PROXY_CONNECT_FAILURES = frozenset(
+    {
+        ("no_accounts", "No active accounts available"),
+        ("upstream_request_timeout", "Proxy request budget exhausted"),
+        ("upstream_unavailable", "Previous response owner account is unavailable; retry later."),
     }
 )
 
@@ -317,9 +328,23 @@ def _normalize_http_bridge_error_event(
             if isinstance(resets_in, int | float):
                 rate_limit_metadata["resets_in_seconds"] = resets_in
 
-    normalized_error_code = _normalize_error_code(error_code_value, error_type_value) or "upstream_error"
-    normalized_error_type = error_type_value or "server_error"
-    normalized_error_message = error_message_value or "Upstream error"
+    raw_error_detail: dict[str, JsonValue] = {}
+    if error_code_value is not None:
+        raw_error_detail["code"] = error_code_value
+    if error_type_value is not None:
+        raw_error_detail["type"] = error_type_value
+    if error_message_value is not None:
+        raw_error_detail["message"] = error_message_value
+    if error_param_value is not None:
+        raw_error_detail["param"] = error_param_value
+    raw_error_detail.update(cast(dict[str, JsonValue], rate_limit_metadata))
+    public_error_detail = sanitize_upstream_websocket_error_detail(raw_error_detail)
+    normalized_error_code = cast(str, public_error_detail["code"])
+    normalized_error_type = cast(str, public_error_detail["type"])
+    normalized_error_message = cast(str, public_error_detail["message"])
+    normalized_error_param = public_error_detail.get("param")
+    if not isinstance(normalized_error_param, str):
+        normalized_error_param = None
 
     normalized_response_id = None
     if request_state is not None:
@@ -330,10 +355,15 @@ def _normalize_http_bridge_error_event(
         normalized_error_message,
         error_type=normalized_error_type,
         response_id=normalized_response_id,
-        error_param=error_param_value,
+        error_param=normalized_error_param,
     )
-    if rate_limit_metadata:
-        normalized_event["response"]["error"].update(rate_limit_metadata)
+    public_plan_type = public_error_detail.get("plan_type")
+    if isinstance(public_plan_type, str):
+        normalized_event["response"]["error"]["plan_type"] = public_plan_type
+    for metadata_key in ("resets_at", "resets_in_seconds"):
+        public_metadata_value = public_error_detail.get(metadata_key)
+        if isinstance(public_metadata_value, int | float) and not isinstance(public_metadata_value, bool):
+            normalized_event["response"]["error"][metadata_key] = public_metadata_value
     normalized_event_block = format_sse_event(normalized_event)
     normalized_payload = parse_sse_data_json(normalized_event_block)
     parsed_event = parse_sse_event(normalized_event_block)
@@ -455,6 +485,12 @@ def _websocket_precreated_retry_error_code(
         message=error_message,
     ):
         return "stream_incomplete"
+    if request_state.websocket_send_started_at is not None and error_code in {
+        "stream_incomplete",
+        "upstream_error",
+        "upstream_unavailable",
+    }:
+        return None
     if error_code in _WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES:
         return error_code
     if _should_failover_first_event_failure(
@@ -492,6 +528,12 @@ def _http_bridge_precreated_failover_error_code(
         _websocket_event_error_code(event_type, payload),
         _websocket_event_error_type(event_type, payload),
     )
+    if request_state.http_bridge_send_started_at is not None and error_code in {
+        "stream_incomplete",
+        "upstream_error",
+        "upstream_unavailable",
+    }:
+        return None
     error_message = _websocket_event_error_message(event_type, payload)
     if not _should_failover_first_event_failure(
         error_code=error_code,
@@ -507,8 +549,11 @@ def _http_bridge_no_text_failover_error_code(
     *,
     event_type: str | None,
     payload: dict[str, JsonValue] | None,
+    has_other_pending_requests: bool,
 ) -> str | None:
     if request_state is None:
+        return None
+    if has_other_pending_requests:
         return None
     if request_state.response_id is None:
         return None
@@ -529,6 +574,12 @@ def _http_bridge_no_text_failover_error_code(
         _websocket_event_error_code(event_type, payload),
         _websocket_event_error_type(event_type, payload),
     )
+    if request_state.http_bridge_send_started_at is not None and error_code in {
+        "stream_incomplete",
+        "upstream_error",
+        "upstream_unavailable",
+    }:
+        return None
     error_message = _websocket_event_error_message(event_type, payload)
     if not _should_failover_first_event_failure(
         error_code=error_code,
@@ -575,6 +626,11 @@ async def _pop_replayable_precreated_websocket_request_state(
         if not request_state.request_text:
             return None
         if request_state.replay_count >= 1:
+            return None
+        # A started response.create may have reached upstream even when no
+        # response.created frame was observed. Transport completion does not
+        # prove rejection, so close/timeout replay would risk duplicate work.
+        if request_state.websocket_send_started_at is not None:
             return None
         pending_requests.popleft()
     request_state.replay_count += 1
@@ -692,40 +748,42 @@ def _sanitize_websocket_connect_failure(
     error_message: str,
     record_continuity_fail_closed: _ContinuityFailClosedRecorder = _record_continuity_fail_closed,
 ) -> tuple[int, OpenAIErrorEnvelope, str, str]:
-    if request_state.previous_response_id is None:
-        return status_code, payload, error_code, error_message
-
     parsed_error = _parse_openai_error(payload)
     normalized_code = _normalize_error_code(
         parsed_error.code if parsed_error else error_code,
         parsed_error.type if parsed_error else None,
     )
     normalized_message = parsed_error.message if parsed_error and parsed_error.message else error_message
-    if not _is_previous_response_not_found_error(
+    if request_state.previous_response_id is not None and _is_previous_response_not_found_error(
         code=normalized_code,
         param=parsed_error.param if parsed_error else None,
         message=normalized_message,
     ):
-        return status_code, payload, error_code, error_message
-
-    rewritten_message = "Upstream websocket closed before response.completed"
-    record_continuity_fail_closed(
-        surface="websocket_connect",
-        reason="previous_response_not_found",
-        previous_response_id=request_state.previous_response_id,
-        session_id=request_state.session_id,
-        upstream_error_code=normalized_code,
-    )
-    return (
-        502,
-        openai_error(
+        rewritten_message = "Upstream websocket closed before response.completed"
+        record_continuity_fail_closed(
+            surface="websocket_connect",
+            reason="previous_response_not_found",
+            previous_response_id=request_state.previous_response_id,
+            session_id=request_state.session_id,
+            upstream_error_code=normalized_code,
+        )
+        return (
+            502,
+            openai_error(
+                "stream_incomplete",
+                rewritten_message,
+                error_type="server_error",
+            ),
             "stream_incomplete",
             rewritten_message,
-            error_type="server_error",
-        ),
-        "stream_incomplete",
-        rewritten_message,
-    )
+        )
+
+    if (error_code, error_message) in _STABLE_PROXY_CONNECT_FAILURES:
+        return status_code, payload, error_code, error_message
+
+    payload = sanitize_upstream_openai_error_envelope(payload)
+    public_error = payload["error"]
+    return status_code, payload, public_error["code"], public_error["message"]
 
 
 def _rewrite_previous_response_stream_error(
@@ -807,16 +865,11 @@ def _assign_websocket_response_id(
     return None
 
 
-def _has_other_precreated_pending_requests(
+def _has_other_pending_requests(
     pending_requests: deque[_WebSocketRequestState],
     current_request_state: _WebSocketRequestState,
 ) -> bool:
-    return any(
-        request_state is not current_request_state
-        and request_state.response_id is None
-        and request_state.awaiting_response_created
-        for request_state in pending_requests
-    )
+    return any(request_state is not current_request_state for request_state in pending_requests)
 
 
 def _pop_matching_websocket_request_states(
@@ -859,7 +912,7 @@ def _build_stream_incomplete_terminal_event_for_request(
 
 def _upstream_websocket_disconnect_message(message: UpstreamWebSocketMessage) -> str:
     if message.kind == "error" and message.error:
-        return f"Upstream websocket closed before response.completed: {message.error}"
+        return "Upstream websocket closed before response.completed"
     if message.close_code is not None:
         return f"Upstream websocket closed before response.completed (close_code={message.close_code})"
     return "Upstream websocket closed before response.completed"

@@ -14,6 +14,7 @@ from app.modules.api_keys.service import (
     ApiKeyData,
     ApiKeyInvalidError,
     ApiKeyRateLimitExceededError,
+    ApiKeyUsageCharge,
     ApiKeyUsageReservationData,
 )
 from app.modules.proxy._service import api_key_usage
@@ -28,8 +29,10 @@ class _FakeApiKeyRepository:
         self.enforce_error: Exception | None = None
         self.enforce_calls: list[dict[str, str | None]] = []
         self.finalize_calls: list[tuple[str, dict[str, object]]] = []
+        self.fail_calls: list[tuple[str, dict[str, object]]] = []
         self.release_calls: list[str] = []
         self.settlement_error: Exception | None = None
+        self.settlement_attempts = 0
 
 
 class _FakeApiKeysService:
@@ -55,11 +58,19 @@ class _FakeApiKeysService:
         return self._repository.reservation
 
     async def finalize_usage_reservation(self, reservation_id: str, **kwargs: object) -> None:
+        self._repository.settlement_attempts += 1
         if self._repository.settlement_error is not None:
             raise self._repository.settlement_error
         self._repository.finalize_calls.append((reservation_id, kwargs))
 
+    async def fail_usage_reservation(self, reservation_id: str, **kwargs: object) -> None:
+        self._repository.settlement_attempts += 1
+        if self._repository.settlement_error is not None:
+            raise self._repository.settlement_error
+        self._repository.fail_calls.append((reservation_id, kwargs))
+
     async def release_usage_reservation(self, reservation_id: str) -> None:
+        self._repository.settlement_attempts += 1
         if self._repository.settlement_error is not None:
             raise self._repository.settlement_error
         self._repository.release_calls.append(reservation_id)
@@ -196,8 +207,9 @@ async def test_compact_settlement_finalizes_complete_usage() -> None:
                 "input_tokens": 30,
                 "output_tokens": 12,
                 "cached_input_tokens": 7,
-                "service_tier": "priority",
-            },
+                    "cache_write_tokens": 0,
+                    "service_tier": "priority",
+                },
         )
     ]
     assert repository.release_calls == []
@@ -217,6 +229,115 @@ async def test_compact_settlement_releases_missing_response() -> None:
 
     assert repository.finalize_calls == []
     assert repository.release_calls == ["reservation-1"]
+
+
+@pytest.mark.asyncio
+async def test_compact_authoritative_settlement_retries_without_releasing_on_persistence_failure() -> None:
+    repository = _FakeApiKeyRepository()
+    repository.settlement_error = RuntimeError("database unavailable")
+    service = _ApiKeyUsageHarness(repository)
+    response = CompactResponsePayload.model_validate(
+        {
+            "object": "response.compact",
+            "model": "gpt-5.6-sol",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 1,
+                "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 80},
+            },
+        }
+    )
+
+    await service._settle_compact_api_key_usage(
+        api_key=None,
+        api_key_reservation=repository.reservation,
+        response=response,
+        request_service_tier="priority",
+    )
+
+    assert repository.settlement_attempts == 2
+    assert repository.finalize_calls == []
+    assert repository.release_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("usage_payload", "expected_usage"),
+    [
+        (
+            {
+                "input_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 80},
+            },
+                {
+                    "input_tokens": 100,
+                    "output_tokens": 0,
+                    "cached_input_tokens": 20,
+                    "cache_write_tokens": 80,
+                },
+        ),
+        (
+            {"output_tokens": 7},
+            {
+                "input_tokens": 0,
+                "output_tokens": 7,
+                "cached_input_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        ),
+        (
+            {"input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 80}},
+            {
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "cached_input_tokens": 20,
+                "cache_write_tokens": 80,
+            },
+        ),
+        (
+            {"output_tokens_details": {"reasoning_tokens": 9}},
+            {
+                "input_tokens": 0,
+                "output_tokens": 9,
+                "cached_input_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        ),
+    ],
+)
+async def test_compact_partial_authoritative_usage_is_failed_settled_instead_of_released(
+    usage_payload: dict[str, object],
+    expected_usage: dict[str, int | None],
+) -> None:
+    repository = _FakeApiKeyRepository()
+    service = _ApiKeyUsageHarness(repository)
+    response = CompactResponsePayload.model_validate(
+        {
+            "object": "response.compact",
+            "model": "gpt-5.6-sol",
+            "usage": usage_payload,
+        }
+    )
+
+    await service._settle_compact_api_key_usage(
+        api_key=_api_key(),
+        api_key_reservation=repository.reservation,
+        response=response,
+        request_service_tier="priority",
+    )
+
+    assert repository.finalize_calls == []
+    assert repository.fail_calls == [
+        (
+            "reservation-1",
+            {
+                "model": "gpt-key",
+                **expected_usage,
+                "service_tier": "priority",
+            },
+        )
+    ]
+    assert repository.release_calls == []
 
 
 @pytest.mark.asyncio
@@ -241,7 +362,9 @@ async def test_stream_settlement_preserves_success_and_release_paths() -> None:
                 "input_tokens": 40,
                 "output_tokens": 20,
                 "cached_input_tokens": 9,
+                "cache_write_tokens": 0,
                 "service_tier": "priority",
+                "usage_charges": None,
             },
         )
     ]
@@ -268,3 +391,50 @@ async def test_stream_settlement_failure_isolated_and_reported(
 
     assert settled is False
     assert "Failed to settle stream API key reservation key_id=key-1 request_id=request-3" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_failed_stream_settlement_uses_reservation_key_when_api_key_context_is_absent() -> None:
+    repository = _FakeApiKeyRepository()
+    service = _ApiKeyUsageHarness(repository)
+    charge = ApiKeyUsageCharge(
+        model="gpt-5.6-sol",
+        input_tokens=100,
+        output_tokens=2,
+        cached_input_tokens=20,
+        cache_write_tokens=80,
+        service_tier="priority",
+    )
+    settlement = _StreamSettlement(
+        status="error",
+        model="gpt-5.6-sol",
+        service_tier="priority",
+        input_tokens=100,
+        output_tokens=2,
+        cached_input_tokens=20,
+        cache_write_tokens=80,
+        usage_charges=(charge,),
+        error_code="stream_incomplete",
+    )
+
+    assert await service._settle_stream_api_key_usage(
+        None,
+        repository.reservation,
+        settlement,
+        "request-without-api-key-context",
+    )
+    assert repository.fail_calls == [
+        (
+            "reservation-1",
+            {
+                "model": "gpt-key",
+                "input_tokens": 100,
+                "output_tokens": 2,
+                "cached_input_tokens": 20,
+                "cache_write_tokens": 80,
+                "service_tier": "priority",
+                "usage_charges": (charge,),
+            },
+        )
+    ]
+    assert repository.release_calls == []

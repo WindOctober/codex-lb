@@ -113,6 +113,7 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
                 continue
             part_dict = _json_dict_or_none(part)
             if part_dict is not None:
+                _reject_unrepresentable_message_breakpoint(part_dict, role)
                 part_type = part_dict.get("type")
                 if part_type not in (None, "text"):
                     raise ClientPayloadError(f"{role} messages must be text-only.", param="messages")
@@ -123,6 +124,7 @@ def _ensure_text_only_content(content: JsonValue, role: str) -> None:
         return
     content_dict = _json_dict_or_none(content)
     if content_dict is not None:
+        _reject_unrepresentable_message_breakpoint(content_dict, role)
         part_type = content_dict.get("type")
         if part_type not in (None, "text"):
             raise ClientPayloadError(f"{role} messages must be text-only.", param="messages")
@@ -184,6 +186,10 @@ def _convert_tool_message(message: OpenAIMessage) -> FunctionCallOutputInputItem
     if not isinstance(resolved_call_id, str) or not resolved_call_id:
         raise ClientPayloadError("tool messages must include 'tool_call_id'.", param="messages")
     content = message.get("content")
+    for part in _content_parts(content) if content is not None else []:
+        part_dict = _json_dict_or_none(part)
+        if part_dict is not None:
+            _reject_unrepresentable_message_breakpoint(part_dict, "tool")
     if isinstance(content, str):
         output = content
     elif is_json_list(content):
@@ -288,7 +294,10 @@ def _normalize_content_part(part: dict[str, JsonValue], role: str = "user") -> J
     if part_type in ("text", "input_text", "output_text"):
         text = part.get("text")
         if isinstance(text, str):
-            return cast(JsonValue, TextContentPart(type=text_type, text=text))
+            return _preserve_prompt_cache_breakpoint(
+                part,
+                cast(dict[str, JsonValue], TextContentPart(type=text_type, text=text)),
+            )
         return part
     if role == "assistant":
         return part
@@ -305,18 +314,47 @@ def _normalize_content_part(part: dict[str, JsonValue], role: str = "user") -> J
         else:
             url = None
         if isinstance(url, str):
-            return {"type": "input_image", "image_url": url, **({"detail": detail} if detail is not None else {})}
+            normalized_image: dict[str, JsonValue] = {
+                "type": "input_image",
+                "image_url": url,
+                **({"detail": detail} if detail is not None else {}),
+            }
+            return _preserve_prompt_cache_breakpoint(part, normalized_image)
         return part
     if part_type == "input_image":
         return part
     if part_type == "input_audio":
         data_url = _audio_input_to_data_url(part.get("input_audio"))
         if data_url:
-            return {"type": "input_file", "file_url": data_url}
+            return _preserve_prompt_cache_breakpoint(
+                part,
+                {"type": "input_file", "file_url": data_url},
+            )
         return part
     if part_type == "file":
-        return cast(JsonValue, _file_part_to_input_file(part.get("file")))
+        return _preserve_prompt_cache_breakpoint(
+            part,
+            cast(dict[str, JsonValue], _file_part_to_input_file(part.get("file"))),
+        )
     return part
+
+
+def _preserve_prompt_cache_breakpoint(
+    source: dict[str, JsonValue],
+    normalized: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    if "prompt_cache_breakpoint" in source:
+        normalized["prompt_cache_breakpoint"] = source["prompt_cache_breakpoint"]
+    return normalized
+
+
+def _reject_unrepresentable_message_breakpoint(part: dict[str, JsonValue], role: str) -> None:
+    if "prompt_cache_breakpoint" not in part:
+        return
+    raise ClientPayloadError(
+        f"{role} message prompt_cache_breakpoint requires structured Responses input.",
+        param="messages",
+    )
 
 
 def _audio_input_to_data_url(input_audio: JsonValue) -> str | None:

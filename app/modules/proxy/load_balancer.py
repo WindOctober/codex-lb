@@ -46,6 +46,7 @@ from app.db.models import (
     StickySessionKind,
     UsageHistory,
 )
+from app.modules.proxy._service.upstream_account import _account_supports_required_upstream_wire_api
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.additional_model_limits import get_additional_quota_key_for_model_id
 from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories
@@ -71,6 +72,7 @@ _RECOVERABLE_STATUSES = frozenset(
 )
 
 NO_PLAN_SUPPORT_FOR_MODEL = "no_plan_support_for_model"
+UPSTREAM_CAPABILITY_UNAVAILABLE = "upstream_capability_unavailable"
 ADDITIONAL_QUOTA_DATA_UNAVAILABLE = "additional_quota_data_unavailable"
 NO_ADDITIONAL_QUOTA_ELIGIBLE_ACCOUNTS = "no_additional_quota_eligible_accounts"
 
@@ -138,6 +140,8 @@ class LoadBalancer:
         allowed_groups: Collection[str] | None = None,
         preferred_group_priorities: dict[str, int] | None = None,
         budget_threshold_pct: float = 95.0,
+        ignore_five_hour_limit: bool = False,
+        required_upstream_wire_api: str | None = None,
     ) -> AccountSelection:
         excluded_ids = set(exclude_account_ids or ())
         scoped_account_ids = None if account_ids is None else set(account_ids)
@@ -152,7 +156,36 @@ class LoadBalancer:
                 allowed_groups=normalized_allowed_groups,
                 preferred_group_priorities=normalized_preferred_group_priorities,
                 routing_strategy=routing_strategy,
+                ignore_five_hour_limit=ignore_five_hour_limit,
             )
+            if required_upstream_wire_api and selection_inputs.accounts:
+                capable_accounts = [
+                    account
+                    for account in selection_inputs.accounts
+                    if _account_supports_required_upstream_wire_api(account, required_upstream_wire_api)
+                ]
+                if not capable_accounts:
+                    return _SelectionInputs(
+                        accounts=[],
+                        latest_primary=selection_inputs.latest_primary,
+                        latest_secondary=selection_inputs.latest_secondary,
+                        primary_drain_scores=selection_inputs.primary_drain_scores,
+                        runtime_accounts=selection_inputs.runtime_accounts,
+                        error_message=(
+                            "No eligible upstream provider supports the required "
+                            f"'{required_upstream_wire_api}' wire API"
+                        ),
+                        error_code=UPSTREAM_CAPABILITY_UNAVAILABLE,
+                    )
+                selection_inputs = _SelectionInputs(
+                    accounts=capable_accounts,
+                    latest_primary=selection_inputs.latest_primary,
+                    latest_secondary=selection_inputs.latest_secondary,
+                    primary_drain_scores=selection_inputs.primary_drain_scores,
+                    runtime_accounts=selection_inputs.runtime_accounts,
+                    error_message=selection_inputs.error_message,
+                    error_code=selection_inputs.error_code,
+                )
             if excluded_ids and selection_inputs.accounts:
                 selection_inputs = _SelectionInputs(
                     accounts=[account for account in selection_inputs.accounts if account.id not in excluded_ids],
@@ -198,6 +231,7 @@ class LoadBalancer:
                     primary_drain_scores=selection_inputs.primary_drain_scores or {},
                     runtime=self._runtime,
                     preferred_group_priorities=normalized_preferred_group_priorities,
+                    ignore_five_hour_limit=ignore_five_hour_limit,
                 )
 
                 result = _select_account_preferring_budget_safe(
@@ -336,6 +370,7 @@ class LoadBalancer:
                     primary_drain_scores=selection_inputs.primary_drain_scores or {},
                     runtime=self._runtime,
                     preferred_group_priorities=normalized_preferred_group_priorities,
+                    ignore_five_hour_limit=ignore_five_hour_limit,
                 )
                 async with self._repo_factory() as repos:
                     result = await self._select_with_stickiness(
@@ -447,6 +482,7 @@ class LoadBalancer:
         preferred_group_priorities: dict[str, int] | None = None,
         budget_threshold_pct: float = 95.0,
         routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
+        ignore_five_hour_limit: bool = False,
     ) -> int:
         account_ids = await self.routable_budget_safe_account_ids(
             model=model,
@@ -457,6 +493,7 @@ class LoadBalancer:
             preferred_group_priorities=preferred_group_priorities,
             budget_threshold_pct=budget_threshold_pct,
             routing_strategy=routing_strategy,
+            ignore_five_hour_limit=ignore_five_hour_limit,
         )
         return len(account_ids)
 
@@ -471,6 +508,7 @@ class LoadBalancer:
         preferred_group_priorities: dict[str, int] | None = None,
         budget_threshold_pct: float = 95.0,
         routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
+        ignore_five_hour_limit: bool = False,
     ) -> set[str]:
         excluded_ids = set(exclude_account_ids or ())
         normalized_allowed_groups = _normalize_group_filter(allowed_groups)
@@ -482,6 +520,7 @@ class LoadBalancer:
             allowed_groups=normalized_allowed_groups,
             preferred_group_priorities=normalized_preferred_group_priorities,
             routing_strategy=routing_strategy,
+            ignore_five_hour_limit=ignore_five_hour_limit,
         )
         accounts = [account for account in selection_inputs.accounts if account.id not in excluded_ids]
         if not accounts:
@@ -495,6 +534,7 @@ class LoadBalancer:
             primary_drain_scores=selection_inputs.primary_drain_scores or {},
             runtime=self._runtime,
             preferred_group_priorities=normalized_preferred_group_priorities,
+            ignore_five_hour_limit=ignore_five_hour_limit,
         )
         selectable_states: list[AccountState] = []
         for state in states:
@@ -522,8 +562,9 @@ class LoadBalancer:
         allowed_groups: frozenset[str] | None = None,
         preferred_group_priorities: dict[str, int] | None = None,
         routing_strategy: RoutingStrategy = DEFAULT_ROUTING_STRATEGY,
+        ignore_five_hour_limit: bool = False,
     ) -> _SelectionInputs:
-        needs_primary_drain_scores = routing_strategy == "primary_drain"
+        needs_primary_drain_scores = routing_strategy == "primary_drain" and not ignore_five_hour_limit
         cache_key = (
             model,
             additional_limit_name,
@@ -1270,6 +1311,7 @@ def _build_states(
     primary_drain_scores: dict[str, float],
     runtime: dict[str, RuntimeState],
     preferred_group_priorities: dict[str, int] | None = None,
+    ignore_five_hour_limit: bool = False,
 ) -> tuple[list[AccountState], dict[str, Account]]:
     states: list[AccountState] = []
     account_map: dict[str, Account] = {}
@@ -1282,6 +1324,7 @@ def _build_states(
             runtime=runtime.setdefault(account.id, RuntimeState()),
             group_priority_rank=_account_group_priority_rank(account, preferred_group_priorities),
             primary_drain_score=primary_drain_scores.get(account.id, 0.0),
+            ignore_five_hour_limit=ignore_five_hour_limit,
         )
         states.append(state)
         account_map[account.id] = account
@@ -1296,6 +1339,7 @@ def _state_from_account(
     runtime: RuntimeState,
     group_priority_rank: int = 1000000,
     primary_drain_score: float = 0.0,
+    ignore_five_hour_limit: bool = False,
 ) -> AccountState:
     primary_used = primary_entry.used_percent if primary_entry else None
     primary_reset = primary_entry.reset_at if primary_entry else None
@@ -1308,6 +1352,9 @@ def _state_from_account(
     # both rows exist, prefer the newer weekly snapshot.
     if primary_row is not None and usage_core.should_use_weekly_primary(primary_row, secondary_row):
         effective_secondary_entry = primary_entry
+        primary_used = None
+        primary_reset = None
+        primary_window_minutes = None
 
     secondary_used = effective_secondary_entry.used_percent if effective_secondary_entry else None
     secondary_reset = effective_secondary_entry.reset_at if effective_secondary_entry else None
@@ -1317,6 +1364,20 @@ def _state_from_account(
     db_reset_at = float(account.reset_at) if account.reset_at else None
     effective_runtime_reset = db_reset_at or runtime.reset_at
     effective_blocked_at = float(account.blocked_at) if account.blocked_at is not None else runtime.blocked_at
+
+    status_for_quota = account.status
+    weekly_only_snapshot = (
+        primary_used is None
+        and effective_secondary_entry is not None
+        and usage_core.is_weekly_window_minutes(effective_secondary_entry.window_minutes)
+    )
+    if (
+        status_for_quota == AccountStatus.RATE_LIMITED
+        and effective_blocked_at is None
+        and (ignore_five_hour_limit or weekly_only_snapshot)
+    ):
+        status_for_quota = AccountStatus.ACTIVE
+        effective_runtime_reset = None
 
     if (
         account.status == AccountStatus.QUOTA_EXCEEDED
@@ -1364,6 +1425,12 @@ def _state_from_account(
     primary_used_for_quota = primary_used
     primary_reset_for_quota = primary_reset
     primary_window_minutes_for_quota = primary_window_minutes
+    if ignore_five_hour_limit and not (
+        account.status == AccountStatus.RATE_LIMITED and effective_blocked_at is not None
+    ):
+        primary_used_for_quota = None
+        primary_reset_for_quota = None
+        primary_window_minutes_for_quota = None
     if (
         account.status == AccountStatus.RATE_LIMITED
         and effective_blocked_at is not None
@@ -1379,7 +1446,7 @@ def _state_from_account(
         primary_window_minutes_for_quota = None
 
     status, used_percent, reset_at = apply_usage_quota(
-        status=account.status,
+        status=status_for_quota,
         primary_used=primary_used_for_quota,
         primary_reset=primary_reset_for_quota,
         primary_window_minutes=primary_window_minutes_for_quota,
@@ -1387,6 +1454,8 @@ def _state_from_account(
         secondary_used=secondary_used,
         secondary_reset=secondary_reset,
     )
+    if ignore_five_hour_limit:
+        used_percent = None
 
     next_blocked_at = (
         effective_blocked_at if status in (AccountStatus.QUOTA_EXCEEDED, AccountStatus.RATE_LIMITED) else None
@@ -1446,7 +1515,7 @@ def _state_from_account(
         source_rank=account_routing_priority(account),
         configured_priority=account_configured_priority(account),
         health_tier=new_tier,
-        primary_drain_score=primary_drain_score,
+        primary_drain_score=0.0 if ignore_five_hour_limit else primary_drain_score,
         primary_drain_priority_enabled=bool(getattr(account, "primary_drain_priority_enabled", False)),
     )
 

@@ -14,6 +14,16 @@ def _remaining_budget_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
+def _ensure_request_budget_remaining(
+    request_state: _WebSocketRequestState,
+    default_budget_seconds: float,
+) -> float:
+    remaining = _remaining_budget_seconds(_request_deadline_at(request_state, default_budget_seconds))
+    if remaining <= 0:
+        _raise_proxy_budget_exhausted()
+    return remaining
+
+
 def _request_budget_seconds(request_state: _WebSocketRequestState, default_budget_seconds: float) -> float:
     configured = request_state.request_budget_seconds
     if configured is not None and configured > 0:
@@ -38,19 +48,22 @@ def _set_request_budget(
     request_state.request_deadline_at = deadline_start + budget_seconds
 
 
+def _inherit_request_budget(
+    source_request_state: _WebSocketRequestState,
+    target_request_state: _WebSocketRequestState,
+) -> None:
+    target_request_state.started_at = source_request_state.started_at
+    target_request_state.request_budget_seconds = source_request_state.request_budget_seconds
+    target_request_state.request_deadline_at = source_request_state.request_deadline_at
+
+
 def _http_bridge_request_budget_seconds(
     session: _HTTPBridgeSession,
     request_state: _WebSocketRequestState,
     settings: Settings,
 ) -> float:
-    if (
-        session.upstream_reconnect_count > 0
-        or session.upstream_control.reconnect_requested
-        or request_state.replay_count > 0
-        or request_state.request_stage in {"reattach", "context_overflow_recover"}
-    ):
-        return settings.proxy_reconnect_request_budget_seconds
-    return settings.proxy_request_budget_seconds
+    del session, request_state
+    return settings.http_responses_session_bridge_request_budget_seconds
 
 
 def _websocket_connect_deadline(request_state: _WebSocketRequestState, budget_seconds: float) -> float:

@@ -120,6 +120,7 @@ class _WebSocketConnectionService(Protocol):
         exclude_account_ids: set[str],
         preferred_account_id: str | None,
         require_preferred_account: bool,
+        required_upstream_wire_api: str | None = None,
     ) -> Account | None: ...
 
     async def _try_open_websocket_connect_attempt(
@@ -211,6 +212,7 @@ class _WebSocketConnectionMixin:
                 require_preferred_account=(
                     request_state.previous_response_id is not None and request_state.preferred_account_id is not None
                 ),
+                required_upstream_wire_api=request_state.affinity_policy.required_upstream_wire_api,
             )
             if account is None:
                 return None, None
@@ -294,6 +296,7 @@ class _WebSocketConnectionMixin:
         exclude_account_ids: set[str],
         preferred_account_id: str | None,
         require_preferred_account: bool,
+        required_upstream_wire_api: str | None = None,
     ) -> Account | None:
         try:
             selection = await self._select_account_with_budget_compatible(
@@ -310,6 +313,7 @@ class _WebSocketConnectionMixin:
                 model=model,
                 exclude_account_ids=exclude_account_ids,
                 preferred_account_id=preferred_account_id,
+                required_upstream_wire_api=required_upstream_wire_api,
             )
         except ProxyResponseError as exc:
             if _is_proxy_budget_exhausted_error(exc):
@@ -461,42 +465,35 @@ class _WebSocketConnectionMixin:
                 websocket=websocket,
             )
         except RefreshError as exc:
-            if exc.is_permanent:
-                await self._load_balancer.mark_permanent_failure(account, exc.code)
-            await self._emit_websocket_connect_failure(
-                websocket,
-                client_send_lock=client_send_lock,
-                account_id=account.id,
-                api_key=api_key,
-                request_state=request_state,
-                status_code=401,
-                payload=openai_error(
-                    "invalid_api_key",
-                    exc.message,
-                    error_type="authentication_error",
-                ),
-                error_code="invalid_api_key",
-                error_message=exc.message,
+            logger.warning(
+                "Direct websocket credential refresh failed account_id=%s code=%s permanent=%s",
+                account.id,
+                exc.code,
+                exc.is_permanent,
+                exc_info=True,
             )
-            return None
+            raise ProxyResponseError(
+                401 if exc.is_permanent else 502,
+                openai_error(
+                    "invalid_api_key" if exc.is_permanent else "upstream_unavailable",
+                    "Upstream credential refresh failed",
+                    error_type="authentication_error" if exc.is_permanent else "server_error",
+                ),
+            ) from exc
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            message = str(exc) or "Request to upstream timed out"
-            await self._emit_websocket_connect_failure(
-                websocket,
-                client_send_lock=client_send_lock,
-                account_id=account.id,
-                api_key=api_key,
-                request_state=request_state,
-                status_code=502,
-                payload=openai_error(
+            logger.warning(
+                "Direct websocket upstream connection failed account_id=%s",
+                account.id,
+                exc_info=True,
+            )
+            raise ProxyResponseError(
+                504 if isinstance(exc, asyncio.TimeoutError) else 502,
+                openai_error(
                     "upstream_unavailable",
-                    message,
+                    "Upstream websocket connection failed",
                     error_type="server_error",
                 ),
-                error_code="upstream_unavailable",
-                error_message=message,
-            )
-            return None
+            ) from exc
 
     async def _retry_websocket_connect_after_401(
         self: _WebSocketConnectionService,
@@ -526,42 +523,35 @@ class _WebSocketConnectionMixin:
                 timeout_seconds=remaining_budget,
             )
         except RefreshError as refresh_exc:
-            if refresh_exc.is_permanent:
-                await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
-            await self._emit_websocket_connect_failure(
-                websocket,
-                client_send_lock=client_send_lock,
-                account_id=account.id,
-                api_key=api_key,
-                request_state=request_state,
-                status_code=401,
-                payload=openai_error(
-                    "invalid_api_key",
-                    refresh_exc.message,
-                    error_type="authentication_error",
-                ),
-                error_code="invalid_api_key",
-                error_message=refresh_exc.message,
+            logger.warning(
+                "Direct websocket forced credential refresh failed account_id=%s code=%s permanent=%s",
+                account.id,
+                refresh_exc.code,
+                refresh_exc.is_permanent,
+                exc_info=True,
             )
-            return None
+            raise ProxyResponseError(
+                401 if refresh_exc.is_permanent else 502,
+                openai_error(
+                    "invalid_api_key" if refresh_exc.is_permanent else "upstream_unavailable",
+                    "Upstream credential refresh failed",
+                    error_type="authentication_error" if refresh_exc.is_permanent else "server_error",
+                ),
+            ) from refresh_exc
         except (aiohttp.ClientError, asyncio.TimeoutError) as refresh_transport_exc:
-            message = str(refresh_transport_exc) or "Request to upstream timed out"
-            await self._emit_websocket_connect_failure(
-                websocket,
-                client_send_lock=client_send_lock,
-                account_id=account.id,
-                api_key=api_key,
-                request_state=request_state,
-                status_code=502,
-                payload=openai_error(
+            logger.warning(
+                "Direct websocket forced refresh transport failed account_id=%s",
+                account.id,
+                exc_info=True,
+            )
+            raise ProxyResponseError(
+                502,
+                openai_error(
                     "upstream_unavailable",
-                    message,
+                    "Upstream credential refresh failed",
                     error_type="server_error",
                 ),
-                error_code="upstream_unavailable",
-                error_message=message,
-            )
-            return None
+            ) from refresh_transport_exc
 
         try:
             remaining_budget = self._remaining_budget_seconds_compatible(deadline)
@@ -603,7 +593,11 @@ class _WebSocketConnectionMixin:
     ) -> str:
         classified = await self._handle_websocket_connect_error(account, exc)
         failure_class = classified["failure_class"] if isinstance(classified, dict) else "non_retryable"
-        if deterministic_failover_enabled:
+        error = _parse_openai_error(exc.payload)
+        error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
+        if error_code == "invalid_api_key" and attempt < max_attempts:
+            action = "failover_next"
+        elif deterministic_failover_enabled:
             action = failover_decision(
                 failure_class=failure_class,
                 downstream_visible=False,

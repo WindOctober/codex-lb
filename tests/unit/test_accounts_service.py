@@ -6,7 +6,12 @@ import pytest
 
 from app.core.auth.refresh import RefreshError
 from app.core.crypto import TokenEncryptor
-from app.core.usage.models import RateLimitResetConsumePayload, RateLimitResetCreditBankPayload, UsagePayload
+from app.core.usage.models import (
+    RateLimitResetConsumePayload,
+    RateLimitResetCreditBankPayload,
+    RateLimitResetCreditPayload,
+    UsagePayload,
+)
 from app.core.utils.time import utcnow
 from app.db.models import ACCOUNT_PROVIDER_API_KEY, Account, AccountStatus
 from app.modules.accounts.service import AccountResetCreditError, AccountsService, _quota_timeline_bucket_count
@@ -180,7 +185,7 @@ async def test_availability_probe_does_not_deactivate_transient_refresh_failure(
 
 
 @pytest.mark.asyncio
-async def test_get_rate_limit_reset_credits_returns_available_count(monkeypatch) -> None:
+async def test_get_rate_limit_reset_credits_returns_sorted_safe_metadata(monkeypatch) -> None:
     encryptor = TokenEncryptor()
     account = Account(
         id="acc_reset_credits",
@@ -202,7 +207,36 @@ async def test_get_rate_limit_reset_credits_returns_available_count(monkeypatch)
     async def _fake_fetch_credits(**kwargs: object) -> RateLimitResetCreditBankPayload:
         assert kwargs["access_token"] == "access"
         assert kwargs["account_id"] == "workspace_reset_credits"
-        return RateLimitResetCreditBankPayload(available_count=3)
+        return RateLimitResetCreditBankPayload(
+            available_count=3,
+            credits=[
+                RateLimitResetCreditPayload(
+                    id="credit_later",
+                    status="available",
+                    reset_type="codex_rate_limits",
+                    title="Later reset",
+                    granted_at=datetime.fromisoformat("2026-06-18T03:15:00+00:00"),
+                    expires_at=datetime.fromisoformat("2026-07-18T03:15:00+00:00"),
+                ),
+                RateLimitResetCreditPayload(
+                    id="credit_used",
+                    status="consumed",
+                    title="Consumed reset",
+                    expires_at=datetime.fromisoformat("2026-07-01T03:15:00+00:00"),
+                ),
+                RateLimitResetCreditPayload(
+                    id="credit_earlier",
+                    status="available",
+                    reset_type="codex_rate_limits",
+                    title="Earlier reset",
+                    expires_at=datetime.fromisoformat("2026-07-14T03:15:00+00:00"),
+                ),
+                RateLimitResetCreditPayload(
+                    id="credit_without_deadline",
+                    status="available",
+                ),
+            ],
+        )
 
     service._auth_manager.ensure_fresh = _fake_ensure_fresh  # type: ignore[method-assign]
     monkeypatch.setattr("app.modules.accounts.service.fetch_rate_limit_reset_credits", _fake_fetch_credits)
@@ -212,6 +246,15 @@ async def test_get_rate_limit_reset_credits_returns_available_count(monkeypatch)
     assert result is not None
     assert result.account_id == account.id
     assert result.available_count == 3
+    assert [credit.title for credit in result.credits] == [
+        "Earlier reset",
+        "Later reset",
+        None,
+    ]
+    assert result.credits[0].expires_at == datetime.fromisoformat("2026-07-14T03:15:00+00:00")
+    assert result.credits[-1].expires_at is None
+    serialized = result.model_dump(mode="json", by_alias=True)
+    assert all("id" not in credit for credit in serialized["credits"])
 
 
 @pytest.mark.asyncio

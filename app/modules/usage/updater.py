@@ -6,11 +6,13 @@ import inspect
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Mapping, Protocol
+from typing import AsyncContextManager, Mapping, Protocol
 
+from app.core import shutdown as shutdown_state
 from app.core.auth.refresh import RefreshError
 from app.core.balancer import PERMANENT_FAILURE_CODES
 from app.core.clients.usage import UsageFetchError, fetch_usage
@@ -21,9 +23,11 @@ from app.core.usage.models import AdditionalRateLimitPayload, UsagePayload
 from app.core.utils.request_id import get_request_id
 from app.core.utils.time import utcnow
 from app.db.models import ACCOUNT_PROVIDER_OPENAI_OAUTH, Account, AccountStatus, UsageHistory
+from app.db.session import get_background_session
 from app.modules.accounts.auth_manager import AccountsRepositoryPort, AuthManager
+from app.modules.accounts.repository import AccountsRepository
 from app.modules.usage.additional_quota_keys import canonicalize_additional_quota_key
-from app.modules.usage.repository import AdditionalUsageRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,8 @@ class UsageRepositoryPort(Protocol):
         credits_unlimited: bool | None = None,
         credits_balance: float | None = None,
     ) -> UsageHistory | None: ...
+
+    async def delete_for_account_window(self, account_id: str, window: str) -> None: ...
 
 
 class AdditionalUsageRepositoryPort(Protocol):
@@ -103,6 +109,26 @@ class AdditionalUsageRepositoryPort(Protocol):
     async def latest_recorded_at_for_account(self, account_id: str) -> datetime | None: ...
 
 
+@dataclass(slots=True)
+class UsageRefreshRepositories:
+    usage: UsageRepositoryPort
+    accounts: AccountsRepositoryPort
+    additional_usage: AdditionalUsageRepositoryPort
+
+
+UsageRefreshRepoFactory = Callable[[], AsyncContextManager[UsageRefreshRepositories]]
+
+
+@asynccontextmanager
+async def background_usage_refresh_repo_context() -> AsyncIterator[UsageRefreshRepositories]:
+    async with get_background_session() as session:
+        yield UsageRefreshRepositories(
+            usage=UsageRepository(session),
+            accounts=AccountsRepository(session),
+            additional_usage=AdditionalUsageRepository(session),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AccountRefreshResult:
     usage_written: bool
@@ -128,6 +154,7 @@ _usage_refresh_auth_cooldowns: dict[str, float] = {}
 class _UsageRefreshSingleflight:
     def __init__(self) -> None:
         self._inflight: dict[str, asyncio.Task[AccountRefreshResult]] = {}
+        self._detached: set[asyncio.Task[AccountRefreshResult]] = set()
         self._lock = asyncio.Lock()
 
     async def run(
@@ -156,23 +183,39 @@ class _UsageRefreshSingleflight:
         if current is task:
             self._inflight.pop(account_id, None)
         if task.cancelled():
+            self._detached.discard(task)
             return
         with contextlib.suppress(BaseException):
             task.exception()
+        self._detached.discard(task)
+
+    def _retain_detached(self, task: asyncio.Task[AccountRefreshResult]) -> None:
+        self._detached.add(task)
+        task.add_done_callback(lambda done: self._clear_if_current("", done))
 
     def clear(self) -> None:
+        tasks = list(self._inflight.values())
         self._inflight.clear()
+        for task in tasks:
+            self._retain_detached(task)
 
-    async def cancel_all(self) -> None:
+    async def cancel_all(self, *, timeout_seconds: float = 1.0) -> None:
         async with self._lock:
             tasks = list(self._inflight.values())
             self._inflight.clear()
         for task in tasks:
+            self._retain_detached(task)
             task.cancel()
         if not tasks:
             return
-        with contextlib.suppress(BaseException):
-            await asyncio.gather(*tasks, return_exceptions=True)
+        done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
+        for task in done:
+            self._clear_if_current("", task)
+        if pending:
+            logger.error(
+                "Timed out cancelling %d usage refresh task(s); retaining ownership until completion",
+                len(pending),
+            )
 
 
 _USAGE_REFRESH_SINGLEFLIGHT = _UsageRefreshSingleflight()
@@ -184,11 +227,13 @@ class UsageUpdater:
         usage_repo: UsageRepositoryPort,
         accounts_repo: AccountsRepositoryPort | None = None,
         additional_usage_repo: AdditionalUsageRepositoryPort | AdditionalUsageRepository | None = None,
+        *,
+        repo_factory: UsageRefreshRepoFactory | None = None,
     ) -> None:
         self._usage_repo = usage_repo
         self._accounts_repo = accounts_repo
         self._additional_usage_repo = additional_usage_repo
-        self._accounts_repo = accounts_repo
+        self._repo_factory = repo_factory
         self._encryptor = TokenEncryptor()
         self._auth_manager = AuthManager(accounts_repo) if accounts_repo else None
 
@@ -238,13 +283,33 @@ class UsageUpdater:
             # within the request-scoped session to avoid PK collisions and
             # flush-time warnings (SAWarning: Session.add during flush).
             try:
+                refresh_factory: Callable[[], Awaitable[AccountRefreshResult]]
+                if self._repo_factory is None:
+
+                    async def refresh_with_current_repositories(account: Account = account) -> AccountRefreshResult:
+                        return await self._refresh_account_if_stale(
+                            account,
+                            usage_account_id=account.chatgpt_account_id,
+                            interval_seconds=interval,
+                        )
+
+                    refresh_factory = refresh_with_current_repositories
+                else:
+                    account_snapshot = _copy_account_snapshot(account)
+
+                    async def refresh_with_owned_repositories(
+                        account: Account = account_snapshot,
+                    ) -> AccountRefreshResult:
+                        return await self._refresh_account_with_owned_repositories(
+                            account,
+                            usage_account_id=account.chatgpt_account_id,
+                            interval_seconds=interval,
+                        )
+
+                    refresh_factory = refresh_with_owned_repositories
                 result = await _USAGE_REFRESH_SINGLEFLIGHT.run(
                     account.id,
-                    lambda account=account: self._refresh_account_if_stale(
-                        account,
-                        usage_account_id=account.chatgpt_account_id,
-                        interval_seconds=interval,
-                    ),
+                    refresh_factory,
                 )
                 await self._sync_account_from_repo(account)
                 refreshed = refreshed or result.usage_written
@@ -266,6 +331,28 @@ class UsageUpdater:
                 continue
         return refreshed
 
+    async def _refresh_account_with_owned_repositories(
+        self,
+        account: Account,
+        *,
+        usage_account_id: str | None,
+        interval_seconds: int,
+    ) -> AccountRefreshResult:
+        if shutdown_state.is_draining():
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+        assert self._repo_factory is not None
+        async with self._repo_factory() as repos:
+            updater = UsageUpdater(
+                repos.usage,
+                repos.accounts,
+                repos.additional_usage,
+            )
+            return await updater._refresh_account_if_stale(
+                account,
+                usage_account_id=usage_account_id,
+                interval_seconds=interval_seconds,
+            )
+
     async def _refresh_account_if_stale(
         self,
         account: Account,
@@ -273,7 +360,11 @@ class UsageUpdater:
         usage_account_id: str | None,
         interval_seconds: int,
     ) -> AccountRefreshResult:
+        if shutdown_state.is_draining():
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         latest = await self._usage_repo.latest_entry_for_account(account.id, window="primary")
+        if latest is None:
+            latest = await self._usage_repo.latest_entry_for_account(account.id, window="secondary")
         if _latest_usage_is_fresh(latest, now=utcnow(), interval_seconds=interval_seconds):
             return AccountRefreshResult(usage_written=False)
         return await self._refresh_account(
@@ -326,6 +417,8 @@ class UsageUpdater:
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
 
         if payload is None:
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+        if shutdown_state.is_draining():
             return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
 
         await self._sync_plan_type(account, payload)
@@ -392,6 +485,7 @@ class UsageUpdater:
         # The 7d stat is in primary window instead of secondary window
         # (that is widely defined as 7d in the ui)
         # This will cause the account usage trend is "primary" instead of "secondary"
+        weekly_only = primary is not None and primary.limit_window_seconds == 604800 and secondary is None
         if primary and primary.limit_window_seconds == 604800:
             secondary = rate_limit.primary_window
             primary = None
@@ -424,6 +518,11 @@ class UsageUpdater:
                 window_minutes=_window_minutes(secondary.limit_window_seconds),
             )
             usage_written = usage_written or _usage_entry_written(entry)
+            if weekly_only:
+                # Commit the replacement weekly snapshot before retiring the
+                # stale primary row. A failed insert must leave the last known
+                # quota snapshot intact.
+                await self._usage_repo.delete_for_account_window(account.id, "primary")
         return AccountRefreshResult(usage_written=usage_written)
 
     async def refresh_account_now(self, account: Account) -> AccountRefreshResult:
@@ -683,6 +782,10 @@ async def _delete_additional_usage_quota_key_window(
         await delete_by_quota_key_window(account_id, quota_key, window)
         return
     await repo.delete_for_account_limit_window(account_id, quota_key, window)
+
+
+def _copy_account_snapshot(account: Account) -> Account:
+    return Account(**{column.name: getattr(account, column.name) for column in Account.__table__.columns})
 
 
 def _latest_usage_is_fresh(

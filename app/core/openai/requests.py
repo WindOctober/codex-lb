@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -36,6 +37,7 @@ _INTERLEAVED_REASONING_KEYS = frozenset({"reasoning_content", "reasoning_details
 _INTERLEAVED_REASONING_PART_TYPES = frozenset({"reasoning", "reasoning_content", "reasoning_details"})
 _ASSISTANT_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _TOOL_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text", "refusal"})
+_PROMPT_CACHE_BREAKPOINT_CONTENT_TYPES = frozenset({"input_text", "input_image", "input_file"})
 
 
 def _json_mapping_or_none(value: JsonValue) -> Mapping[str, JsonValue] | None:
@@ -294,6 +296,85 @@ class ResponsesReasoning(BaseModel):
     summary: str | None = None
 
 
+class PromptCacheOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["implicit", "explicit"] | None = None
+    ttl: Literal["30m"] | None = None
+
+    @field_validator("mode", "ttl", mode="before")
+    @classmethod
+    def _reject_explicit_null(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("prompt-cache option values cannot be null")
+        return value
+
+
+class PromptCacheBreakpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["explicit"]
+
+
+def _validate_prompt_cache_breakpoints(input_items: list[JsonValue]) -> bool:
+    found = False
+    for item in input_items:
+        item_mapping = _json_mapping_or_none(item)
+        if item_mapping is None:
+            continue
+        item_has_breakpoint = _validate_prompt_cache_breakpoint_content_block(item_mapping)
+        content_has_breakpoint = False
+        content = item_mapping.get("content")
+        for part in _json_parts(content) if content is not None else []:
+            part_mapping = _json_mapping_or_none(part)
+            if part_mapping is None:
+                continue
+            content_has_breakpoint = (
+                _validate_prompt_cache_breakpoint_content_block(part_mapping) or content_has_breakpoint
+            )
+        if content_has_breakpoint and item_mapping.get("role") in {"assistant", "tool"}:
+            raise ValueError("prompt_cache_breakpoint is not supported for assistant or tool input messages")
+        found = item_has_breakpoint or content_has_breakpoint or found
+    return found
+
+
+def _validate_prompt_cache_breakpoint_content_block(block: Mapping[str, JsonValue]) -> bool:
+    if "prompt_cache_breakpoint" not in block:
+        return False
+    marker = block["prompt_cache_breakpoint"]
+    block_type = block.get("type")
+    if not isinstance(block_type, str) or block_type not in _PROMPT_CACHE_BREAKPOINT_CONTENT_TYPES:
+        raise ValueError("prompt_cache_breakpoint is not supported for this content block type")
+    PromptCacheBreakpoint.model_validate(marker)
+    return True
+
+
+_GPT_MODEL_VERSION_PATTERN = re.compile(r"^gpt-(\d+)(?:\.(\d+))?(?:-|$)")
+
+
+def _supports_prompt_cache_controls(model: str) -> bool:
+    normalized = model.strip().lower()
+    match = _GPT_MODEL_VERSION_PATTERN.match(normalized)
+    if match is None:
+        return False
+    major = int(match.group(1))
+    minor_text = match.group(2)
+    if major > 5:
+        return True
+    return major == 5 and minor_text is not None and int(minor_text) >= 6
+
+
+def _validate_prompt_cache_model(
+    *,
+    model: str,
+    prompt_cache_options: PromptCacheOptions | None,
+    input_items: list[JsonValue],
+) -> None:
+    has_breakpoint = _validate_prompt_cache_breakpoints(input_items)
+    if (prompt_cache_options is not None or has_breakpoint) and not _supports_prompt_cache_controls(model):
+        raise ValueError("prompt_cache_options and prompt_cache_breakpoint require GPT-5.6 or later")
+
+
 class ResponsesTextFormat(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True, serialize_by_alias=True)
 
@@ -328,21 +409,35 @@ class ResponsesRequest(BaseModel):
     previous_response_id: str | None = None
     truncation: str | None = None
     prompt_cache_key: str | None = None
+    prompt_cache_options: PromptCacheOptions | None = None
     text: ResponsesTextControls | None = None
+
+    @field_validator("prompt_cache_options", mode="before")
+    @classmethod
+    def _reject_null_prompt_cache_options(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("prompt_cache_options cannot be null")
+        return value
 
     @field_validator("input")
     @classmethod
     def _validate_input_type(cls, value: JsonValue) -> JsonValue:
         if isinstance(value, str):
             normalized = _normalize_input_text(value)
+            _validate_prompt_cache_breakpoints(normalized)
             if _has_input_file_id(normalized):
                 raise ValueError("input_file.file_id is not supported")
-            return _sanitize_input_items(normalized)
+            sanitized = _sanitize_input_items(normalized)
+            _validate_prompt_cache_breakpoints(sanitized)
+            return sanitized
         if is_json_list(value):
             input_items = value
+            _validate_prompt_cache_breakpoints(input_items)
             if _has_input_file_id(input_items):
                 raise ValueError("input_file.file_id is not supported")
-            return _sanitize_input_items(input_items)
+            sanitized = _sanitize_input_items(input_items)
+            _validate_prompt_cache_breakpoints(sanitized)
+            return sanitized
         raise ValueError("input must be a string or array")
 
     @field_validator("include")
@@ -397,7 +492,20 @@ class ResponsesRequest(BaseModel):
             raise ValueError("Provide either 'conversation' or 'previous_response_id', not both.")
         return self
 
+    def ensure_prompt_cache_model_compatibility(self) -> None:
+        _validate_prompt_cache_model(
+            model=self.model,
+            prompt_cache_options=self.prompt_cache_options,
+            input_items=cast(list[JsonValue], self.input),
+        )
+
+    def uses_prompt_cache_controls(self) -> bool:
+        return self.prompt_cache_options is not None or _validate_prompt_cache_breakpoints(
+            cast(list[JsonValue], self.input)
+        )
+
     def to_payload(self) -> JsonObject:
+        self.ensure_prompt_cache_model_compatibility()
         payload: MutableJsonObject = self.model_dump(mode="json", exclude_none=True)
         return _strip_unsupported_fields(payload)
 
@@ -412,20 +520,34 @@ class ResponsesCompactRequest(BaseModel):
     store: bool = False
     service_tier: str | None = "default"
     prompt_cache_key: str | None = None
+    prompt_cache_options: PromptCacheOptions | None = None
+
+    @field_validator("prompt_cache_options", mode="before")
+    @classmethod
+    def _reject_null_prompt_cache_options(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("prompt_cache_options cannot be null")
+        return value
 
     @field_validator("input")
     @classmethod
     def _validate_input_type(cls, value: JsonValue) -> JsonValue:
         if isinstance(value, str):
             normalized = _normalize_input_text(value)
+            _validate_prompt_cache_breakpoints(normalized)
             if _has_input_file_id(normalized):
                 raise ValueError("input_file.file_id is not supported")
-            return _sanitize_input_items(normalized)
+            sanitized = _sanitize_input_items(normalized)
+            _validate_prompt_cache_breakpoints(sanitized)
+            return sanitized
         if is_json_list(value):
             input_items = value
+            _validate_prompt_cache_breakpoints(input_items)
             if _has_input_file_id(input_items):
                 raise ValueError("input_file.file_id is not supported")
-            return _sanitize_input_items(input_items)
+            sanitized = _sanitize_input_items(input_items)
+            _validate_prompt_cache_breakpoints(sanitized)
+            return sanitized
         raise ValueError("input must be a string or array")
 
     @model_validator(mode="before")
@@ -453,7 +575,20 @@ class ResponsesCompactRequest(BaseModel):
         normalized = _normalize_service_tier_alias_value(value)
         return normalized if isinstance(normalized, str) else value
 
+    def ensure_prompt_cache_model_compatibility(self) -> None:
+        _validate_prompt_cache_model(
+            model=self.model,
+            prompt_cache_options=self.prompt_cache_options,
+            input_items=cast(list[JsonValue], self.input),
+        )
+
+    def uses_prompt_cache_controls(self) -> bool:
+        return self.prompt_cache_options is not None or _validate_prompt_cache_breakpoints(
+            cast(list[JsonValue], self.input)
+        )
+
     def to_payload(self) -> JsonObject:
+        self.ensure_prompt_cache_model_compatibility()
         payload: MutableJsonObject = self.model_dump(mode="json", exclude_none=True)
         return _strip_compact_unsupported_fields(payload)
 

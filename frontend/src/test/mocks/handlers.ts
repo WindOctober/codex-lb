@@ -80,6 +80,7 @@ const SettingsPayloadSchema = z
       .enum(["default", "auto", "http", "websocket"])
       .optional(),
     preferEarlierResetAccounts: z.boolean().optional(),
+    ignoreFiveHourLimit: z.boolean().optional(),
     routingStrategy: z
       .enum([
         "high_waterline",
@@ -743,6 +744,15 @@ export const handlers = [
       return HttpResponse.json({
         accountId,
         availableCount: state.resetCredits[accountId] ?? 0,
+        credits: Array.from(
+          { length: state.resetCredits[accountId] ?? 0 },
+          (_, index) => ({
+            resetType: "codex_rate_limits",
+            title: "Full reset (Weekly + 5 hr)",
+            grantedAt: `2026-06-${String(18 + index).padStart(2, "0")}T03:15:00Z`,
+            expiresAt: `2026-07-${String(18 + index).padStart(2, "0")}T03:15:00Z`,
+          }),
+        ),
       });
     },
   ),

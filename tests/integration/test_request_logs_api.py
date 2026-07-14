@@ -52,6 +52,7 @@ async def test_request_logs_api_returns_recent(async_client, db_setup):
             model="gpt-5.1",
             input_tokens=100,
             output_tokens=200,
+            cache_write_tokens=25,
             latency_ms=1200,
             status="success",
             error_code=None,
@@ -93,4 +94,5 @@ async def test_request_logs_api_returns_recent(async_client, db_setup):
     assert older["apiKeyName"] is None
     assert older["tokens"] == 300
     assert older["cachedInputTokens"] is None
+    assert older["cacheWriteTokens"] == 25
     assert older["transport"] == "http"

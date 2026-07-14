@@ -48,6 +48,7 @@ def to_request_log_entry(
         error_message=log.error_message,
         tokens=total_tokens_from_log(log_like),
         cached_input_tokens=cached_input_tokens_from_log(log_like),
+        cache_write_tokens=log.cache_write_tokens,
         cost_usd=cost_from_log(log_like, precision=6),
         latency_ms=log.latency_ms,
         latency_first_token_ms=log.latency_first_token_ms,

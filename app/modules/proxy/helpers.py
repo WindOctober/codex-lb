@@ -36,7 +36,9 @@ PLAN_TYPE_PRIORITY = (
 
 _RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "usage_limit_reached"})
 _QUOTA_CODES = frozenset({"insufficient_quota", "usage_not_included", "quota_exceeded"})
-_TRANSIENT_CODES = frozenset({"server_error", "server_is_overloaded", "upstream_error", "stream_incomplete"})
+_TRANSIENT_CODES = frozenset(
+    {"server_error", "server_is_overloaded", "upstream_error", "stream_incomplete", "upstream_connect_timeout"}
+)
 _CONNECT_RETRYABLE_FORBIDDEN_CODES = frozenset({"forbidden", "insufficient_permissions", "permission_error"})
 _MODEL_CAPACITY_MESSAGES = frozenset(
     {

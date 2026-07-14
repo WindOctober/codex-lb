@@ -74,6 +74,7 @@ class _FakeService(_AccountFreshnessMixin):
     ) -> None:
         self._repo_factory = repo_factory
         self._admission = admission
+        self._proxy_cleanup_tasks: set[asyncio.Task[None]] = set()
         self.admission_lookup_calls = 0
 
     def _get_work_admission(self) -> WorkAdmissionController:
@@ -125,6 +126,37 @@ def _service() -> tuple[
 
 
 @pytest.mark.asyncio
+async def test_freshness_budget_is_hard_when_refresh_suppresses_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _, _, _ = _service()
+    account = _account(ACCOUNT_PROVIDER_OPENAI_OAUTH)
+    cancellation_seen = asyncio.Event()
+    allow_late_result = asyncio.Event()
+
+    async def cancellation_suppressing_refresh(*_args, **_kwargs) -> Account:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await allow_late_result.wait()
+        return account
+
+    monkeypatch.setattr(service, "_ensure_fresh", cancellation_suppressing_refresh)
+
+    with pytest.raises(TimeoutError):
+        await service._ensure_fresh_with_budget(account, timeout_seconds=0.01)
+
+    await asyncio.sleep(0)
+    assert cancellation_seen.is_set()
+    assert service._proxy_cleanup_tasks
+    allow_late_result.set()
+    await asyncio.gather(*tuple(service._proxy_cleanup_tasks))
+    await asyncio.sleep(0)
+    assert not service._proxy_cleanup_tasks
+
+
+@pytest.mark.asyncio
 async def test_api_key_provider_bypasses_repository_and_refresh_admission() -> None:
     service, repo_factory, context, admission = _service()
     account = _account(ACCOUNT_PROVIDER_API_KEY)
@@ -159,7 +191,7 @@ async def test_oauth_freshness_uses_canonical_auth_manager_and_refresh_admission
         force: bool = False,
         deactivate_on_permanent_error: bool = True,
     ) -> Account:
-        assert deactivate_on_permanent_error is True
+        assert deactivate_on_permanent_error is False
         managers.append(manager)
         force_values.append(force)
         return target

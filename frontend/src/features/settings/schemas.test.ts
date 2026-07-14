@@ -11,6 +11,7 @@ describe("DashboardSettingsSchema", () => {
       stickyThreadsEnabled: true,
       upstreamStreamTransport: "default",
       preferEarlierResetAccounts: false,
+      ignoreFiveHourLimit: true,
       routingStrategy: "high_waterline",
       openaiCacheAffinityMaxAgeSeconds: 300,
       kycRoutingEnforcementEnabled: false,
@@ -24,6 +25,7 @@ describe("DashboardSettingsSchema", () => {
 
     expect(parsed.stickyThreadsEnabled).toBe(true);
     expect(parsed.upstreamStreamTransport).toBe("default");
+    expect(parsed.ignoreFiveHourLimit).toBe(true);
     expect(parsed.routingStrategy).toBe("high_waterline");
     expect(parsed.openaiCacheAffinityMaxAgeSeconds).toBe(300);
     expect(parsed.kycRoutingEnforcementEnabled).toBe(false);
@@ -40,6 +42,7 @@ describe("SettingsUpdateRequestSchema", () => {
       stickyThreadsEnabled: false,
       upstreamStreamTransport: "websocket",
       preferEarlierResetAccounts: true,
+      ignoreFiveHourLimit: true,
       routingStrategy: "primary_drain",
       openaiCacheAffinityMaxAgeSeconds: 120,
       kycRoutingEnforcementEnabled: false,
@@ -50,6 +53,7 @@ describe("SettingsUpdateRequestSchema", () => {
 
     expect(parsed.openaiCacheAffinityMaxAgeSeconds).toBe(120);
     expect(parsed.upstreamStreamTransport).toBe("websocket");
+    expect(parsed.ignoreFiveHourLimit).toBe(true);
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.routingStrategy).toBe("primary_drain");
     expect(parsed.kycRoutingEnforcementEnabled).toBe(false);

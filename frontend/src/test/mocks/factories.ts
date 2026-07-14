@@ -508,9 +508,10 @@ export function createDashboardSettings(
 ): DashboardSettings {
 	return DashboardSettingsSchema.parse({
 		stickyThreadsEnabled: true,
-		upstreamStreamTransport: "default",
-		preferEarlierResetAccounts: false,
-		routingStrategy: "high_waterline",
+			upstreamStreamTransport: "default",
+			preferEarlierResetAccounts: false,
+			ignoreFiveHourLimit: false,
+			routingStrategy: "high_waterline",
 		openaiCacheAffinityMaxAgeSeconds: 300,
 		importWithoutOverwrite: false,
 		totpRequiredOnLogin: false,

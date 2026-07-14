@@ -97,7 +97,7 @@ def _slim_historical_response_input_item(item: JsonValue) -> tuple[JsonValue, in
         images_slimmed += content_images_slimmed
 
     if item_mapping.get("type") == "input_image" and _is_inline_image_reference(item_mapping.get("image_url")):
-        return _response_create_inline_image_notice_item(), tool_outputs_slimmed, images_slimmed + 1
+        return _response_create_inline_image_notice_item(item_mapping), tool_outputs_slimmed, images_slimmed + 1
 
     return item_mapping, tool_outputs_slimmed, images_slimmed
 
@@ -124,7 +124,7 @@ def _slim_historical_response_content_part(part: JsonValue) -> tuple[JsonValue, 
     part_mapping = dict(cast(dict[str, JsonValue], deepcopy(part)))
     part_type = part_mapping.get("type")
     if part_type == "input_image" and _is_inline_image_reference(part_mapping.get("image_url")):
-        return _response_create_inline_image_notice_part(), 1
+        return _response_create_inline_image_notice_part(part_mapping), 1
 
     if part_type == "image_url":
         image_url_value = part_mapping.get("image_url")
@@ -135,12 +135,15 @@ def _slim_historical_response_content_part(part: JsonValue) -> tuple[JsonValue, 
     return part_mapping, 0
 
 
-def _response_create_inline_image_notice_part() -> JsonObject:
-    return {"type": "input_text", "text": _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE}
+def _response_create_inline_image_notice_part(source: dict[str, JsonValue] | None = None) -> JsonObject:
+    notice: dict[str, JsonValue] = {"type": "input_text", "text": _RESPONSE_CREATE_IMAGE_OMISSION_NOTICE}
+    if source is not None and "prompt_cache_breakpoint" in source:
+        notice["prompt_cache_breakpoint"] = deepcopy(source["prompt_cache_breakpoint"])
+    return cast(JsonObject, notice)
 
 
-def _response_create_inline_image_notice_item() -> JsonObject:
-    return {"role": "user", "content": [_response_create_inline_image_notice_part()]}
+def _response_create_inline_image_notice_item(source: dict[str, JsonValue]) -> JsonObject:
+    return {"role": "user", "content": [_response_create_inline_image_notice_part(source)]}
 
 
 def _responses_request_contains_input_image(payload: ResponsesRequest) -> bool:

@@ -46,6 +46,35 @@ def test_slimming_preserves_latest_user_suffix_and_does_not_mutate_input() -> No
     assert slimmed_input[2:] == original["input"][2:]
 
 
+def test_slimming_preserves_prompt_cache_breakpoint_on_replaced_inline_image() -> None:
+    marker = {"mode": "explicit"}
+    payload = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,historical",
+                        "prompt_cache_breakpoint": marker,
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "current"}]},
+        ],
+    }
+
+    slimmed, summary = policy._slim_response_create_payload_for_upstream(payload, max_bytes=1)
+
+    assert summary == {"historical_tool_outputs_slimmed": 0, "historical_images_slimmed": 1}
+    assert slimmed["input"][0]["content"][0] == {
+        "type": "input_text",
+        "text": policy._RESPONSE_CREATE_IMAGE_OMISSION_NOTICE,
+        "prompt_cache_breakpoint": marker,
+    }
+
+
 def test_slimming_without_user_anchor_preserves_payload_identity() -> None:
     payload = {
         "input": [

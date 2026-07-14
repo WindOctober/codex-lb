@@ -125,13 +125,19 @@ def _install_proxy_settings_cache(
 @pytest.mark.asyncio
 async def test_proxy_stream_sticky_threads_reallocate_by_prompt_cache_key(async_client, monkeypatch):
     await _set_routing_settings(async_client, sticky_threads_enabled=True)
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer._account_supports_required_upstream_wire_api",
+        lambda _account, _required: True,
+    )
     acc_a_id = await _import_account(async_client, "acc_a", "a@example.com")
     acc_b_id = await _import_account(async_client, "acc_b", "b@example.com")
 
     seen: list[str] = []
+    seen_keys: list[str | None] = []
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
         seen.append(account_id)
+        seen_keys.append(payload.prompt_cache_key)
         yield 'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
@@ -157,11 +163,23 @@ async def test_proxy_stream_sticky_threads_reallocate_by_prompt_cache_key(async_
         )
 
     payload = {
-        "model": "gpt-5.1",
+        "model": "gpt-5.6-sol",
         "instructions": "hi",
-        "input": [],
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "stable explicit-cache prefix",
+                        "prompt_cache_breakpoint": {"mode": "explicit"},
+                    }
+                ],
+            }
+        ],
         "stream": True,
         "prompt_cache_key": "thread_123",
+        "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
     }
 
     response = await async_client.post("/backend-api/codex/responses", json=payload)
@@ -188,6 +206,7 @@ async def test_proxy_stream_sticky_threads_reallocate_by_prompt_cache_key(async_
     assert response.status_code == 200
 
     assert seen == ["acc_a", "acc_a"]
+    assert seen_keys == ["thread_123", "thread_123"]
 
 
 @pytest.mark.asyncio
@@ -1099,6 +1118,14 @@ async def test_v1_prompt_cache_key_rebalances_after_affinity_expires(async_clien
             window_minutes=300,
         )
         stale_updated_at = utcnow() - timedelta(minutes=10)
+        sticky_key = (
+            await session.execute(
+                text("SELECT key FROM sticky_sessions WHERE account_id = :account_id AND kind = 'prompt_cache'"),
+                {"account_id": acc_a_id},
+            )
+        ).scalar_one()
+        assert sticky_key.startswith("prompt-cache:v2:")
+        assert sticky_key != thread_key
         await session.execute(
             text(
                 """
@@ -1107,7 +1134,7 @@ async def test_v1_prompt_cache_key_rebalances_after_affinity_expires(async_clien
                 WHERE key = :sticky_key AND kind = 'prompt_cache'
                 """
             ),
-            {"sticky_key": thread_key, "stale_updated_at": stale_updated_at},
+            {"sticky_key": sticky_key, "stale_updated_at": stale_updated_at},
         )
         await session.commit()
 
@@ -1146,9 +1173,16 @@ async def test_codex_endpoint_uses_prompt_cache_sticky_kind(async_client, monkey
     assert seen == ["acc_kind_a"]
 
     async with SessionLocal() as session:
-        row = (await session.execute(text("SELECT kind FROM sticky_sessions WHERE key = 'pck_abc'"))).fetchone()
+        row = (
+            await session.execute(
+                text("SELECT key, kind FROM sticky_sessions WHERE account_id = :account_id AND kind = 'prompt_cache'"),
+                {"account_id": acc_id},
+            )
+        ).fetchone()
         assert row is not None
-        assert row[0] == "prompt_cache"
+        assert row[0].startswith("prompt-cache:v2:")
+        assert row[0] != "pck_abc"
+        assert row[1] == "prompt_cache"
 
 
 @pytest.mark.asyncio
