@@ -33,3 +33,11 @@ The system SHALL preserve the exact `gpt-6-astra` model identifier in Responses 
 #### Scenario: Astra long context
 - **WHEN** a standard Astra request reports 300000 uncached input tokens and 1000 output tokens
 - **THEN** the estimated cost is 6.075 USD
+
+### Requirement: Astra introduction announcement
+The Astra bootstrap entry SHALL include a nonempty `availability_nux.message` matching the introduction bundled with the installed Codex extension. The Codex model endpoint SHALL retain this announcement object. Client catalogs used with the API-key provider SHALL carry the same object without changing the model identifier or default selection. The client SHALL retain its normal announcement dismissal and eligibility behavior.
+
+#### Scenario: Astra introduction metadata is available
+- **WHEN** an authorized client requests the bootstrap Codex model catalog
+- **THEN** the Astra entry contains an availability_nux object with a nonempty message introducing GPT-6
+- **AND** the client's model/list result can expose that object as availabilityNux

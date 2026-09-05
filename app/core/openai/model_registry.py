@@ -159,6 +159,13 @@ _BOOTSTRAP_STATIC_MODELS: tuple[UpstreamModel, ...] = (
         available_in_plans=_BOOTSTRAP_CORE_AVAILABLE_IN_PLANS,
         shell_type="unified_exec",
         raw={
+            "availability_nux": {
+                "message": (
+                    "This is GPT-6, a new generation of intelligence. Astra is state-of-the-art in coding, "
+                    "computer use, science, and professional work. Give it a hard problem, a half-formed idea, "
+                    "or anything you've been meaning to build. See where it takes you."
+                ),
+            },
             "additional_speed_tiers": ["fast"],
             "service_tiers": [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}],
             "supports_image_detail_original": True,

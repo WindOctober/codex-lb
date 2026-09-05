@@ -345,6 +345,7 @@ async def test_astra_bootstrap_discovery_and_key_filtering(async_client):
             assert astra["max_context_window"] == 872_000
             assert astra["default_reasoning_level"] == "medium"
             assert astra["visibility"] == "list"
+            assert astra["availability_nux"]["message"].startswith("This is GPT-6,")
             assert astra["service_tiers"][0]["id"] == "priority"
             assert "gpt-6-astra" in {model["id"] for model in payload["data"]}
         elif endpoint == "/v1/models":
