@@ -150,6 +150,26 @@ def _bootstrap_model(
 
 _BOOTSTRAP_STATIC_MODELS: tuple[UpstreamModel, ...] = (
     _bootstrap_model(
+        "gpt-6-astra",
+        "GPT-6-Astra",
+        priority=0,
+        context_window=272_000,
+        max_context_window=872_000,
+        reasoning_levels=_REASONING_LEVELS_ULTRA,
+        available_in_plans=_BOOTSTRAP_CORE_AVAILABLE_IN_PLANS,
+        shell_type="unified_exec",
+        raw={
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}],
+            "supports_image_detail_original": True,
+            "default_reasoning_summary": "none",
+            "apply_patch_tool_type": "freeform",
+            "web_search_tool_type": "text_and_image",
+            "effective_context_window_percent": 95,
+            "truncation_policy": {"mode": "tokens", "limit": 10_000},
+        },
+    ),
+    _bootstrap_model(
         "gpt-5.6-sol",
         "GPT-5.6-Sol",
         priority=1,

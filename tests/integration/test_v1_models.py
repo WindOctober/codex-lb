@@ -7,6 +7,7 @@ from app.core.openai.model_registry import ReasoningLevel, UpstreamModel, get_mo
 pytestmark = pytest.mark.integration
 
 BOOTSTRAP_MODEL_SLUGS = {
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -329,3 +330,44 @@ async def test_model_context_window_no_override(async_client):
     assert resp.status_code == 200
     entry = next(m for m in resp.json()["models"] if m["slug"] == "gpt-5.4")
     assert entry["context_window"] == 272000
+
+
+@pytest.mark.asyncio
+async def test_astra_bootstrap_discovery_and_key_filtering(async_client):
+    registry = get_model_registry()
+    registry._snapshot = None
+    for endpoint in ("/backend-api/codex/models", "/v1/models", "/api/models"):
+        response = await async_client.get(endpoint)
+        assert response.status_code == 200
+        payload = response.json()
+        if endpoint == "/backend-api/codex/models":
+            astra = next(model for model in payload["models"] if model["slug"] == "gpt-6-astra")
+            assert astra["max_context_window"] == 872_000
+            assert astra["default_reasoning_level"] == "medium"
+            assert astra["visibility"] == "list"
+            assert astra["service_tiers"][0]["id"] == "priority"
+            assert "gpt-6-astra" in {model["id"] for model in payload["data"]}
+        elif endpoint == "/v1/models":
+            assert "gpt-6-astra" in {model["id"] for model in payload["data"]}
+        else:
+            assert "gpt-6-astra" in {model["id"] for model in payload["models"]}
+
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/", json={"name": "astra-restricted", "allowedModels": ["gpt-5.6-sol"]}
+    )
+    assert created.status_code == 200
+    headers = {"Authorization": f"Bearer {created.json()['key']}"}
+    for endpoint, field, identity in (("/backend-api/codex/models", "models", "slug"), ("/v1/models", "data", "id")):
+        response = await async_client.get(endpoint, headers=headers)
+        assert response.status_code == 200
+        assert "gpt-6-astra" not in {model[identity] for model in response.json()[field]}
